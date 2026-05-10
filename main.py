@@ -1,0 +1,1967 @@
+"""
+FORWARD Command Center — FastAPI Backend
+Deploy on Railway using existing FORWARD OS infrastructure.
+
+Environment variables required:
+  SUPABASE_URL               — Supabase project URL
+  SUPABASE_SERVICE_ROLE_KEY  — Supabase service role key (backend only, never exposed to browser)
+  FUB_API_KEY                — Follow Up Boss API key
+  GOOGLE_SERVICE_ACCOUNT_JSON — Service account credentials JSON string
+  MARKET_STATS_FOLDER_ID      — Google Drive folder ID for market stats
+  CFO_REPORTS_FOLDER_ID       — Google Drive folder ID for CFO reports
+  ALLOWED_ORIGINS             — Comma-separated CORS origins (e.g. https://forward-cc.netlify.app)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import io
+import json
+import re
+import zipfile
+import os
+import logging
+from uuid import uuid4
+from datetime import datetime, timezone, timedelta
+from typing import Any, Optional
+
+import httpx
+from fastapi import FastAPI, HTTPException, Depends, Request, Header, BackgroundTasks, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from supabase import create_client, Client
+from jose import jwt, JWTError
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("forward-cc")
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+SUPABASE_URL              = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+FUB_API_KEY               = os.environ["FUB_API_KEY"]
+FUB_BASE_URL              = "https://api.followupboss.com/v1"
+GOOGLE_SA_JSON            = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+MARKET_STATS_FOLDER_ID    = os.environ.get("MARKET_STATS_FOLDER_ID", "")
+CFO_REPORTS_FOLDER_ID     = os.environ.get("CFO_REPORTS_FOLDER_ID", "")
+ALLOWED_ORIGINS           = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",")]
+ANTHROPIC_API_KEY         = os.environ.get("ANTHROPIC_API_KEY", "")
+NETLIFY_ACCESS_TOKEN      = os.environ.get("NETLIFY_ACCESS_TOKEN", "")
+BMR_MODEL                 = "claude-sonnet-4-5"
+
+# ---------------------------------------------------------------------------
+# Agent name mapping: FUB display name → FORWARD OS canonical agent name
+# ---------------------------------------------------------------------------
+AGENT_NAME_MAP: dict[str, str] = {
+    "Ash McGowan": "Ashling McGowan",
+    # All other FUB agent names are expected to match FORWARD OS names exactly
+}
+
+# Active deal stages for task feed (excludes "Closed This Quarter")
+TASK_SKIP_PATTERNS: list[str] = [
+    "slide fub deal card",
+    "move deal card",
+    "move fub deal card",
+    "update fub stage",
+]
+
+BUYER_ACTIVE_STAGES: set[str]  = {"ba signed", "actively showing", "pending"}
+SELLER_ACTIVE_STAGES: set[str] = {
+    "listing agreement signed", "coming soon", "listed",
+    "back on the market", "pending"
+}
+
+# ---------------------------------------------------------------------------
+# Supabase admin client
+# ---------------------------------------------------------------------------
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+# ---------------------------------------------------------------------------
+# Google Drive helper
+# ---------------------------------------------------------------------------
+def get_drive_service():
+    if not GOOGLE_SA_JSON:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not set")
+    info = json.loads(GOOGLE_SA_JSON)
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+    )
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def get_folder_last_modified(folder_id: str) -> Optional[datetime]:
+    """Return the most recent modifiedTime of any file in the given Drive folder."""
+    try:
+        service = get_drive_service()
+        result = service.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="files(modifiedTime)",
+            orderBy="modifiedTime desc",
+            pageSize=1
+        ).execute()
+        files = result.get("files", [])
+        if not files:
+            return None
+        return datetime.fromisoformat(files[0]["modifiedTime"].replace("Z", "+00:00"))
+    except Exception as e:
+        logger.error("Drive error: %s", e)
+        return None
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+def _safe_str(val) -> str:
+    """Coerce a FUB field value (str, dict, None) to a plain string."""
+    if not val:
+        return ""
+    if isinstance(val, str):
+        return val
+    if isinstance(val, dict):
+        return val.get("name") or val.get("street") or val.get("label") or ""
+    return str(val)
+
+
+# ---------------------------------------------------------------------------
+# FUB helpers
+# ---------------------------------------------------------------------------
+def fub_auth() -> tuple[str, str]:
+    return (FUB_API_KEY, "")  # HTTP Basic: key as username, blank password
+
+
+async def fub_get(path: str, params: dict | None = None) -> Any:
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            f"{FUB_BASE_URL}{path}",
+            auth=fub_auth(),
+            params=params or {}
+        )
+        logger.info("FUB %s status=%s", path, r.status_code)
+        if r.status_code != 200:
+            logger.error("FUB error body: %s", r.text[:500])
+            r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, dict):
+            raise ValueError(f"FUB returned unexpected type {type(data).__name__}: {str(data)[:200]}")
+        return data
+
+# ---------------------------------------------------------------------------
+# Auth middleware — verify Supabase JWT
+# ---------------------------------------------------------------------------
+SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")  # optional: from project settings
+
+async def get_current_user(authorization: Optional[str] = Header(None)):
+    """Extract and validate the Supabase JWT from the Authorization header."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    token = authorization.split(" ", 1)[1]
+    try:
+        # Decode without full verification if secret not set (development fallback)
+        payload = jwt.decode(
+            token,
+            SUPABASE_JWT_SECRET or "fallback",
+            algorithms=["HS256"],
+            audience="authenticated",
+            options={
+                "verify_signature": bool(SUPABASE_JWT_SECRET),
+                "verify_aud": bool(SUPABASE_JWT_SECRET)
+            }
+        )
+        return payload
+    except JWTError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+app = FastAPI(title="FORWARD Command Center API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------------------------------------------------------------------
+# Scheduled jobs
+# ---------------------------------------------------------------------------
+scheduler = AsyncIOScheduler(timezone="America/New_York")
+
+
+async def job_sync_fub_pipeline():
+    """Daily 6am ET: pull FUB pipeline data and cache in Supabase."""
+    logger.info("Running FUB pipeline sync...")
+    try:
+        await _sync_fub_pipeline()
+        logger.info("FUB pipeline sync complete.")
+    except Exception as e:
+        logger.error("FUB sync failed: %s", e)
+
+
+async def job_check_drive_automations():
+    """Daily 6am ET: check Drive folders and update automation_health status."""
+    logger.info("Running Drive automation check...")
+    try:
+        await _check_drive_automations()
+        logger.info("Drive automation check complete.")
+    except Exception as e:
+        logger.error("Drive check failed: %s", e)
+
+
+async def job_sync_agent_task_cache():
+    """Daily 6:02am ET: pull FUB tasks per agent and cache in Supabase."""
+    logger.info("Running agent task cache sync...")
+    try:
+        await _sync_agent_task_cache()
+        logger.info("Agent task cache sync complete.")
+    except Exception as e:
+        logger.error("Agent task cache sync failed: %s", e)
+
+
+async def _sync_agent_task_cache(agent_filter: str | None = None):
+    """
+    Pull active FUB deals, fetch each deal's next incomplete task, group by
+    agent, and upsert one row per agent into agent_task_cache.
+
+    If agent_filter is provided (FORWARD OS canonical name), only that agent's
+    row is updated — useful for the manual per-agent refresh endpoint.
+    """
+    now = datetime.now(timezone.utc)
+
+    # ── Fetch all deals (paginated) ──────────────────────────────────────────
+    all_deals: list = []
+    offset, limit = 0, 100
+    while True:
+        data  = await fub_get("/deals", {"limit": limit, "offset": offset})
+        batch = data.get("deals", [])
+        if not batch:
+            break
+        all_deals.extend(batch)
+        if len(batch) < limit:
+            break
+        offset += limit
+    logger.info("Agent task sync: %d total deals fetched", len(all_deals))
+
+    # ── Group tasks by agent ─────────────────────────────────────────────────
+    # agent_tasks: { forward_os_agent_name: [task_dict, ...] }
+    agent_tasks: dict[str, list] = {}
+
+    for deal in all_deals:
+        if not isinstance(deal, dict):
+            continue
+
+        pipeline   = _safe_str(deal.get("pipelineName") or "").lower()
+        stage      = _safe_str(deal.get("stageName") or "")
+        stage_lower = stage.lower()
+
+        if "seller" in pipeline:
+            ptype = "seller"
+            if stage_lower not in SELLER_ACTIVE_STAGES:
+                continue
+        elif "buyer" in pipeline:
+            ptype = "buyer"
+            if stage_lower not in BUYER_ACTIVE_STAGES:
+                continue
+        else:
+            continue  # skip Rentals, Referrals, etc.
+
+        # ── Agent name ───────────────────────────────────────────────────────
+        users    = deal.get("users") or []
+        agent_fub = ""
+        if isinstance(users, list) and users:
+            for u in users:
+                if isinstance(u, dict):
+                    role = u.get("role", "").lower()
+                    if "agent" in role or role == "":
+                        agent_fub = u.get("name", "")
+                        break
+            if not agent_fub and isinstance(users[0], dict):
+                agent_fub = users[0].get("name", "")
+
+        if not agent_fub:
+            continue
+
+        # Normalize to FORWARD OS canonical name
+        agent_name = AGENT_NAME_MAP.get(agent_fub, agent_fub)
+
+        # If filtering to a single agent, skip all others
+        if agent_filter and agent_name != agent_filter:
+            continue
+
+        # ── Client name ──────────────────────────────────────────────────────
+        people_list = deal.get("people") or []
+        if ptype == "buyer" and people_list and isinstance(people_list[0], dict):
+            client_name = _safe_str(people_list[0].get("name") or deal.get("name") or "")
+        else:
+            client_name = _safe_str(deal.get("name") or "")
+
+        person_id = str(people_list[0]["id"]) if people_list and isinstance(people_list[0], dict) else ""
+        if not person_id:
+            continue
+
+        # ── Next incomplete task ─────────────────────────────────────────────
+        task_name, task_due = await _get_next_task(person_id)
+        if not task_name:
+            continue  # no pending task for this deal — omit from feed
+
+        if agent_name not in agent_tasks:
+            agent_tasks[agent_name] = []
+
+        agent_tasks[agent_name].append({
+            "client_name": client_name,
+            "stage":       stage,
+            "pipeline":    ptype,
+            "task_name":   task_name,
+            "due_date":    task_due,
+            "fub_deal_id": str(deal.get("id", ""))
+        })
+
+    logger.info("Agent task sync: %d agents with tasks", len(agent_tasks))
+
+    # ── Sort each agent's tasks by due date, then upsert ────────────────────
+    for aname, tasks in agent_tasks.items():
+        tasks.sort(key=lambda t: t["due_date"] or "9999-99-99")
+        supabase.table("agent_task_cache").upsert(
+            {"agent_name": aname, "tasks": tasks, "synced_at": now.isoformat()},
+            on_conflict="agent_name"
+        ).execute()
+        logger.info("  Upserted %d tasks for %s", len(tasks), aname)
+
+
+@app.on_event("startup")
+async def startup():
+    # Daily 6am ET FUB sync
+    scheduler.add_job(
+        job_sync_fub_pipeline,
+        CronTrigger(hour=6, minute=0, timezone="America/New_York"),
+        id="fub_sync",
+        replace_existing=True
+    )
+    # Daily 6am ET Drive check (runs alongside FUB sync)
+    scheduler.add_job(
+        job_check_drive_automations,
+        CronTrigger(hour=6, minute=5, timezone="America/New_York"),
+        id="drive_check",
+        replace_existing=True
+    )
+    # Daily 6:02am ET — agent task feed cache
+    scheduler.add_job(
+        job_sync_agent_task_cache,
+        CronTrigger(hour=6, minute=2, timezone="America/New_York"),
+        id="agent_task_sync",
+        replace_existing=True
+    )
+    scheduler.start()
+    logger.info("Scheduler started.")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    scheduler.shutdown(wait=False)
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+@app.get("/health")
+async def health():
+    return {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()}
+
+# ---------------------------------------------------------------------------
+# Pipeline routes
+# ---------------------------------------------------------------------------
+@app.post("/pipeline/sync")
+async def trigger_pipeline_sync(user=Depends(get_current_user)):
+    """Manual sync trigger — Ops only."""
+    await _sync_fub_pipeline()
+    return {"status": "synced", "ts": datetime.now(timezone.utc).isoformat()}
+
+
+class AgentTaskSyncRequest(BaseModel):
+    agent_name: Optional[str] = None
+
+
+@app.post("/sync-agent-tasks")
+async def trigger_agent_task_sync(req: AgentTaskSyncRequest = None):
+    """
+    Manual trigger for agent task cache sync.
+    No auth required — called by FORWARD OS agents from their browser.
+
+    Optionally pass {"agent_name": "..."} to sync only one agent (faster —
+    task API calls are only made for that agent's deals).
+    """
+    agent_filter = req.agent_name if req else None
+    try:
+        await _sync_agent_task_cache(agent_filter=agent_filter)
+        return {"status": "synced", "ts": datetime.now(timezone.utc).isoformat()}
+    except Exception as e:
+        logger.error("Manual agent task sync failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/pipeline/buyers")
+async def get_buyers(user=Depends(get_current_user)):
+    res = supabase.table("pipeline_cache").select("*").eq("type", "buyer").execute()
+    return res.data
+
+
+@app.get("/pipeline/sellers")
+async def get_sellers(user=Depends(get_current_user)):
+    res = supabase.table("pipeline_cache").select("*").eq("type", "seller").execute()
+    return res.data
+
+
+async def _get_next_task(person_id: str) -> tuple[str, Optional[str]]:
+    """
+    Return (task_name, due_date_str) for the next incomplete, non-internal task.
+    Fetches up to 10 tasks, skips any matching TASK_SKIP_PATTERNS.
+    """
+    try:
+        data = await fub_get("/tasks", {"personId": person_id, "isCompleted": "false", "sort": "dueDate", "limit": 10})
+        tasks = data.get("tasks", [])
+        for t in tasks:
+            name = t.get("name") or t.get("description") or t.get("subject") or ""
+            if any(pat in name.lower().strip() for pat in TASK_SKIP_PATTERNS):
+                logger.info("Skipping internal FUB task for person %s: %r", person_id, name)
+                continue
+            due = t.get("dueDate") or t.get("due")
+            return str(name), str(due) if due else None
+        return "", None
+    except Exception as e:
+        logger.warning("Task fetch for person %s: %s", person_id, e)
+        return "", None
+
+
+async def _sync_fub_pipeline():
+    now = datetime.now(timezone.utc)
+    quarter_start = _this_quarter_start()
+
+    # ---------------------------------------------------------------------------
+    # Fetch ALL deals with pagination (FUB /deals endpoint)
+    # ---------------------------------------------------------------------------
+    all_deals: list = []
+    offset = 0
+    limit = 100
+    while True:
+        data = await fub_get("/deals", {"limit": limit, "offset": offset})
+        batch = data.get("deals", [])
+        logger.info("FUB /deals offset=%d got %d", offset, len(batch))
+        if not batch:
+            break
+        all_deals.extend(batch)
+        if len(batch) < limit:
+            break
+        offset += limit
+
+    logger.info("FUB: %d total deals fetched", len(all_deals))
+
+    # ---------------------------------------------------------------------------
+    # Stage sets — exact match on FUB stageName values
+    # Buyers:  BA Signed → Actively Showing → Pending → Closed This Quarter
+    # Sellers: Listing Agreement Signed → Coming Soon → Listed →
+    #          Back on the Market → Pending → Closed This Quarter
+    # ---------------------------------------------------------------------------
+    BUYER_STAGES  = {"ba signed", "actively showing", "pending", "closed this quarter"}
+    SELLER_STAGES = {"listing agreement signed", "coming soon", "listed",
+                     "back on the market", "pending", "closed this quarter"}
+
+    rows = []
+    for deal in all_deals:
+        if not isinstance(deal, dict):
+            continue
+
+        # FUB uses pipelineName (Buyers/Sellers/Rentals/Referrals) and stageName
+        pipeline = _safe_str(deal.get("pipelineName") or "").lower()
+        stage    = _safe_str(deal.get("stageName") or "")
+
+        if "seller" in pipeline:
+            ptype = "seller"
+        elif "buyer" in pipeline:
+            ptype = "buyer"
+        else:
+            continue  # Skip Rentals, Referrals, etc.
+
+        # Stage filter
+        if ptype == "buyer"  and stage.lower() not in BUYER_STAGES:
+            continue
+        if ptype == "seller" and stage.lower() not in SELLER_STAGES:
+            continue
+
+        # Log first filtered deal — show users field for agent
+        if not rows:
+            logger.info("DEAL users: %s", deal.get("users"))
+
+        # people array: [{'id': 6743, 'name': 'Mahmood Mohamadi', 'avatar': ''}]
+        people_list = deal.get("people") or []
+        person_id   = str(people_list[0]["id"]) if people_list and isinstance(people_list[0], dict) else ""
+
+        # Client name: buyers → person name, sellers → deal name (property address)
+        if ptype == "buyer" and people_list and isinstance(people_list[0], dict):
+            client_name = _safe_str(people_list[0].get("name") or deal.get("name") or "")
+        else:
+            client_name = _safe_str(deal.get("name") or "")
+
+        # Agent — from users array: [{'id', 'name', 'email', 'role', ...}]
+        users = deal.get("users") or []
+        agent = ""
+        if isinstance(users, list) and users:
+            for u in users:
+                if isinstance(u, dict):
+                    role = u.get("role", "").lower()
+                    if "agent" in role or role == "":
+                        agent = u.get("name", "")
+                        break
+            if not agent:
+                agent = _safe_str(users[0])
+
+        # Property address — sellers: use deal name; buyers: build from parts if available
+        street  = _safe_str(deal.get("street") or deal.get("propertyStreet") or "")
+        city    = _safe_str(deal.get("city")   or deal.get("propertyCity")   or "")
+        state   = _safe_str(deal.get("state")  or deal.get("propertyState")  or "")
+        address = ", ".join(p for p in [street, city, state] if p) if street else _safe_str(deal.get("name") or "")
+
+        # Price and projected close date
+        price           = deal.get("price")
+        projected_close = deal.get("projectedCloseDate") or deal.get("closeDate")
+
+        # Next due task
+        next_task, next_task_due = await _get_next_task(person_id) if person_id else ("", None)
+
+        rows.append({
+            "type":                 ptype,
+            "fub_id":               str(deal.get("id", "")),
+            "client_name":          client_name,
+            "agent":                agent,
+            "lead_stage":           stage,
+            "last_activity":        None,
+            "days_since_contact":   None,
+            "property_address":     address,
+            "list_date":            None,
+            "dom":                  None,
+            "price":                price,
+            "projected_close_date": projected_close,
+            "next_due_task":        next_task,
+            "next_task_due_date":   next_task_due,
+            "synced_at":            now.isoformat()
+        })
+
+    logger.info("Pipeline rows: %d buyers, %d sellers",
+                len([r for r in rows if r["type"] == "buyer"]),
+                len([r for r in rows if r["type"] == "seller"]))
+
+    # Replace cache
+    supabase.table("pipeline_cache").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+    if rows:
+        supabase.table("pipeline_cache").insert(rows).execute()
+
+    # Update last sync on KPI row for this week
+    monday = _this_monday()
+    supabase.table("kpis").upsert(
+        {
+            "week_start":    monday,
+            "active_buyers": len([r for r in rows if r["type"] == "buyer"]),
+            "fub_synced_at": now.isoformat()
+        },
+        on_conflict="week_start"
+    ).execute()
+
+
+def _this_monday() -> str:
+    today  = datetime.now(timezone.utc).date()
+    monday = today - timedelta(days=today.weekday())
+    return str(monday)
+
+
+def _this_quarter_start() -> datetime:
+    now           = datetime.now(timezone.utc)
+    quarter_month = ((now.month - 1) // 3) * 3 + 1   # 1, 4, 7, or 10
+    return datetime(now.year, quarter_month, 1, tzinfo=timezone.utc)
+
+# ---------------------------------------------------------------------------
+# KPI routes
+# ---------------------------------------------------------------------------
+@app.post("/kpis/sync")
+async def kpi_sync(user=Depends(get_current_user)):
+    """Trigger FUB data pull and update KPI row."""
+    await _sync_fub_pipeline()
+    return {"status": "ok"}
+
+# ---------------------------------------------------------------------------
+# Automation Health — Drive check
+# ---------------------------------------------------------------------------
+async def _check_drive_automations():
+    now = datetime.now(timezone.utc)
+
+    # Check Market Stats (fires Wednesdays — flag if >8 days without update)
+    if MARKET_STATS_FOLDER_ID:
+        last_mod = get_folder_last_modified(MARKET_STATS_FOLDER_ID)
+        if last_mod:
+            days_old = (now - last_mod).days
+            status   = "ok" if days_old <= 8 else "late"
+        else:
+            status = "late"
+
+        supabase.table("automation_health").update({
+            "last_run": last_mod.isoformat() if last_mod else None,
+            "status":   status
+        }).eq("automation_name", "Weekly Market Stats Post").execute()
+
+    # Check CFO Report (fires 1st of month — look for file modified this month)
+    if CFO_REPORTS_FOLDER_ID:
+        last_mod = get_folder_last_modified(CFO_REPORTS_FOLDER_ID)
+        if last_mod:
+            same_month = last_mod.year == now.year and last_mod.month == now.month
+            status     = "ok" if same_month else "late"
+        else:
+            status = "late"
+
+        supabase.table("automation_health").update({
+            "last_run": last_mod.isoformat() if last_mod else None,
+            "status":   status
+        }).eq("automation_name", "Monthly CFO Report").execute()
+
+# ---------------------------------------------------------------------------
+# Webhook receiver — Zapier posts here after each automation runs
+# ---------------------------------------------------------------------------
+class AutomationPing(BaseModel):
+    automation_name: str
+    status:          str   # 'ok' | 'failed' | 'late'
+    timestamp:       Optional[str] = None
+    notes:           Optional[str] = None
+
+
+@app.post("/webhooks/fub-task-update")
+async def fub_task_webhook(request: Request, background_tasks: BackgroundTasks):
+    """
+    FUB fires this webhook whenever a task is created, updated, or completed.
+    We return 200 immediately and re-sync the agent task cache in the background
+    so FORWARD OS reflects the change within seconds.
+
+    Configure in FUB: Admin > Settings > API > Webhooks
+    URL: https://forward-command-center-production.up.railway.app/webhooks/fub-task-update
+    Events: Tasks (all)
+    """
+    try:
+        payload = await request.json()
+        logger.info("FUB task webhook received: %s", str(payload)[:300])
+    except Exception:
+        pass  # payload logging is best-effort
+    background_tasks.add_task(job_sync_agent_task_cache)
+    return {"received": True}
+
+
+@app.post("/webhooks/automation-ping")
+async def automation_ping(payload: AutomationPing, request: Request):
+    """
+    Zapier automations POST here on completion.
+    Webhook URL (after deploy): https://your-api.railway.app/webhooks/automation-ping
+
+    Example payload:
+    {
+      "automation_name": "Weekly FUB Pipeline Report",
+      "status": "ok",
+      "timestamp": "2026-05-03T14:00:00Z",
+      "notes": "Sent to all team members"
+    }
+    """
+    ts = payload.timestamp or datetime.now(timezone.utc).isoformat()
+
+    update = {
+        "last_run": ts,
+        "status":   payload.status if payload.status in ("ok", "late", "failed") else "ok"
+    }
+    if payload.notes:
+        update["notes"] = payload.notes
+
+    result = supabase.table("automation_health").update(update).eq(
+        "automation_name", payload.automation_name
+    ).execute()
+
+    if not result.data:
+        logger.warning("Automation ping: no row found for '%s'", payload.automation_name)
+
+    return {"received": True, "automation": payload.automation_name, "status": payload.status}
+
+
+# ===========================================================================
+# BUYER MARKET REPORT  — /api/buyer-report/*
+# ===========================================================================
+
+class BuyerReportComp(BaseModel):
+    address: str; status: str; beds: str; baths: str; sqft: str
+    list_price: str; sale_price: str; dom: str; ls_ratio: str; notes: str
+
+class BuyerReportSubject(BaseModel):
+    address: str; beds: str; baths: str; sqft: str; list_price: str
+
+class BuyerReportAnalysis(BaseModel):
+    subject: BuyerReportSubject
+    comps: list[BuyerReportComp]
+    narrative: str
+    offer_guidance: str = ""          # full UAD adjustment detail (collapsible)
+    offer_summary: str = ""           # 2-3 sentence buyer-facing plain-English conclusion
+    supported_value: str = ""         # e.g. "$659,449" — average adjusted value
+    offer_range: str = ""             # e.g. "$639,666–$679,232"
+    suggested_offer_price: str = ""   # e.g. "$625,000" — pre-filled in agent UI, editable
+
+class BuyerReportDeployRequest(BaseModel):
+    analysis: BuyerReportAnalysis
+    offer_price: str; offer_terms: list[str]; client_name: str
+    agent_name: str; agent_email: str; agent_phone: str; report_title: str
+    market_conditions: str = "balanced"  # low | balanced | competitive | high | war
+    subject_dom: int = 0                 # days subject has been on market
+
+class BuyerReportCandidate(BaseModel):
+    address: str = ""; beds: str = ""; baths: str = ""; sqft: str = ""
+    list_price: str = ""; sale_price: str = ""; dom: str = ""; status: str = ""
+    ls_ratio: str = ""; notes: str = ""; suggested_offer: str = ""
+
+class BuyerReportComparisonRequest(BaseModel):
+    comparison_mode: bool = True
+    candidates: list[BuyerReportCandidate]
+    client_name: str; agent_name: str; agent_email: str = ""; agent_phone: str = ""
+    report_title: str = "Property Comparison Report"
+    market_conditions: str = "balanced"
+    offer_terms: list[str] = []
+
+
+async def _bmr_claude(pdf_bytes: bytes) -> BuyerReportAnalysis:
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
+    pdf_b64 = base64.standard_b64encode(pdf_bytes).decode()
+    prompt = """Analyze this MLS Agent Full report PDF and return ONLY a JSON object:
+{
+  "subject": {"address":"","beds":"","baths":"","sqft":"","list_price":""},
+  "comps": [{"address":"","status":"Active|Pending|Closed","beds":"","baths":"","sqft":"","list_price":"","sale_price":"","dom":"","ls_ratio":"","notes":""}],
+  "narrative": "2-3 paragraphs using ONLY numbers from the PDF. Cite specific comp addresses. Cover: (1) closed sale price range with addresses, (2) DOM range and what it signals about demand, (3) how the subject compares to the comp pool. Never reference data not in the PDF.",
+  "offer_summary": "",
+  "offer_guidance": "",
+  "supported_value": "",
+  "offer_range": "",
+  "suggested_offer_price": ""
+}
+Rules: include ALL comps shown (up to 12); sale_price empty if not sold; ls_ratio = sale_price/list_price as "98.5%" (empty if not sold); sqft and beds/baths as plain numbers (e.g. "1248", "4", "2.0"); prices with $ and commas. Return ONLY the JSON — the offer math is calculated separately."""
+    headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+    body = {"model": BMR_MODEL, "max_tokens": 4096, "temperature": 0, "messages": [{"role": "user", "content": [
+        {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64}},
+        {"type": "text", "text": prompt}
+    ]}]}
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
+        resp.raise_for_status()
+    text = resp.json()["content"][0]["text"].strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text); text = re.sub(r"\s*```$", "", text)
+    try:
+        analysis = BuyerReportAnalysis(**json.loads(text))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Claude returned invalid JSON: {e}")
+    # Fill in offer fields with deterministic Python math (not Claude)
+    uad = _uad_calc(analysis)
+    if uad:
+        analysis.supported_value      = uad["supported_value_str"]
+        analysis.offer_range          = uad["offer_range_str"]
+        analysis.suggested_offer_price = uad["suggested_str"]
+        analysis.offer_guidance        = uad["detail_text"]
+    return analysis
+
+
+# ---------------------------------------------------------------------------
+# UAD Adjustment Calculator — deterministic Python math, never Claude
+# Defaults match the CMA Builder (cma-tool.html) exactly
+# ---------------------------------------------------------------------------
+UAD = {
+    "gla_per_sqft":  50,
+    "bedroom":       15_000,
+    "full_bath":     12_000,
+    "half_bath":      5_000,
+    "garage":        20_000,
+    "condition": {"A+": 15_000, "A": 10_000, "B": 5_000, "C": 0, "D": -10_000},
+}
+
+MARKET_COND_ADJ = {
+    "low":         -0.03,   # Slow / Buyer Favored      → -3%
+    "balanced":     0.00,   # Balanced                  → ±0%
+    "competitive":  0.03,   # Competitive               → +3%
+    "high":         0.06,   # Very Competitive          → +6%
+    "war":          0.10,   # Bidding War               → +10%
+}
+MARKET_COND_LABEL = {
+    "low":         "Slow / Buyer Favored",
+    "balanced":    "Balanced Market",
+    "competitive": "Competitive",
+    "high":        "Very Competitive",
+    "war":         "Bidding War / Multiple Offers",
+}
+# In competitive markets, the list price is effectively the market floor.
+# We don't recommend offering more than this % below list no matter what the comps say.
+# In a bidding war, we anchor ABOVE list price.
+MARKET_LIST_FLOOR = {
+    "low":         None,    # No floor — comps drive everything
+    "balanced":    0.94,    # Max 6% below list
+    "competitive": 0.97,    # Max 3% below list
+    "high":        0.99,    # Max 1% below list
+    "war":         1.01,    # At minimum 1% above list (expect competition)
+}
+
+def _dom_adj(dom: int) -> float:
+    """Adjustment to supported value based on subject's days on market."""
+    if dom <= 0:   return 0.0
+    if dom <= 7:   return 0.02    # Fresh listing — high demand signal
+    if dom <= 21:  return 0.01
+    if dom <= 45:  return 0.0
+    if dom <= 90:  return -0.02   # Cooling
+    return -0.04                   # Stale
+
+def _parse_num(s: str) -> float:
+    try: return float(re.sub(r"[^\d.]", "", str(s or "")))
+    except: return 0.0
+
+def _parse_baths(baths_str: str) -> tuple[float, float]:
+    """Parse '2.1' → (2 full, 1 half). Also handles '2', '2.0', '2.5'."""
+    try:
+        f = float(baths_str or 0)
+        full = int(f)
+        half = round((f - full) * 10)  # '2.1' → 1 half bath
+        return float(full), float(half)
+    except: return 0.0, 0.0
+
+MAX_NET_ADJ_PCT = 0.15  # Exclude comp if |net_adj| > 15% of its sale price (too dissimilar)
+MAX_GLA_PCT     = 0.15  # Flag (but don't exclude) if GLA adj alone > 15% of sale price
+
+def _uad_calc(analysis: "BuyerReportAnalysis") -> dict:
+    """
+    Run UAD adjustments on all CLOSED comps against the subject.
+
+    Quality gates:
+    - Comps where |net_adj| > MAX_NET_ADJ are excluded from the average (too dissimilar).
+    - Comps where GLA adjustment alone > 10% of sale price are flagged with a warning.
+    - If exclusions leave fewer than 2 usable comps, all comps are re-included (with flags).
+
+    Returns dict with comp_rows, excluded_rows, quality_warnings, avg_adjusted,
+    supported_value_str, offer_range_str, detail_text, and related fields.
+    """
+    s = analysis.subject
+    subj_sqft  = _parse_num(s.sqft)
+    subj_beds  = _parse_num(s.beds)
+    subj_full, subj_half = _parse_baths(s.baths)
+
+    def _fmt(v: float) -> str:
+        return (f"+${v:,.0f}" if v >= 0 else f"-${abs(v):,.0f}")
+
+    all_rows = []
+    for c in analysis.comps:
+        if c.status.lower() != "closed" or not c.sale_price:
+            continue
+        sale = _parse_num(c.sale_price)
+        if sale == 0:
+            continue
+        comp_sqft = _parse_num(c.sqft)
+        comp_beds = _parse_num(c.beds)
+        comp_full, comp_half = _parse_baths(c.baths)
+
+        gla_adj  = (subj_sqft - comp_sqft) * UAD["gla_per_sqft"] if comp_sqft and subj_sqft else 0
+        bed_adj  = (subj_beds - comp_beds) * UAD["bedroom"]
+        full_adj = (subj_full - comp_full) * UAD["full_bath"]
+        half_adj = (subj_half - comp_half) * UAD["half_bath"]
+        net_adj  = gla_adj + bed_adj + full_adj + half_adj
+        adjusted = sale + net_adj
+
+        # Quality flags for this comp
+        flags = []
+        gla_pct = abs(gla_adj) / sale if sale else 0
+        net_pct = abs(net_adj) / sale if sale else 0
+        if gla_pct > MAX_GLA_PCT:
+            flags.append(
+                f"GLA adjustment ({_fmt(gla_adj)}) is {gla_pct:.0%} of sale price "
+                f"— sqft difference ({abs(subj_sqft - comp_sqft):.0f} sqft) is large"
+            )
+        if net_pct > MAX_NET_ADJ_PCT:
+            flags.append(
+                f"Net adjustment {_fmt(net_adj)} is {net_pct:.0%} of sale price — comp may be too dissimilar"
+            )
+
+        detail = (
+            f"{c.address}: Sale ${sale:,.0f}"
+            + (f" | GLA adj: {_fmt(gla_adj)} ({comp_sqft:.0f}→{subj_sqft:.0f} sqft)" if comp_sqft and subj_sqft else "")
+            + (f" | Bed adj: {_fmt(bed_adj)}" if bed_adj != 0 else "")
+            + (f" | Bath adj: {_fmt(full_adj + half_adj)}" if (full_adj + half_adj) != 0 else "")
+            + f" | Net adj: {_fmt(net_adj)} | Adjusted: ${adjusted:,.0f}"
+            + (" ⚠ " + "; ".join(flags) if flags else "")
+        )
+
+        all_rows.append({
+            "address":   c.address,
+            "sale":      sale,
+            "net_adj":   net_adj,
+            "adjusted":  adjusted,
+            "detail":    detail,
+            "flags":     flags,
+            "excluded":  net_pct > MAX_NET_ADJ_PCT,
+        })
+
+    if not all_rows:
+        return {}
+
+    # Split into usable vs excluded
+    usable   = [r for r in all_rows if not r["excluded"]]
+    excluded = [r for r in all_rows if r["excluded"]]
+
+    # If fewer than 2 usable comps remain, fall back to using everything (flag it)
+    fallback = False
+    if len(usable) < 2:
+        usable   = all_rows
+        excluded = []
+        fallback = True
+
+    avg  = sum(r["adjusted"] for r in usable) / len(usable)
+    low  = avg * 0.97
+    high = avg * 1.03
+
+    list_price  = _parse_num(s.list_price)
+    pct_diff    = ((list_price - avg) / avg * 100) if avg else 0
+    above_below = "above" if pct_diff >= 0 else "below"
+
+    # Build detail text
+    used_lines = "\n".join(r["detail"] for r in usable)
+    excl_lines = (
+        "\n\nEXCLUDED FROM AVERAGE (adjustment too large — verify these comps):\n"
+        + "\n".join(r["detail"] for r in excluded)
+    ) if excluded else ""
+    fallback_note = (
+        "\n\n⚠ NOTE: All comps have large adjustments. Verify subject sqft, beds, and baths above."
+    ) if fallback else ""
+
+    detail_text = (
+        used_lines
+        + excl_lines
+        + fallback_note
+        + f"\n\nAverage adjusted value (from {len(usable)} comp{'s' if len(usable)!=1 else ''}): ${avg:,.0f}"
+        + f" | List price ${list_price:,.0f} is {abs(pct_diff):.1f}% {above_below} supported value"
+        + f"\nOffer range: ${low:,.0f}–${high:,.0f} (±3%)"
+    )
+
+    # Surface just a count — the detail is visible in the comp cards below
+    quality_warnings = []
+    if fallback:
+        quality_warnings.append("All comps have large size differences — verify subject sqft, beds, and baths")
+    if excluded:
+        quality_warnings.append(
+            f"{len(excluded)} comp{'s' if len(excluded)!=1 else ''} excluded from average (net adjustment >15% of sale price)"
+        )
+
+    return {
+        "comp_rows":           usable,
+        "excluded_rows":       excluded,
+        "quality_warnings":    quality_warnings,
+        "avg_adjusted":        avg,
+        "low":                 low,
+        "high":                high,
+        "supported_value_str": f"${avg:,.0f}",
+        "offer_range_str":     f"${low:,.0f}–${high:,.0f}",
+        "suggested_str":       f"${avg:,.0f}",
+        "detail_text":         detail_text,
+        "pct_diff":            pct_diff,
+        "above_below":         above_below,
+        "list_price":          list_price,
+        "n_comps":             len(usable),
+        "n_excluded":          len(excluded),
+    }
+
+
+def _ls_class(ls: str) -> str:
+    try:
+        p = float(ls.replace("%","").strip())
+        return "r-over" if p >= 100 else "r-at" if p >= 95 else "r-under"
+    except: return ""
+
+def _bar_pct(price: str, mx: float) -> int:
+    try: return min(100, round(float(re.sub(r"[^\d.]","",price)) / mx * 100)) if mx else 0
+    except: return 0
+
+def _bmr_build_html(req: BuyerReportDeployRequest) -> str:
+    a = req.analysis; s = a.subject
+    prices = []
+    for c in a.comps:
+        for p in [c.list_price, c.sale_price]:
+            try: prices.append(float(re.sub(r"[^\d.]","",p)))
+            except: pass
+    try: prices.append(float(re.sub(r"[^\d.]","",s.list_price)))
+    except: pass
+    mx = max(prices) if prices else 1.0
+
+    def _ppsf(price_str, sqft_str):
+        try:
+            p = float(re.sub(r"[^\d.]","",price_str))
+            q = float(re.sub(r"[^\d.]","",sqft_str))
+            return f"${p/q:,.0f}" if p>0 and q>0 else "—"
+        except: return "—"
+
+    comp_rows = ""
+    for c in a.comps:
+        pc = _ls_class(c.ls_ratio)
+        pill = f'<span class="rpill {pc}">{c.ls_ratio}</span>' if c.ls_ratio else "—"
+        sc = {"active":"t-active","pending":"t-pending","closed":"t-closed"}.get(c.status.lower(),"t-active")
+        ppsf = _ppsf(c.sale_price or c.list_price, c.sqft)
+        comp_rows += f"<tr><td><strong>{c.address}</strong></td><td><span class='stag {sc}'>{c.status}</span></td><td>{c.beds}</td><td>{c.baths}</td><td>{c.sqft}</td><td>{c.list_price}</td><td>{c.sale_price or '—'}</td><td>{ppsf}</td><td>{c.dom}</td><td>{pill}</td></tr>"
+
+    bars = f'<div class="bar-row"><div class="bar-label">Subject: {s.address}</div><div class="bar-track"><div class="bar-fill bsubj" style="width:{_bar_pct(s.list_price,mx)}%"></div></div><div class="bar-val">{s.list_price}</div></div>'
+    for c in a.comps:
+        price = c.sale_price if c.sale_price else c.list_price
+        fc = {"r-over":"bgreen","r-at":"bamber","r-under":"bred"}.get(_ls_class(c.ls_ratio),"bn")
+        bars += f'<div class="bar-row"><div class="bar-label">{c.address}</div><div class="bar-track"><div class="bar-fill {fc}" style="width:{_bar_pct(price,mx)}%"></div></div><div class="bar-val">{price}</div></div>'
+
+    terms_html = "".join(f'<div class="iblock">{t}</div>' for t in req.offer_terms)
+    phone_line = f"<div>{req.agent_phone}</div>" if req.agent_phone.strip() else ""
+    gen_date = datetime.now(timezone.utc).strftime("%B %d, %Y")
+
+    # Run deterministic UAD math in Python — never trust Claude's arithmetic
+    uad = _uad_calc(a)
+    mc_key   = getattr(req, "market_conditions", "balanced") or "balanced"
+    dom_days = getattr(req, "subject_dom", 0) or 0
+    mc_label = MARKET_COND_LABEL.get(mc_key, "Balanced Market")
+
+    if uad:
+        avg       = uad["avg_adjusted"]
+        list_p    = uad["list_price"]
+        mc_pct    = MARKET_COND_ADJ.get(mc_key, 0.0)
+        d_pct     = _dom_adj(dom_days)
+        total_pct = mc_pct + d_pct
+
+        # UAD-adjusted offer
+        uad_win   = avg * (1 + total_pct)
+
+        # List-price floor: in competitive markets we never recommend more than
+        # a small discount from list (the market IS the market).
+        floor_pct = MARKET_LIST_FLOOR.get(mc_key)
+        if floor_pct is not None and list_p > 0:
+            list_floor = list_p * floor_pct
+            win_offer  = max(uad_win, list_floor)
+            floored    = win_offer > uad_win  # flag: floor was binding
+        else:
+            win_offer  = uad_win
+            floored    = False
+
+        win_low   = win_offer * 0.97
+        win_high  = win_offer * 1.03
+
+        py_supported   = uad["supported_value_str"]
+        py_detail      = uad["detail_text"]
+        py_n           = uad["n_comps"]
+        py_pct         = f"{abs(uad['pct_diff']):.1f}%"
+        py_above_below = uad["above_below"]
+
+        # Display strings
+        mc_adj_str    = (f"+{mc_pct*100:.0f}%" if mc_pct >= 0 else f"{mc_pct*100:.0f}%")
+        d_adj_str     = (f"+{d_pct*100:.0f}%" if d_pct >= 0 else f"{d_pct*100:.0f}%") if d_pct != 0 else ""
+        total_str     = (f"+{total_pct*100:.0f}%" if total_pct >= 0 else f"{total_pct*100:.0f}%")
+        mc_dollar     = win_offer - avg
+        mc_dollar_str = (f"+${mc_dollar:,.0f}" if mc_dollar >= 0 else f"-${abs(mc_dollar):,.0f}")
+        py_win_offer  = f"${win_offer:,.0f}"
+        py_win_range  = f"${win_low:,.0f}–${win_high:,.0f}"
+
+        dom_line   = f" | DOM adjustment ({dom_days} days): {d_adj_str}" if d_pct != 0 else ""
+        floor_note = (
+            f'<div style="font-size:10px;color:#92400e;margin-top:6px;background:#fef9c3;padding:4px 8px;border-radius:4px">'
+            f'Floor applied: comps-only result was ${uad_win:,.0f} — market conditions anchor raised to {py_win_offer}'
+            f'</div>'
+        ) if floored else ""
+
+        mc_color   = "#166534" if mc_dollar >= 0 else "#991b1b"
+        py_market_box = (
+            '<div style="background:#fff;border:1px solid var(--border);border-radius:10px;padding:20px;margin-bottom:16px">'
+            '<div style="font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:10px">Market Conditions Adjustment</div>'
+            '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px">'
+            f'<div><div style="font-size:11px;color:var(--muted);margin-bottom:2px">UAD Supported Value</div><div style="font-size:16px;font-weight:700;color:var(--navy)">{py_supported}</div></div>'
+            f'<div><div style="font-size:11px;color:var(--muted);margin-bottom:2px">Market Conditions</div><div style="font-size:14px;font-weight:600;color:var(--navy)">{mc_label}</div><div style="font-size:11px;color:var(--muted)">{mc_adj_str}{dom_line}</div></div>'
+            f'<div><div style="font-size:11px;color:var(--muted);margin-bottom:2px">Market Adjustment</div><div style="font-size:16px;font-weight:700;color:{mc_color}">{mc_dollar_str} ({total_str})</div></div>'
+            f'</div>{floor_note}</div>'
+        )
+
+        if a.offer_summary:
+            py_summary = a.offer_summary
+        else:
+            if floored:
+                py_summary = (
+                    f"Comps adjusted for size, bedrooms, and bathrooms support a value of {py_supported}. "
+                    f"However, in current {mc_label.lower()} conditions with {dom_days} days on market, "
+                    f"offering that far below list is not a realistic strategy. "
+                    f"The estimated winning offer is {py_win_offer} — anchored to current market dynamics. "
+                    f"We recommend offering between {py_win_range.split(chr(8211))[0]} and {py_win_range.split(chr(8211))[1]}."
+                )
+            else:
+                py_summary = (
+                    f"Based on {py_n} comparable {'sale' if py_n==1 else 'sales'} adjusted for size, bedrooms, and bathrooms, "
+                    f"the market supports a value of {py_supported}. "
+                    f"In current {mc_label.lower()} conditions, the estimated winning offer is {py_win_offer} "
+                    f"({mc_dollar_str} above supported value). "
+                    f"We recommend offering between {py_win_range.split(chr(8211))[0]} and {py_win_range.split(chr(8211))[1]}."
+                )
+        py_range = py_win_range
+    else:
+        py_supported   = a.supported_value or a.suggested_offer_price or "—"
+        py_win_offer   = a.suggested_offer_price or "—"
+        py_range       = a.offer_range or "—"
+        py_detail      = a.offer_guidance or "No closed comp data available for adjustment analysis."
+        py_summary     = a.offer_summary or "Insufficient closed comp data to calculate a supported value."
+        py_market_box  = ""
+
+    # Pre-compute narrative snippet vars (f-strings can't contain backslashes in expressions)
+    if len(a.narrative) > 350:
+        narr_short_html = a.narrative[:350] + "..."
+        narr_toggle_html = (
+            '<button class="narrative-toggle" onclick="'
+            "document.getElementById('narr-short').style.display='none';"
+            "document.getElementById('narr-full').style.display='block';"
+            "this.style.display='none'"
+            '">Read full narrative ↓</button>'
+        )
+    else:
+        narr_short_html = a.narrative
+        narr_toggle_html = ""
+
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{req.report_title}</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;600;700&family=Jost:wght@300;400;500;600&display=swap">
+<style>
+:root{{--navy:#0A2342;--navy2:#1b3461;--gold:#C8A96E;--offwhite:#F7F4EF;--white:#ffffff;--text:#1a1a2e;--muted:#6b7280;--border:#e5e0d8}}
+*{{box-sizing:border-box;margin:0;padding:0}}body{{font-family:'Jost',sans-serif;background:var(--offwhite);color:var(--text);font-size:15px;line-height:1.6}}
+.header{{background:var(--navy);padding:20px 40px;display:flex;align-items:center;justify-content:space-between}}
+.header-logo{{font-family:'Cormorant Garamond',serif;font-size:22px;color:#fff;letter-spacing:2px;text-transform:uppercase}}
+.header-sub{{font-size:11px;color:var(--gold);letter-spacing:3px;text-transform:uppercase;margin-top:2px}}
+.nav-tabs{{background:var(--navy2);display:flex;border-bottom:3px solid var(--gold)}}
+.nav-tabs button{{background:none;border:none;color:rgba(255,255,255,.65);font-family:'Jost',sans-serif;font-size:13px;letter-spacing:1px;text-transform:uppercase;padding:14px 28px;cursor:pointer;transition:all .2s}}
+.nav-tabs button.active,.nav-tabs button:hover{{color:#fff;background:rgba(255,255,255,.07)}}
+.nav-tabs button.active{{border-bottom:3px solid var(--gold);margin-bottom:-3px}}
+.section{{display:none;padding:40px;max-width:1100px;margin:0 auto}}.section.active{{display:block}}
+.hero{{background:var(--navy);color:#fff;border-radius:12px;padding:36px 40px;margin-bottom:32px}}
+.hero h1{{font-family:'Cormorant Garamond',serif;font-size:32px;font-weight:700;margin-bottom:6px}}
+.hero-sub{{color:var(--gold);font-size:13px;letter-spacing:2px;text-transform:uppercase;margin-bottom:24px}}
+.hs{{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:16px;margin-top:20px}}
+.hs-item label{{font-size:10px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.5);display:block;margin-bottom:4px}}
+.hs-item span{{font-size:20px;font-weight:600}}
+.sc-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:16px;margin-bottom:32px}}
+.sc{{background:#fff;border-radius:10px;padding:20px;border:1px solid var(--border);box-shadow:0 2px 8px rgba(0,0,0,.04)}}
+.sc label{{font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--muted);display:block;margin-bottom:4px}}
+.sc span{{font-size:18px;font-weight:600;color:var(--navy)}}
+.verdict{{background:#fff;border-left:4px solid var(--gold);border-radius:0 10px 10px 0;padding:24px 28px;margin-bottom:32px;box-shadow:0 2px 8px rgba(0,0,0,.04)}}
+.verdict h3{{font-family:'Cormorant Garamond',serif;font-size:20px;color:var(--navy);margin-bottom:10px}}
+.verdict p{{line-height:1.75}}
+.two-col{{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-bottom:32px}}
+.iblock{{background:#fff;border:1px solid var(--border);border-radius:8px;padding:12px 16px;font-size:13px;color:var(--navy);font-weight:500}}
+.comps-table{{width:100%;border-collapse:collapse;background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.04);margin-bottom:32px}}
+.comps-table th{{background:var(--navy);color:#fff;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;padding:12px 14px;text-align:left;font-weight:500}}
+.comps-table td{{padding:12px 14px;border-bottom:1px solid var(--border);font-size:13px;vertical-align:middle}}
+.comps-table tr:last-child td{{border-bottom:none}}.comps-table tr:hover td{{background:var(--offwhite)}}
+.stag{{display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}}
+.t-active{{background:#dbeafe;color:#1e40af}}.t-pending{{background:#fef9c3;color:#92400e}}.t-closed{{background:#dcfce7;color:#166534}}.t-subject{{background:var(--gold);color:var(--navy)}}
+.rpill{{display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600}}
+.r-over{{background:#dcfce7;color:#166534}}.r-at{{background:#fef9c3;color:#92400e}}.r-under{{background:#fee2e2;color:#991b1b}}
+.bar-row{{display:grid;grid-template-columns:200px 1fr 80px;align-items:center;gap:12px;margin-bottom:10px}}
+.bar-label{{font-size:12px;color:var(--navy);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.bar-track{{background:#e5e0d8;border-radius:4px;height:18px;overflow:hidden}}
+.bar-fill{{height:100%;border-radius:4px;transition:width .6s ease}}
+.bn{{background:var(--navy)}}.bg{{background:var(--gold)}}.bgreen{{background:#22c55e}}.bamber{{background:#f59e0b}}.bred{{background:#ef4444}}
+.bsubj{{background:linear-gradient(90deg,var(--navy),var(--gold));border:2px solid var(--gold)}}
+.bar-val{{font-size:12px;font-weight:600;color:var(--navy);text-align:right}}
+.rec-box{{background:var(--navy);color:#fff;border-radius:12px;padding:28px 32px;margin-bottom:24px}}
+.rec-box h3{{font-family:'Cormorant Garamond',serif;font-size:22px;color:var(--gold);margin-bottom:12px}}
+.rec-box p{{line-height:1.75;color:rgba(255,255,255,.9)}}
+.rec-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px}}
+.offer-grid{{display:grid;grid-template-columns:1fr 1fr;gap:16px}}
+.offer-price-box{{background:#fff;border:2px solid var(--gold);border-radius:12px;padding:24px;text-align:center}}
+.offer-price-box label{{font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--muted);display:block;margin-bottom:6px}}
+.offer-price-box .price{{font-family:'Cormorant Garamond',serif;font-size:36px;font-weight:700;color:var(--navy)}}
+.footer{{background:var(--navy);color:rgba(255,255,255,.7);padding:32px 40px;margin-top:40px;display:grid;grid-template-columns:1fr auto;gap:40px;align-items:start}}
+.footer-brand{{font-family:'Cormorant Garamond',serif;font-size:18px;color:#fff;letter-spacing:1px;margin-bottom:6px}}
+.footer-sub{{font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--gold)}}
+.footer-agent{{text-align:right;font-size:13px;line-height:1.8}}
+.footer-agent strong{{color:#fff;font-size:15px}}
+.disclaimer{{background:var(--offwhite);border:1px solid var(--border);border-radius:8px;padding:16px 20px;margin-top:24px;font-size:11px;color:var(--muted);line-height:1.6}}
+.narrative-full{{display:none}}.narrative-toggle{{background:none;border:none;color:var(--gold);font-family:'Jost',sans-serif;font-size:13px;font-weight:500;cursor:pointer;padding:8px 0;text-decoration:underline}}
+@media(max-width:768px){{
+  .header{{padding:14px 16px}}.header-logo{{font-size:17px}}
+  .nav-tabs{{overflow-x:auto;-webkit-overflow-scrolling:touch;flex-wrap:nowrap}}
+  .nav-tabs button{{padding:11px 16px;font-size:11px;white-space:nowrap;flex-shrink:0}}
+  .section{{padding:20px 14px}}
+  .hero{{padding:22px 18px;border-radius:8px}}.hero h1{{font-size:20px;line-height:1.3}}
+  .hs{{grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}}.hs-item span{{font-size:16px}}
+  .sc-grid{{grid-template-columns:1fr 1fr;gap:10px}}
+  .sc{{padding:14px}}.sc span{{font-size:15px}}
+  .verdict{{padding:18px 16px}}.verdict h3{{font-size:17px}}
+  .verdict p{{font-size:14px}}
+  .comps-table{{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch;font-size:12px}}
+  .comps-table th,.comps-table td{{padding:9px 10px;white-space:nowrap}}
+  .bar-row{{grid-template-columns:100px 1fr 55px;gap:6px;margin-bottom:8px}}
+  .bar-label{{font-size:11px}}.bar-val{{font-size:11px}}
+  .offer-grid{{grid-template-columns:1fr;gap:12px}}
+  .offer-price-box{{padding:18px}}.offer-price-box .price{{font-size:28px}}
+  .rec-box{{padding:20px 18px}}.rec-box p{{font-size:14px}}
+  .two-col{{grid-template-columns:1fr}}
+  .footer{{grid-template-columns:1fr;gap:16px;padding:24px 16px}}.footer-agent{{text-align:left}}
+  h2{{font-size:20px!important}}
+}}
+</style></head><body>
+<div class="header"><div><div class="header-logo">FORWARD</div><div class="header-sub">Real Estate Group</div></div>
+<div style="color:rgba(255,255,255,.6);font-size:12px;text-align:right">{req.report_title}<br><span style="color:var(--gold)">{gen_date}</span></div></div>
+<div class="nav-tabs">
+<button class="active" onclick="show('overview',this)">Overview</button>
+<button onclick="show('comps',this)">Comparable Sales</button>
+<button onclick="show('charts',this)">Market Charts</button>
+<button onclick="show('offer',this)">Offer Guidance</button>
+</div>
+<div id="overview" class="section active">
+<div class="hero"><div class="hero-sub">Subject Property</div><h1>{s.address}</h1>
+<div class="hs"><div class="hs-item"><label>Beds</label><span>{s.beds}</span></div><div class="hs-item"><label>Baths</label><span>{s.baths}</span></div><div class="hs-item"><label>Sq Ft</label><span>{s.sqft}</span></div><div class="hs-item"><label>List Price</label><span>{s.list_price}</span></div></div></div>
+<div class="verdict"><h3>Market Narrative</h3><p id="narr-short">{narr_short_html}</p><p id="narr-full" class="narrative-full">{a.narrative}</p>{narr_toggle_html}</div>
+<div class="sc-grid"><div class="sc"><label>Comps Analyzed</label><span>{len(a.comps)}</span></div><div class="sc"><label>Offer Price</label><span>{req.offer_price}</span></div><div class="sc"><label>Prepared For</label><span>{req.client_name}</span></div><div class="sc"><label>Prepared By</label><span>{req.agent_name}</span></div></div>
+<div class="disclaimer"><strong>Disclaimer:</strong> This report is prepared for informational purposes only. All data sourced from MLS records and public information. Market conditions change frequently; this analysis represents a snapshot in time and should not be relied upon as the sole basis for any purchase decision.</div>
+</div>
+<div id="comps" class="section">
+<h2 style="font-family:'Cormorant Garamond',serif;font-size:26px;color:var(--navy);margin-bottom:24px">Comparable Sales</h2>
+<table class="comps-table"><thead><tr><th>Address</th><th>Status</th><th>Beds</th><th>Baths</th><th>Sq Ft</th><th>List Price</th><th>Sale Price</th><th>$/Sqft</th><th>DOM</th><th>L/S Ratio</th></tr></thead>
+<tbody><tr style="background:#f0f4ff"><td><strong>{s.address}</strong> <span class="stag t-subject">Subject</span></td><td>—</td><td>{s.beds}</td><td>{s.baths}</td><td>{s.sqft}</td><td>{s.list_price}</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+{comp_rows}</tbody></table></div>
+<div id="charts" class="section">
+<h2 style="font-family:'Cormorant Garamond',serif;font-size:26px;color:var(--navy);margin-bottom:24px">Price Comparison</h2>
+<div style="background:#fff;border-radius:12px;padding:28px;box-shadow:0 2px 8px rgba(0,0,0,.04)">{bars}</div></div>
+<div id="offer" class="section">
+<div class="offer-grid" style="margin-bottom:24px">
+<div class="offer-price-box"><label>Your Offer Price</label><div class="price">{req.offer_price}</div></div>
+<div class="offer-price-box" style="border-color:var(--navy)"><label>Estimated Winning Offer</label><div class="price" style="font-size:28px;color:var(--navy)">{py_win_offer}</div><div style="font-size:12px;color:var(--muted);margin-top:4px">Range: {py_range}</div></div>
+</div>
+{py_market_box}
+<div class="verdict" style="margin-bottom:24px"><h3>What This Means for You</h3><p style="line-height:1.8">{py_summary}</p></div>
+<div style="background:#fff;border-radius:12px;border:1px solid var(--border);margin-bottom:24px">
+<button onclick="var d=document.getElementById('uad-detail');var open=d.style.display!=='none';d.style.display=open?'none':'block';this.querySelector('span').textContent=open?'▸ Show':'▾ Hide'" style="width:100%;background:none;border:none;padding:16px 20px;text-align:left;cursor:pointer;font-family:'Jost',sans-serif;font-size:13px;font-weight:600;color:var(--navy);letter-spacing:.5px;display:flex;justify-content:space-between;align-items:center">HOW WE CALCULATED THIS <span style="color:var(--gold);font-size:12px">▸ Show</span></button>
+<div id="uad-detail" style="display:none;padding:0 20px 20px;font-size:12px;line-height:1.9;color:var(--text);white-space:pre-wrap;border-top:1px solid var(--border)">{py_detail}</div>
+</div>
+<div style="background:#fff;border-radius:12px;padding:24px;border:1px solid var(--border)">
+<div style="font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:12px">Offer Terms</div>
+<div class="rec-grid">{terms_html}</div></div></div>
+<div class="footer"><div><div class="footer-brand">FORWARD Real Estate Group</div><div class="footer-sub">Washington DC Metro Area</div></div>
+<div class="footer-agent"><strong>{req.agent_name}</strong><div>{req.agent_email}</div>{phone_line}</div></div>
+<script>function show(id,el){{document.querySelectorAll('.section').forEach(s=>s.classList.remove('active'));document.querySelectorAll('.nav-tabs button').forEach(b=>b.classList.remove('active'));document.getElementById(id).classList.add('active');el.classList.add('active');}}</script>
+</body></html>"""
+
+
+async def _bmr_comparison_claude(req: "BuyerReportComparisonRequest") -> list[dict]:
+    """Call Claude to generate per-property offer analysis for comparison mode."""
+    if not ANTHROPIC_API_KEY:
+        return [{} for _ in req.candidates]
+    mc_label = MARKET_COND_LABEL.get(req.market_conditions, "Balanced Market")
+    props_text = ""
+    for i, c in enumerate(req.candidates):
+        props_text += f"""
+Property {i+1}: {c.address}
+  Beds: {c.beds} | Baths: {c.baths} | SqFt: {c.sqft}
+  List Price: {c.list_price} | Sale Price: {c.sale_price or "Active/Not yet sold"}
+  DOM: {c.dom or "N/A"} | L/S Ratio: {c.ls_ratio or "N/A"}
+  Status: {c.status or "Active"}
+  Notes: {c.notes or "None"}
+  Agent-suggested offer: {c.suggested_offer or "Not specified"}
+"""
+    prompt = f"""You are a senior real estate appraiser and buyer's agent in the Washington DC metro area.
+
+The buyer is evaluating {len(req.candidates)} properties with no single subject property selected yet.
+Market conditions: {mc_label}
+Client: {req.client_name}
+
+{props_text}
+
+IMPORTANT: DOM (Days on Market) may be formatted as "current/total" (e.g. "84/285" means 84 days in this current listing period, 285 total cumulative days on market including prior listings). High total DOM signals a stale listing and stronger negotiating position. Use the total DOM figure when assessing seller motivation.
+
+For EACH property, provide:
+1. suggested_offer: A specific recommended offer price (e.g. "$2,350,000") based on list price, DOM, market conditions, and any notes. If the agent provided a suggested offer, use that as your anchor.
+2. offer_range: A low-to-high range (e.g. "$2,250,000–$2,450,000")
+3. rationale: 2–3 concise sentences explaining the offer strategy for this specific property. Consider DOM, price per sqft, market conditions, and any notes. If the property has been relisted (high cumulative DOM), note the leverage this gives the buyer.
+4. strength: One word — "Strong", "Moderate", or "Cautious" — reflecting how aggressively to pursue this property.
+
+Respond ONLY with a JSON array with one object per property, in order. Example:
+[
+  {{"suggested_offer": "$2,350,000", "offer_range": "$2,250,000–$2,450,000", "rationale": "...", "strength": "Strong"}},
+  {{"suggested_offer": "$4,100,000", "offer_range": "$3,950,000–$4,200,000", "rationale": "...", "strength": "Moderate"}}
+]"""
+
+    headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+    body = {"model": "claude-haiku-4-5-20251001", "max_tokens": 1024, "messages": [{"role": "user", "content": prompt}]}
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
+            resp.raise_for_status()
+            raw = resp.json()["content"][0]["text"].strip()
+            logger.info("comparison claude raw: %s", raw[:300])
+            # Extract JSON array
+            m = re.search(r'\[.*\]', raw, re.DOTALL)
+            if m:
+                return json.loads(m.group())
+            logger.warning("no JSON array found in comparison claude response")
+    except Exception as e:
+        logger.warning("comparison claude call failed: %s", e)
+    return [{} for _ in req.candidates]
+
+
+def _bmr_build_comparison_html(req: BuyerReportComparisonRequest, analyses: list = None) -> str:
+    mc_label = MARKET_COND_LABEL.get(req.market_conditions, "Balanced Market")
+    gen_date = datetime.now(timezone.utc).strftime("%B %d, %Y")
+    phone_line = f"<div style='opacity:.75'>{req.agent_phone}</div>" if req.agent_phone.strip() else ""
+    if analyses is None:
+        analyses = [{} for _ in req.candidates]
+
+    STRENGTH_COLOR = {"Strong": "#166534", "Moderate": "#92400e", "Cautious": "#991b1b"}
+    STRENGTH_BG    = {"Strong": "#dcfce7", "Moderate": "#fef9c3", "Cautious": "#fee2e2"}
+
+    # Property cards
+    cards_html = ""
+    for i, c in enumerate(req.candidates):
+        ai = analyses[i] if i < len(analyses) else {}
+        specs = " &nbsp;·&nbsp; ".join(filter(None, [
+            f"{c.beds} bd" if c.beds else "",
+            f"{c.baths} ba" if c.baths else "",
+            f"{c.sqft} sqft" if c.sqft else "",
+        ]))
+        suggested = ai.get("suggested_offer") or c.suggested_offer or ""
+        offer_range = ai.get("offer_range", "")
+        rationale = ai.get("rationale", "")
+        strength = ai.get("strength", "")
+        dom_note = f'<div style="font-size:12px;color:var(--muted);margin-top:4px">DOM: {c.dom}</div>' if c.dom else ""
+        notes_note = f'<div style="font-size:12px;color:var(--muted);margin-top:4px;font-style:italic">{c.notes}</div>' if c.notes else ""
+        strength_badge = (
+            f'<span style="font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;padding:3px 10px;border-radius:20px;background:{STRENGTH_BG.get(strength,"#f3f4f6")};color:{STRENGTH_COLOR.get(strength,"#374151")}">{strength} Interest</span>'
+        ) if strength else ""
+        offer_block = ""
+        if suggested:
+            range_line = f'<div style="font-size:12px;color:var(--muted);margin-top:2px">Range: {offer_range}</div>' if offer_range else ""
+            offer_block = f'''
+            <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border);display:grid;grid-template-columns:1fr auto;align-items:start;gap:12px">
+              <div>
+                <div style="font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:4px">Suggested Offer</div>
+                <div style="font-size:22px;font-weight:700;color:var(--navy)">{suggested}</div>
+                {range_line}
+              </div>
+              <div>{strength_badge}</div>
+            </div>'''
+        rationale_block = (
+            f'<div style="margin-top:14px;padding:12px 14px;background:#f8fafc;border-left:3px solid var(--gold);border-radius:0 6px 6px 0;font-size:12px;color:#374151;line-height:1.6">{rationale}</div>'
+        ) if rationale else ""
+        cards_html += f"""
+        <div style="background:#fff;border:1px solid var(--border);border-radius:12px;padding:24px;break-inside:avoid;margin-bottom:20px">
+          <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px">
+            <div style="flex:1;min-width:0">
+              <div style="font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--gold);margin-bottom:4px;font-weight:600">Option {i+1}</div>
+              <div style="font-size:17px;font-weight:700;color:var(--navy);line-height:1.3">{c.address}</div>
+            </div>
+            <div style="text-align:right;flex-shrink:0">
+              <div style="font-size:10px;color:var(--muted);margin-bottom:2px">List Price</div>
+              <div style="font-size:20px;font-weight:700;color:var(--navy)">{c.list_price or "—"}</div>
+            </div>
+          </div>
+          <div style="font-size:13px;color:#555;margin-bottom:6px">{specs}</div>
+          {dom_note}{notes_note}{offer_block}{rationale_block}
+        </div>"""
+
+    # Comparison table
+    table_rows = ""
+    fields = [("List Price","list_price"),("Beds","beds"),("Baths","baths"),("Sq Ft","sqft"),("DOM","dom"),("Suggested Offer","suggested_offer")]
+    for label, key in fields:
+        cells = "".join(f"<td style='padding:8px 12px;border-bottom:1px solid var(--border);text-align:center;font-size:13px'>{getattr(c,key) or '—'}</td>" for c in req.candidates)
+        table_rows += f"<tr><td style='padding:8px 12px;border-bottom:1px solid var(--border);font-size:11px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:var(--muted);white-space:nowrap'>{label}</td>{cells}</tr>"
+    
+    col_headers = "".join(f"<th style='padding:10px 12px;text-align:center;font-size:12px;font-weight:700;color:var(--navy);border-bottom:2px solid var(--border)'>Option {i+1}</th>" for i, _ in enumerate(req.candidates))
+
+    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{req.report_title}</title>
+<style>
+  :root{{--navy:#0a2342;--gold:#c8a96e;--border:#e5e7eb;--bg:#f9fafb;--muted:#6b7280}}
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:#1f2937;padding:0}}
+  .wrap{{max-width:860px;margin:0 auto;padding:32px 20px}}
+  @media(max-width:600px){{.wrap{{padding:16px 12px}}}}
+</style></head><body>
+<div style="background:var(--navy);padding:20px 32px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+  <div><div style="font-size:10px;letter-spacing:3px;text-transform:uppercase;color:var(--gold);margin-bottom:4px">FORWARD | Corcoran McEnearney</div>
+  <div style="font-size:20px;font-weight:700;color:#fff">{req.report_title}</div></div>
+  <div style="text-align:right;color:#fff;font-size:13px">
+    <div style="font-weight:600">{req.agent_name}</div>
+    {phone_line}<div style="opacity:.65;font-size:11px">{gen_date}</div>
+  </div>
+</div>
+<div class="wrap">
+  <div style="background:#fff;border:1px solid var(--border);border-radius:12px;padding:20px 24px;margin-bottom:28px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+    <div><div style="font-size:11px;color:var(--muted);margin-bottom:2px">Prepared for</div>
+    <div style="font-size:18px;font-weight:700;color:var(--navy)">{req.client_name}</div></div>
+    <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 16px;text-align:center">
+      <div style="font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);margin-bottom:2px">Market Conditions</div>
+      <div style="font-size:14px;font-weight:700;color:var(--navy)">{mc_label}</div>
+    </div>
+  </div>
+  <div style="font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:16px;font-weight:600">{len(req.candidates)} Properties · Independent Analysis</div>
+  {cards_html}
+  <div style="background:#fff;border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-bottom:28px">
+    <div style="padding:16px 20px;border-bottom:1px solid var(--border)"><div style="font-size:13px;font-weight:700;color:var(--navy)">Side-by-Side Comparison</div></div>
+    <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse">
+      <thead><tr><th style="padding:10px 12px;text-align:left;font-size:12px;font-weight:700;color:var(--muted);border-bottom:2px solid var(--border)">Metric</th>{col_headers}</tr></thead>
+      <tbody>{table_rows}</tbody>
+    </table></div>
+  </div>
+  <div style="font-size:11px;color:var(--muted);line-height:1.6;padding:16px;background:#fffbeb;border:1px solid #fde68a;border-radius:8px">
+    <strong>Disclaimer:</strong> This report is prepared for informational purposes only. All data has been reviewed by {req.agent_name} and is subject to market changes. This does not constitute legal or financial advice.
+  </div>
+</div></body></html>"""
+
+async def _bmr_netlify_deploy(html: str, site_name: str) -> str:
+    if not NETLIFY_ACCESS_TOKEN:
+        raise HTTPException(status_code=500, detail="NETLIFY_ACCESS_TOKEN not configured")
+    headers = {"Authorization": f"Bearer {NETLIFY_ACCESS_TOKEN}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=60) as client:
+        cr = await client.post("https://api.netlify.com/api/v1/sites", headers=headers, json={"name": site_name})
+        if cr.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"Netlify site creation failed: {cr.status_code} {cr.text[:200]}")
+        site_id = cr.json()["id"]
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("index.html", html)
+            # Tell Netlify CDN to serve HTML with correct Content-Type
+            zf.writestr("_headers", "/index.html\n  Content-Type: text/html; charset=UTF-8\n")
+        buf.seek(0)
+        dr = await client.post(f"https://api.netlify.com/api/v1/sites/{site_id}/deploys",
+            headers={"Authorization": f"Bearer {NETLIFY_ACCESS_TOKEN}", "Content-Type": "application/zip"},
+            content=buf.read())
+        if dr.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"Netlify deploy failed: {dr.status_code} {dr.text[:200]}")
+        deploy_id = dr.json().get("id")
+
+    # Poll until deploy is ready (avoids serving raw HTML before processing finishes)
+    if deploy_id:
+        poll_headers = {"Authorization": f"Bearer {NETLIFY_ACCESS_TOKEN}"}
+        async with httpx.AsyncClient(timeout=60) as poll_client:
+            for _ in range(20):  # up to ~60 seconds
+                await asyncio.sleep(3)
+                pr = await poll_client.get(
+                    f"https://api.netlify.com/api/v1/deploys/{deploy_id}",
+                    headers=poll_headers
+                )
+                if pr.status_code == 200 and pr.json().get("state") == "ready":
+                    break
+                logger.info("BMR deploy state: %s", pr.json().get("state") if pr.status_code == 200 else pr.status_code)
+
+    return f"https://{site_name}.netlify.app"
+
+
+
+@app.post("/api/buyer-report/regenerate")
+async def buyer_report_regenerate(request: Request):
+    """
+    Re-generate narrative from the current (agent-edited) comp list.
+    UAD math is calculated deterministically in Python — Claude only writes the narrative.
+    """
+    payload = await request.json()
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
+
+    subject_data     = payload.get("subject", {})
+    comps_data       = payload.get("comps", [])
+    market_conditions = payload.get("market_conditions", "balanced")
+    subject_dom       = int(payload.get("subject_dom", 0) or 0)
+    if not comps_data:
+        raise HTTPException(status_code=400, detail="No comps provided")
+
+    # Build Pydantic objects so we can reuse _uad_calc
+    subject = BuyerReportSubject(
+        address=subject_data.get("address",""),
+        beds=subject_data.get("beds",""),
+        baths=subject_data.get("baths",""),
+        sqft=subject_data.get("sqft",""),
+        list_price=subject_data.get("list_price",""),
+    )
+    comps = [BuyerReportComp(
+        address=c.get("address",""), status=c.get("status",""),
+        beds=c.get("beds",""), baths=c.get("baths",""), sqft=c.get("sqft",""),
+        list_price=c.get("list_price",""), sale_price=c.get("sale_price",""),
+        dom=c.get("dom",""), ls_ratio=c.get("ls_ratio",""), notes=c.get("notes",""),
+    ) for c in comps_data]
+
+    temp_analysis = BuyerReportAnalysis(subject=subject, comps=comps, narrative="")
+    uad = _uad_calc(temp_analysis)
+
+    # Build comp table for Claude (narrative only — no math)
+    comp_lines = "\n".join(
+        f"  {c.address} | {c.status} | Beds:{c.beds} Baths:{c.baths} SqFt:{c.sqft} "
+        f"| List:{c.list_price} Sale:{c.sale_price or '—'} DOM:{c.dom}"
+        for c in comps
+    )
+    mc_pct    = MARKET_COND_ADJ.get(market_conditions, 0.0)
+    d_pct     = _dom_adj(subject_dom)
+    mc_label  = MARKET_COND_LABEL.get(market_conditions, "Balanced Market")
+    if uad:
+        avg       = uad["avg_adjusted"]
+        list_p    = uad["list_price"]
+        uad_win   = avg * (1 + mc_pct + d_pct)
+        floor_pct = MARKET_LIST_FLOOR.get(market_conditions)
+        floored   = False
+        if floor_pct is not None and list_p > 0:
+            win_offer = max(uad_win, list_p * floor_pct)
+            floored   = win_offer > uad_win
+        else:
+            win_offer = uad_win
+        win_low   = win_offer * 0.97
+        win_high  = win_offer * 1.03
+        win_str   = f"${win_offer:,.0f}"
+        win_range = f"${win_low:,.0f}–${win_high:,.0f}"
+        mc_sign   = "+" if mc_pct >= 0 else ""
+        d_sign    = "+" if d_pct >= 0 else ""
+        floor_note = f"\n⚠ Floor applied: raw comp result was ${uad_win:,.0f} — raised to {win_str} based on {mc_label} conditions." if floored else ""
+        # Offer guidance shown in Step 2 — includes full market-adjusted result
+        offer_guidance_text = (
+            uad["detail_text"]
+            + f"\n\n── Market Conditions Adjustment ──"
+            + f"\nConditions: {mc_label} ({mc_sign}{mc_pct*100:.0f}%)"
+            + (f"\nDOM adjustment ({subject_dom} days): {d_sign}{d_pct*100:.0f}%" if d_pct != 0 else "")
+            + f"\nUAD-adjusted estimate: ${uad_win:,.0f}"
+            + floor_note
+            + f"\n\n✓ ESTIMATED WINNING OFFER: {win_str}"
+            + f"\n  Range: {win_range}"
+        )
+    else:
+        win_str = win_range = ""
+        offer_guidance_text = "No closed comps available for adjustment analysis."
+    uad_summary = (
+        f"Supported value: {uad['supported_value_str']} (avg of {uad['n_comps']} adjusted comps). "
+        f"List price ${uad['list_price']:,.0f} is {abs(uad['pct_diff']):.1f}% {uad['above_below']}. "
+        f"Market conditions: {mc_label} ({'+' if mc_pct>=0 else ''}{mc_pct*100:.0f}%). "
+        f"Estimated winning offer: {win_str}. Recommended range: {win_range}."
+    ) if uad else "No closed comps available for adjustment analysis."
+
+    prompt = f"""You are a real estate analyst. Write a market narrative for a buyer based ONLY on the data below. Do not calculate or mention $/sqft. Do not invent any numbers.
+
+SUBJECT: {subject.address} | Beds:{subject.beds} Baths:{subject.baths} SqFt:{subject.sqft} | List:{subject.list_price}
+
+COMPARABLES:
+{comp_lines}
+
+UAD ADJUSTMENT RESULT (pre-calculated): {uad_summary}
+
+Return ONLY this JSON (no markdown):
+{{
+  "narrative": "2-3 paragraphs using ONLY the numbers above. Cover: (1) closed sale price range citing specific addresses, (2) what the UAD-adjusted supported value means relative to list price, (3) DOM range and what it signals about demand.",
+  "offer_summary": "2-3 plain-English sentences for the buyer. Reference the supported value and offer range from the UAD result above. No math formulas, no jargon."
+}}"""
+
+    headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+    body = {"model": BMR_MODEL, "max_tokens": 1024, "temperature": 0,
+            "messages": [{"role": "user", "content": prompt}]}
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
+        resp.raise_for_status()
+
+    text = resp.json()["content"][0]["text"].strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail=f"Claude returned invalid JSON: {e}")
+
+    return {
+        "narrative":              data.get("narrative", ""),
+        "offer_summary":          data.get("offer_summary", ""),
+        "offer_guidance":         offer_guidance_text,
+        "supported_value":        uad.get("supported_value_str", "") if uad else "",
+        "offer_range":            win_range,
+        "suggested_offer_price":  win_str,
+        "quality_warnings":       uad.get("quality_warnings", []) if uad else [],
+        "n_excluded":             uad.get("n_excluded", 0) if uad else 0,
+    }
+
+@app.post("/api/buyer-report/analyze")
+async def buyer_report_analyze(file: UploadFile = File(...)):
+    if file.content_type not in ("application/pdf", "application/octet-stream"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+    pdf_bytes = await file.read()
+    if len(pdf_bytes) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="PDF exceeds 20 MB limit")
+    analysis = await _bmr_claude(pdf_bytes)
+    result = analysis.model_dump()
+    # Attach comp quality warnings so the frontend can flag issues in Step 2
+    uad = _uad_calc(analysis)
+    result["quality_warnings"] = uad.get("quality_warnings", []) if uad else []
+    result["n_excluded"]       = uad.get("n_excluded", 0) if uad else 0
+    return result
+
+
+@app.post("/api/buyer-report/deploy")
+async def buyer_report_deploy(request: Request):
+    body = await request.json()
+    report_id = str(uuid4())
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=90)).isoformat()
+
+    if body.get("comparison_mode"):
+        # ── Comparison mode: analyze each property independently ──
+        req = BuyerReportComparisonRequest(**body)
+        site_name = f"forward-compare-{str(uuid4())[:6]}"
+        analyses = await _bmr_comparison_claude(req)
+        html = _bmr_build_comparison_html(req, analyses)
+        url = await _bmr_netlify_deploy(html, site_name)
+        try:
+            supabase.table("buyer_reports").insert({
+                "id": report_id, "agent_email": req.agent_email, "agent_name": req.agent_name,
+                "client_name": req.client_name, "subject_address": f"{len(req.candidates)} properties compared",
+                "report_title": req.report_title, "offer_price": "",
+                "netlify_site_name": site_name, "url": url, "expires_at": expires_at,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+        except Exception as e:
+            logger.warning("Supabase buyer_reports insert failed: %s", e)
+        return {"url": url, "report_id": report_id, "expires_at": expires_at}
+
+    else:
+        # ── Standard mode: single subject + comps ──
+        payload = BuyerReportDeployRequest(**body)
+        _addr_parts = payload.analysis.subject.address.lower().split(",")[0].strip().split()
+        if len(_addr_parts) >= 2:
+            _slug_core = re.sub(r"[^a-z0-9]", "", _addr_parts[0]) + re.sub(r"[^a-z0-9]", "", _addr_parts[1])
+        else:
+            _slug_core = re.sub(r"[^a-z0-9]+", "-", payload.analysis.subject.address.lower())[:20].strip("-")
+        site_name = f"forward-{_slug_core}-{str(uuid4())[:4]}"
+        html = _bmr_build_html(payload)
+        url = await _bmr_netlify_deploy(html, site_name)
+        try:
+            supabase.table("buyer_reports").insert({
+                "id": report_id, "agent_email": payload.agent_email, "agent_name": payload.agent_name,
+                "client_name": payload.client_name, "subject_address": payload.analysis.subject.address,
+                "report_title": payload.report_title, "offer_price": payload.offer_price,
+                "netlify_site_name": site_name, "url": url, "expires_at": expires_at,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+        except Exception as e:
+            logger.warning("Supabase buyer_reports insert failed: %s", e)
+        return {"url": url, "report_id": report_id, "expires_at": expires_at}
+
+
+@app.post("/api/parse-offer")
+async def parse_offer(file: UploadFile = File(...)):
+    """Parse a real estate offer PDF and extract structured field data."""
+    if file.content_type not in ("application/pdf", "application/octet-stream"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+    pdf_bytes = await file.read()
+    if len(pdf_bytes) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="PDF exceeds 20 MB limit")
+
+    b64_pdf = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+
+    prompt = """You are parsing a real estate purchase offer contract. Extract ALL of the following fields. Return ONLY a valid JSON object with these exact keys. If a field is not present or not applicable, use an empty string "".
+
+{
+  "buyer_name": "Full name(s) of buyer(s)",
+  "date_submitted": "Date the offer was submitted or contract date",
+  "selling_agent_name": "Buyer's agent / selling agent full name",
+  "agent_phone": "Selling agent phone number",
+  "agent_email": "Selling agent email address",
+  "closing_coordinator": "Closing coordinator or assistant name and contact info",
+  "cash_portion": "Paragraph 3A - cash portion dollar amount",
+  "loan_amount": "Paragraph 3B - loan amount",
+  "sales_price": "Paragraph 3C - total sales price",
+  "earnest_money": "Paragraph 5A - earnest money amount",
+  "option_fee": "Paragraph 5A - option fee amount",
+  "additional_earnest_money": "Paragraph 5A(1) - additional earnest money",
+  "option_period": "Paragraph 5B - option period in days",
+  "title_policy_paid_by": "Paragraph 6A - who pays title policy premium (Buyer or Seller)",
+  "title_company": "Paragraph 6A - title company name",
+  "shortages_expense_of": "Paragraph 6A(8) - shortages in area at expense of",
+  "survey_paid_by": "Paragraph 6C - who pays for new survey",
+  "objections": "Paragraph 6D - any objections noted",
+  "objection_period": "Paragraph 6D - objection period in days",
+  "repairs_requested": "Paragraph 7D(2) - repairs and treatments requested",
+  "residential_service_contract": "Paragraph 7H - residential service contract amount",
+  "closing_date": "Paragraph 9A - closing date",
+  "possession": "Paragraph 10A - possession terms",
+  "buyer_contingencies": "Any buyer contingencies (financing, inspection, sale of current home, etc.)",
+  "seller_contingencies": "Any seller contingencies",
+  "non_realty_items": "Non-realty items requested by buyer",
+  "non_realty_sum": "Dollar sum offered for non-realty items",
+  "proof_of_funds": "Whether proof of funds was received or mentioned (Yes / No / Not mentioned)",
+  "pre_approval_letter": "Whether pre-approval letter was received or mentioned (Yes / No / Not mentioned)",
+  "loan_type": "Type of financing (Conventional, FHA, VA, Cash, etc.)",
+  "lender_name": "Name of lender or mortgage company",
+  "hoa_resale_paid_by": "Who pays HOA resale package (Buyer or Seller)",
+  "hoa_resale_fees": "Buyer HOA resale fees not to exceed amount",
+  "appraisal_waiver": "Whether buyer is waiving appraisal contingency (Yes / No / Partial)",
+  "appraisal_price_delta": "Appraisal gap coverage — amount buyer will cover above appraised value",
+  "proof_of_funds_appraisal": "Proof of funds for appraisal waiver provided (Yes / No / Not mentioned)",
+  "seller_temp_lease_offered": "Whether seller is requesting a leaseback after closing (Yes / No)",
+  "seller_temp_lease_days": "Number of days for seller leaseback",
+  "seller_temp_lease_price": "Seller leaseback price per day",
+  "buyer_temp_lease_requested": "Whether buyer requested temporary lease before closing (Yes / No)",
+  "buyer_temp_lease_days": "Number of days for buyer temporary lease",
+  "buyer_temp_lease_price": "Buyer temporary lease price per day",
+  "net_to_seller": "Net to seller if calculable — leave blank if not",
+  "buyer_agent_compensation": "Buyer agent compensation requested from seller — dollar amount or percentage",
+  "additional_notes": "Any other notable terms, conditions, escalation clauses, or special provisions not captured above"
+}
+
+Return ONLY the JSON object. No explanation, no markdown, no code fences."""
+
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    payload = {
+        "model": BMR_MODEL,
+        "max_tokens": 2500,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "document",
+                    "source": {"type": "base64", "media_type": "application/pdf", "data": b64_pdf}
+                },
+                {"type": "text", "text": prompt}
+            ]
+        }]
+    }
+
+    async with httpx.AsyncClient(timeout=90) as client:
+        resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
+        resp.raise_for_status()
+
+    raw = resp.json()["content"][0]["text"].strip()
+    raw = re.sub(r"^```(?:json)?\n?", "", raw)
+    raw = re.sub(r"\n?```$", "", raw)
+    return json.loads(raw)
+
+
+class AnalyzeOffersRequest(BaseModel):
+    offers: list[dict]
+    property_address: str = ""
+    list_price: str = ""
+
+
+@app.post("/api/analyze-offers")
+async def analyze_offers(payload: AnalyzeOffersRequest):
+    """Generate agent-facing AI analysis of multiple offers."""
+    if not payload.offers:
+        raise HTTPException(status_code=400, detail="No offers provided")
+
+    def _fmt(offers: list[dict]) -> str:
+        lines = []
+        for o in offers:
+            n = o.get("offer_number", "?")
+            d = o.get("offer_data", {})
+            lines.append(f"""OFFER {n}:
+  Buyer: {d.get('buyer_name') or '—'}
+  Sales Price: {d.get('sales_price') or '—'}
+  Financing: {d.get('loan_type') or '—'} | Loan: {d.get('loan_amount') or '—'} | Cash: {d.get('cash_portion') or '—'}
+  Closing Date: {d.get('closing_date') or '—'} | Possession: {d.get('possession') or '—'}
+  Earnest Money: {d.get('earnest_money') or '—'} | Option Fee: {d.get('option_fee') or '—'} | Option Period: {d.get('option_period') or '—'} days
+  Appraisal Waiver: {d.get('appraisal_waiver') or '—'} | Appraisal Gap: {d.get('appraisal_price_delta') or '—'}
+  Title Paid By: {d.get('title_policy_paid_by') or '—'} | Survey: {d.get('survey_paid_by') or '—'}
+  Repairs Requested: {d.get('repairs_requested') or '—'}
+  Buyer Contingencies: {d.get('buyer_contingencies') or '—'}
+  Seller Contingencies: {d.get('seller_contingencies') or '—'}
+  HOA Resale: {d.get('hoa_resale_paid_by') or '—'} | HOA Fees Cap: {d.get('hoa_resale_fees') or '—'}
+  Buyer Agent Compensation: {d.get('buyer_agent_compensation') or '—'}
+  Pre-Approval: {d.get('pre_approval_letter') or '—'} | Proof of Funds: {d.get('proof_of_funds') or '—'}
+  Seller Leaseback: {d.get('seller_temp_lease_offered') or '—'} ({d.get('seller_temp_lease_days') or ''} days @ {d.get('seller_temp_lease_price') or ''}/day)
+  Non-Realty Items: {d.get('non_realty_items') or '—'} (sum: {d.get('non_realty_sum') or '—'})
+  Additional Notes: {d.get('additional_notes') or '—'}""")
+        return "\n\n".join(lines)
+
+    prompt = f"""You are an expert real estate listing agent advising a colleague who has received {len(payload.offers)} offers on their listing.
+
+Property: {payload.property_address or "Not specified"}
+List Price: {payload.list_price or "Not specified"}
+
+OFFERS RECEIVED:
+{_fmt(payload.offers)}
+
+Output your analysis using EXACTLY the section markers and bullet format shown below. Do not add any text before the first marker.
+
+---STRONGEST OFFER---
+• [Why this offer is strongest — price, net to seller, or terms advantage]
+• [Financing strength — down payment %, pre-approval headroom, cash reserves]
+• [Risk comparison vs. other offers — appraisal, inspection, contingencies]
+• [Any additional differentiator — closing timeline, leaseback, earnest money]
+
+---LIKELIHOOD TO CLOSE---
+OFFER 1:
+• [1-sentence close likelihood rating]
+• [Primary risk factor with specific dollar or % figure]
+OFFER 2:
+• [1-sentence close likelihood rating]
+• [Primary risk factor with specific dollar or % figure]
+[Repeat for each offer received]
+
+---COUNTER STRATEGY---
+OFFER 1:
+• [Specific counter price recommendation with dollar figure]
+• [Key term to change — repairs cap, earnest money, appraisal gap, timeline]
+• [What to insist on and why — use dollar amounts]
+OFFER 2:
+• [Specific counter price recommendation with dollar figure]
+• [Key term to change]
+• [What to insist on and why]
+[Repeat for each offer received]
+
+---TALKING POINTS FOR SELLER CONVERSATION---
+• [How to explain price vs. terms tradeoff to the seller]
+• [How to explain financing risk in plain language — avoid jargon]
+• [Appraisal gap or waiver implications for this seller specifically]
+• [Closing timeline fit — does it match seller's needs?]
+• [How to frame the decision without steering — seller chooses]
+• [Anything else specific to these offers the seller must understand]
+
+Rules:
+- Use OFFER 1:, OFFER 2: etc. (with colon) as the only sub-headers inside sections
+- Every point must start with • and use actual numbers from the offers
+- Do not repeat section header names inside the section body
+- This is for the agent's eyes only — be direct and specific"""
+
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    body = {
+        "model": BMR_MODEL,
+        "max_tokens": 2500,
+        "temperature": 0,
+        "messages": [{"role": "user", "content": prompt}]
+    }
+
+    async with httpx.AsyncClient(timeout=90) as client:
+        resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
+        resp.raise_for_status()
+
+    raw = resp.json()["content"][0]["text"].strip()
+
+    # Parse into structured sections so frontend renders reliably
+    def _parse_sections(txt):
+        markers = [
+            ("strongest",  "---STRONGEST OFFER---"),
+            ("likelihood", "---LIKELIHOOD TO CLOSE---"),
+            ("counter",    "---COUNTER STRATEGY---"),
+            ("talking",    "---TALKING POINTS FOR SELLER CONVERSATION---"),
+        ]
+        positions = []
+        for key, marker in markers:
+            idx = txt.find(marker)
+            positions.append((idx, key, marker))
+        positions.sort()
+
+        extracted = {}
+        for i, (idx, key, marker) in enumerate(positions):
+            if idx == -1:
+                extracted[key] = ""
+                continue
+            start = idx + len(marker)
+            next_idx = positions[i + 1][0] if i + 1 < len(positions) else -1
+            chunk = txt[start:next_idx].strip() if next_idx != -1 else txt[start:].strip()
+            extracted[key] = chunk
+
+        def split_bullets(text):
+            if not text:
+                return []
+            import re
+            return [p.strip() for p in re.split(r'[\n•·]+\s*', text) if p.strip()]
+
+        def split_offer_blocks(text):
+            if not text:
+                return []
+            import re
+            parts = re.split(r'(?=(?:^|\n)OFFER \d+:)', text, flags=re.IGNORECASE)
+            if len(parts) <= 1:
+                parts = re.split(r'(?=(?:^|\n)Offer \d+:)', text, flags=re.IGNORECASE)
+            if len(parts) <= 1:
+                return [{"label": "", "bullets": split_bullets(text)}]
+            blocks = []
+            for p in parts:
+                p = p.strip()
+                if not p:
+                    continue
+                m = re.match(r'^(OFFER \d+|Offer \d+):\s*([\s\S]*)$', p, re.IGNORECASE)
+                if m:
+                    num = re.sub(r'\D', '', m.group(1))
+                    blocks.append({"label": f"Offer {num}", "bullets": split_bullets(m.group(2).strip())})
+                else:
+                    blocks.append({"label": "", "bullets": split_bullets(p)})
+            return blocks
+
+        return {
+            "strongest":  split_bullets(extracted.get("strongest", "")),
+            "likelihood": split_offer_blocks(extracted.get("likelihood", "")),
+            "counter":    split_offer_blocks(extracted.get("counter", "")),
+            "talking":    split_bullets(extracted.get("talking", "")),
+        }
+
+    try:
+        sections = _parse_sections(raw)
+    except Exception as e:
+        logger.error("_parse_sections failed: %s", e)
+        sections = None
+    return {"analysis": raw, "sections": sections}
+
+
+# ---------------------------------------------------------------------------
+# Offer Chat — follow-up Q&A after initial analysis
+# ---------------------------------------------------------------------------
+class ChatOffersRequest(BaseModel):
+    offers: list[dict]
+    analysis: str = ""
+    history: list[dict] = []   # [{role:"user",content:"..."},{role:"assistant",content:"..."}]
+    question: str
+    property_address: str = ""
+    list_price: str = ""
+
+@app.post("/api/chat-offers")
+async def chat_offers(payload: ChatOffersRequest):
+    """Follow-up conversational Q&A about offers, retaining full context."""
+    if not payload.question.strip():
+        raise HTTPException(status_code=400, detail="Question required")
+
+    def _fmt_chat(offers):
+        lines = []
+        for o in offers:
+            n = o.get("offer_number", "?")
+            d = o.get("offer_data", {})
+            lines.append(f"Offer {n}: Price {d.get('sales_price') or '—'} | {d.get('loan_type') or '—'} | "
+                         f"Close {d.get('closing_date') or '—'} | Option {d.get('option_period') or '—'}d | "
+                         f"Appraisal waiver: {d.get('appraisal_waiver') or '—'} | "
+                         f"Earnest {d.get('earnest_money') or '—'} | Contingencies: {d.get('buyer_contingencies') or '—'} | "
+                         f"Seller credit: {d.get('seller_contingencies') or '—'} | "
+                         f"Net to seller: {d.get('net_to_seller') or '—'}")
+        return "\n".join(lines)
+
+    system = f"""You are an expert real estate listing agent advising a colleague on multiple offers for their listing.
+
+Property: {payload.property_address or "Not specified"} | List Price: {payload.list_price or "Not specified"}
+
+CURRENT OFFER TERMS:
+{_fmt_chat(payload.offers)}
+
+INITIAL ANALYSIS ALREADY PROVIDED:
+{payload.analysis or "Not yet generated."}
+
+Answer the agent's follow-up questions directly and specifically. Use actual numbers from the offers. Be concise — 2–4 sentences unless complexity warrants more. This is agent-only, confidential."""
+
+    messages = [{"role": h["role"], "content": h["content"]} for h in payload.history]
+    messages.append({"role": "user", "content": payload.question})
+
+    headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+    body = {"model": BMR_MODEL, "max_tokens": 1024, "temperature": 0, "system": system, "messages": messages}
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
+        resp.raise_for_status()
+
+    return {"answer": resp.json()["content"][0]["text"].strip()}
