@@ -1965,3 +1965,117 @@ Answer the agent's follow-up questions directly and specifically. Use actual num
         resp.raise_for_status()
 
     return {"answer": resp.json()["content"][0]["text"].strip()}
+
+
+# ── Property Management (service_role — bypasses RLS for all agents) ──────
+
+class CreatePropertyRequest(BaseModel):
+    address: str
+    agent_name: str
+    agent_email: str
+    seller_name: str = ""
+    seller_name_2: str = ""
+    market: str = "DC"
+    status: str = "draft"
+
+@app.post("/create-property")
+async def create_property(req: CreatePropertyRequest):
+    """
+    Create a property record using the service_role key — bypasses RLS,
+    works for every agent on every device without auth tokens.
+    """
+    if not req.address.strip():
+        raise HTTPException(status_code=400, detail="Address is required.")
+
+    prop_data = {
+        "address":       req.address.strip(),
+        "agent_name":    req.agent_name,
+        "agent_email":   req.agent_email,
+        "seller_name":   req.seller_name,
+        "seller_name_2": req.seller_name_2 or None,
+        "market":        req.market,
+        "status":        req.status,
+        "drive_folder_id":     "",
+        "subfolder_drive_ids": {},
+    }
+
+    try:
+        result = supabase.table("properties").insert(prop_data).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database insert failed: {e}")
+
+    if not result.data:
+        raise HTTPException(status_code=500, detail="Insert returned no data.")
+
+    prop = result.data[0]
+
+    # ── Try to create Drive folder structure ─────────────────────────────
+    drive_folder_id = ""
+    subfolder_ids = {}
+    properties_root = os.environ.get("PROPERTIES_DRIVE_FOLDER_ID", "")
+
+    if properties_root:
+        try:
+            from googleapiclient.discovery import build as gdrive_build
+            sa_info = json.loads(GOOGLE_SA_JSON)
+            creds = service_account.Credentials.from_service_account_info(
+                sa_info,
+                scopes=["https://www.googleapis.com/auth/drive"]
+            )
+            svc = gdrive_build("drive", "v3", credentials=creds, cache_discovery=False)
+
+            def make_folder(name, parent_id):
+                meta = {
+                    "name": name,
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [parent_id],
+                }
+                f = svc.files().create(body=meta, fields="id").execute()
+                return f["id"]
+
+            drive_folder_id = make_folder(req.address, properties_root)
+            subfolders = ["Photos", "CMA", "Net Sheet", "Listing Description",
+                          "MLS Data", "Seller Prep", "Campaign"]
+            sub_keys   = ["listing_photos", "cma", "seller_net_sheet",
+                          "listing_remarks", "mls_data", "cma", "campaign"]
+            for label, key in zip(subfolders, sub_keys):
+                fid = make_folder(label, drive_folder_id)
+                if key not in subfolder_ids:
+                    subfolder_ids[key] = fid
+
+            # Update Supabase record with Drive IDs
+            supabase.table("properties").update({
+                "drive_folder_id":     drive_folder_id,
+                "subfolder_drive_ids": subfolder_ids,
+            }).eq("id", prop["id"]).execute()
+
+            prop["drive_folder_id"]     = drive_folder_id
+            prop["subfolder_drive_ids"] = subfolder_ids
+
+        except Exception as drive_err:
+            logger.warning("Drive folder creation skipped: %s", drive_err)
+
+    return prop
+
+
+@app.get("/properties")
+async def get_all_properties():
+    """
+    Fetch ALL properties for the team using service_role — no agent filter,
+    always returns the full team view for every agent.
+    """
+    try:
+        result = supabase.table("properties").select("*").order("created_at", desc=True).execute()
+        return result.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/properties/{property_id}")
+async def delete_property(property_id: str):
+    """Delete a property record (service_role, works for any agent)."""
+    try:
+        supabase.table("properties").delete().eq("id", property_id).execute()
+        return {"deleted": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
