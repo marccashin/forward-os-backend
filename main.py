@@ -2062,15 +2062,18 @@ async def create_property(req: CreatePropertyRequest):
 async def get_all_properties(agent_name: Optional[str] = None):
     """
     Fetch properties via service_role.
-    - No agent_name param → return all (admin view)
-    - agent_name param → return only that agent's properties
+    - No agent_name → all properties (admin view)
+    - agent_name → primary agent OR listed as co-agent
     """
     try:
-        q = supabase.table("properties").select("*").order("created_at", desc=True)
-        if agent_name:
-            q = q.eq("agent_name", agent_name)
-        result = q.execute()
-        return result.data or []
+        result = supabase.table("properties").select("*").order("created_at", desc=True).execute()
+        all_props = result.data or []
+        if not agent_name:
+            return all_props
+        # Return records where agent is primary OR co-agent
+        return [p for p in all_props if
+                p.get("agent_name") == agent_name or
+                agent_name in (p.get("subfolder_drive_ids") or {}).get("_co_agents", [])]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2123,15 +2126,17 @@ async def create_buyer(req: CreateBuyerRequest):
 async def get_all_buyers(agent_name: Optional[str] = None):
     """
     Fetch buyers via service_role.
-    - No agent_name param → return all active buyers (admin view)
-    - agent_name param → return only that agent's active buyers
+    - No agent_name → all active buyers (admin view)
+    - agent_name → primary agent OR listed as co-agent
     """
     try:
-        q = supabase.table("buyers").select("*").eq("status", "active").order("created_at", desc=True)
-        if agent_name:
-            q = q.eq("agent_name", agent_name)
-        result = q.execute()
-        return result.data or []
+        result = supabase.table("buyers").select("*").eq("status", "active").order("created_at", desc=True).execute()
+        all_buyers = result.data or []
+        if not agent_name:
+            return all_buyers
+        return [b for b in all_buyers if
+                b.get("agent_name") == agent_name or
+                agent_name in (b.get("subfolder_drive_ids") or {}).get("_co_agents", [])]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2190,3 +2195,78 @@ async def create_revision(req: CreateRevisionRequest):
         return result.data[0] if result.data else {"created": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Deal Partners (co-agents on listings and buyers) ──────────────────────
+# Co-agents are stored as _co_agents key inside the existing
+# subfolder_drive_ids JSONB column — no schema migration required.
+
+AGENT_LIST = [
+    "Marc Cashin", "Ash McGowan", "Niki Lang",
+    "Cesar Rivera", "Charlotte Lee", "Shannon Casey"
+]
+
+def _get_co_agents(record: dict) -> list:
+    sdi = record.get("subfolder_drive_ids") or {}
+    return sdi.get("_co_agents", [])
+
+def _set_co_agents(record: dict, co_agents: list) -> dict:
+    sdi = dict(record.get("subfolder_drive_ids") or {})
+    sdi["_co_agents"] = co_agents
+    return sdi
+
+
+class PartnerRequest(BaseModel):
+    agent_name: str
+
+
+@app.post("/properties/{property_id}/add-partner")
+async def add_property_partner(property_id: str, req: PartnerRequest):
+    result = supabase.table("properties").select("subfolder_drive_ids").eq("id", property_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Property not found.")
+    record = result.data[0]
+    co_agents = _get_co_agents(record)
+    if req.agent_name not in co_agents:
+        co_agents.append(req.agent_name)
+    new_sdi = _set_co_agents(record, co_agents)
+    supabase.table("properties").update({"subfolder_drive_ids": new_sdi}).eq("id", property_id).execute()
+    return {"co_agents": co_agents}
+
+
+@app.post("/properties/{property_id}/remove-partner")
+async def remove_property_partner(property_id: str, req: PartnerRequest):
+    result = supabase.table("properties").select("subfolder_drive_ids").eq("id", property_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Property not found.")
+    record = result.data[0]
+    co_agents = [a for a in _get_co_agents(record) if a != req.agent_name]
+    new_sdi = _set_co_agents(record, co_agents)
+    supabase.table("properties").update({"subfolder_drive_ids": new_sdi}).eq("id", property_id).execute()
+    return {"co_agents": co_agents}
+
+
+@app.post("/buyers/{buyer_id}/add-partner")
+async def add_buyer_partner(buyer_id: str, req: PartnerRequest):
+    result = supabase.table("buyers").select("subfolder_drive_ids").eq("id", buyer_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Buyer not found.")
+    record = result.data[0]
+    co_agents = _get_co_agents(record)
+    if req.agent_name not in co_agents:
+        co_agents.append(req.agent_name)
+    new_sdi = _set_co_agents(record, co_agents)
+    supabase.table("buyers").update({"subfolder_drive_ids": new_sdi}).eq("id", buyer_id).execute()
+    return {"co_agents": co_agents}
+
+
+@app.post("/buyers/{buyer_id}/remove-partner")
+async def remove_buyer_partner(buyer_id: str, req: PartnerRequest):
+    result = supabase.table("buyers").select("subfolder_drive_ids").eq("id", buyer_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Buyer not found.")
+    record = result.data[0]
+    co_agents = [a for a in _get_co_agents(record) if a != req.agent_name]
+    new_sdi = _set_co_agents(record, co_agents)
+    supabase.table("buyers").update({"subfolder_drive_ids": new_sdi}).eq("id", buyer_id).execute()
+    return {"co_agents": co_agents}
