@@ -2059,13 +2059,17 @@ async def create_property(req: CreatePropertyRequest):
 
 
 @app.get("/properties")
-async def get_all_properties():
+async def get_all_properties(agent_name: Optional[str] = None):
     """
-    Fetch ALL properties for the team using service_role — no agent filter,
-    always returns the full team view for every agent.
+    Fetch properties via service_role.
+    - No agent_name param → return all (admin view)
+    - agent_name param → return only that agent's properties
     """
     try:
-        result = supabase.table("properties").select("*").order("created_at", desc=True).execute()
+        q = supabase.table("properties").select("*").order("created_at", desc=True)
+        if agent_name:
+            q = q.eq("agent_name", agent_name)
+        result = q.execute()
         return result.data or []
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -2116,10 +2120,17 @@ async def create_buyer(req: CreateBuyerRequest):
 
 
 @app.get("/buyers")
-async def get_all_buyers():
-    """Fetch ALL active buyers for the team — no agent filter, fully global."""
+async def get_all_buyers(agent_name: Optional[str] = None):
+    """
+    Fetch buyers via service_role.
+    - No agent_name param → return all active buyers (admin view)
+    - agent_name param → return only that agent's active buyers
+    """
     try:
-        result = supabase.table("buyers").select("*").eq("status", "active").order("created_at", desc=True).execute()
+        q = supabase.table("buyers").select("*").eq("status", "active").order("created_at", desc=True)
+        if agent_name:
+            q = q.eq("agent_name", agent_name)
+        result = q.execute()
         return result.data or []
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
