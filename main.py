@@ -2079,3 +2079,103 @@ async def delete_property(property_id: str):
         return {"deleted": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Buyer Management (service_role — bypasses RLS for all agents) ──────────
+
+class CreateBuyerRequest(BaseModel):
+    buyer_name: str
+    agent_name: str
+    agent_email: str = ""
+    email: str = ""
+    phone: str = ""
+    status: str = "active"
+
+@app.post("/create-buyer")
+async def create_buyer(req: CreateBuyerRequest):
+    """Insert a buyer using service_role — works for every agent."""
+    if not req.buyer_name.strip():
+        raise HTTPException(status_code=400, detail="buyer_name is required.")
+    data = {
+        "buyer_name":  req.buyer_name.strip(),
+        "agent_name":  req.agent_name,
+        "agent_email": req.agent_email,
+        "email":       req.email or None,
+        "phone":       req.phone or None,
+        "status":      req.status,
+        "drive_folder_id":     "",
+        "subfolder_drive_ids": {},
+    }
+    try:
+        result = supabase.table("buyers").insert(data).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database insert failed: {e}")
+    if not result.data:
+        raise HTTPException(status_code=500, detail="Insert returned no data.")
+    return result.data[0]
+
+
+@app.get("/buyers")
+async def get_all_buyers():
+    """Fetch ALL active buyers for the team — no agent filter, fully global."""
+    try:
+        result = supabase.table("buyers").select("*").eq("status", "active").order("created_at", desc=True).execute()
+        return result.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/buyers/{buyer_id}")
+async def delete_buyer(buyer_id: str):
+    """Delete a buyer (service_role, works for any agent)."""
+    try:
+        supabase.table("buyers").delete().eq("id", buyer_id).execute()
+        return {"deleted": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Generic property / buyer update (service_role) ────────────────────────
+
+class UpdateRecordRequest(BaseModel):
+    fields: dict
+
+@app.patch("/properties/{property_id}")
+async def update_property(property_id: str, req: UpdateRecordRequest):
+    """PATCH any property fields via service_role — works for every agent."""
+    try:
+        result = supabase.table("properties").update(req.fields).eq("id", property_id).execute()
+        return result.data[0] if result.data else {"updated": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/buyers/{buyer_id}")
+async def update_buyer(buyer_id: str, req: UpdateRecordRequest):
+    """PATCH any buyer fields via service_role — works for every agent."""
+    try:
+        result = supabase.table("buyers").update(req.fields).eq("id", buyer_id).execute()
+        return result.data[0] if result.data else {"updated": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Revision requests (service_role) ──────────────────────────────────────
+
+class CreateRevisionRequest(BaseModel):
+    property_id: str
+    revision_number: int
+    requested_by_email: str
+    requested_by_name: str
+    revision_notes: str = ""
+    input_method: str = "text"
+    status: str = "pending"
+
+@app.post("/create-revision")
+async def create_revision(req: CreateRevisionRequest):
+    """Insert a revision request via service_role."""
+    try:
+        result = supabase.table("revision_requests").insert(req.dict()).execute()
+        return result.data[0] if result.data else {"created": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
