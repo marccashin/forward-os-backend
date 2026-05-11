@@ -1967,306 +1967,126 @@ Answer the agent's follow-up questions directly and specifically. Use actual num
     return {"answer": resp.json()["content"][0]["text"].strip()}
 
 
-# ── Property Management (service_role — bypasses RLS for all agents) ──────
+# ── Market Report Links ──────────────────────────────────────────────────────
+
+class MarketReportLinksRequest(BaseModel):
+    dc: str = ""
+    nova: str = ""
+    montgomery: str = ""
+    loudoun: str = ""
+    countryside: str = ""
+
+@app.post("/market-reports/update")
+async def update_market_report_links(payload: MarketReportLinksRequest):
+    """Called by the scheduled task after uploading PDFs to Drive.
+    Writes the new Drive links into property_notes so FORWARD OS picks them up."""
+    links = {
+        "dc":          payload.dc,
+        "nova":        payload.nova,
+        "montgomery":  payload.montgomery,
+        "loudoun":     payload.loudoun,
+        "countryside": payload.countryside,
+    }
+    content = json.dumps(links)
+
+    # Delete existing record
+    supabase.table("property_notes").delete().eq("property_id", "__market_reports__").eq("subfolder", "links").execute()
+
+    # Insert fresh record
+    supabase.table("property_notes").insert({
+        "property_id": "__market_reports__",
+        "subfolder":   "links",
+        "content":     content,
+        "updated_by":  "scheduled-task"
+    }).execute()
+
+    return {"ok": True, "links": links}
+
+
+@app.get("/market-reports")
+async def get_market_report_links():
+    """Returns the current market report Drive links."""
+    rows = supabase.table("property_notes").select("content").eq("property_id", "__market_reports__").eq("subfolder", "links").order("updated_at", desc=True).limit(1).execute()
+    if rows.data:
+        import json as _json
+        try:
+            return {"ok": True, "links": _json.loads(rows.data[0]["content"])}
+        except Exception:
+            pass
+    return {"ok": True, "links": {}}
+
+
+# ── Property Management ──────────────────────────────────────────────────────
 
 class CreatePropertyRequest(BaseModel):
     address: str
-    agent_name: str
-    agent_email: str
+    agent_name: str = ""
+    agent_email: str = ""
     seller_name: str = ""
-    seller_name_2: str = ""
     market: str = "DC"
     status: str = "draft"
+    # co_seller stored in subfolder_drive_ids JSONB — no dedicated column
+    co_seller: str = ""
 
 @app.post("/create-property")
-async def create_property(req: CreatePropertyRequest):
-    """
-    Create a property record using the service_role key — bypasses RLS,
-    works for every agent on every device without auth tokens.
-    """
-    if not req.address.strip():
-        raise HTTPException(status_code=400, detail="Address is required.")
-
-    prop_data = {
-        "address":       req.address.strip(),
-        "agent_name":    req.agent_name,
-        "agent_email":   req.agent_email,
-        "seller_name":   req.seller_name,
-        "seller_name_2": req.seller_name_2 or None,
-        "market":        req.market,
-        "status":        req.status,
-        "drive_folder_id":     "",
-        "subfolder_drive_ids": {},
+async def create_property(payload: CreatePropertyRequest):
+    """Create a new property record. co_seller stored in subfolder_drive_ids JSONB."""
+    insert_data = {
+        "address":     payload.address,
+        "agent_name":  payload.agent_name,
+        "agent_email": payload.agent_email,
+        "seller_name": payload.seller_name,
+        "market":      payload.market,
+        "status":      payload.status,
     }
+    if payload.co_seller:
+        insert_data["subfolder_drive_ids"] = {"_co_seller": payload.co_seller}
 
     try:
-        result = supabase.table("properties").insert(prop_data).execute()
+        result = supabase.table("properties").insert(insert_data).execute()
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Insert returned no data")
+        return result.data[0]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database insert failed: {e}")
 
-    if not result.data:
-        raise HTTPException(status_code=500, detail="Insert returned no data.")
 
-    prop = result.data[0]
+class SavePropertyNoteRequest(BaseModel):
+    property_id: str
+    subfolder: str
+    content: str
 
-    # ── Try to create Drive folder structure ─────────────────────────────
-    drive_folder_id = ""
-    subfolder_ids = {}
-    properties_root = os.environ.get("PROPERTIES_DRIVE_FOLDER_ID", "")
-
-    if properties_root:
-        try:
-            from googleapiclient.discovery import build as gdrive_build
-            sa_info = json.loads(GOOGLE_SA_JSON)
-            creds = service_account.Credentials.from_service_account_info(
-                sa_info,
-                scopes=["https://www.googleapis.com/auth/drive"]
-            )
-            svc = gdrive_build("drive", "v3", credentials=creds, cache_discovery=False)
-
-            def make_folder(name, parent_id):
-                meta = {
-                    "name": name,
-                    "mimeType": "application/vnd.google-apps.folder",
-                    "parents": [parent_id],
-                }
-                f = svc.files().create(body=meta, fields="id").execute()
-                return f["id"]
-
-            drive_folder_id = make_folder(req.address, properties_root)
-            subfolders = ["Photos", "CMA", "Net Sheet", "Listing Description",
-                          "MLS Data", "Seller Prep", "Campaign"]
-            sub_keys   = ["listing_photos", "cma", "seller_net_sheet",
-                          "listing_remarks", "mls_data", "cma", "campaign"]
-            for label, key in zip(subfolders, sub_keys):
-                fid = make_folder(label, drive_folder_id)
-                if key not in subfolder_ids:
-                    subfolder_ids[key] = fid
-
-            # Update Supabase record with Drive IDs
-            supabase.table("properties").update({
-                "drive_folder_id":     drive_folder_id,
-                "subfolder_drive_ids": subfolder_ids,
-            }).eq("id", prop["id"]).execute()
-
-            prop["drive_folder_id"]     = drive_folder_id
-            prop["subfolder_drive_ids"] = subfolder_ids
-
-        except Exception as drive_err:
-            logger.warning("Drive folder creation skipped: %s", drive_err)
-
-    return prop
-
-
-@app.get("/properties")
-async def get_all_properties(agent_name: Optional[str] = None):
-    """
-    Fetch properties via service_role.
-    - No agent_name → all properties (admin view)
-    - agent_name → primary agent OR listed as co-agent
-    """
+@app.post("/save-property-note")
+async def save_property_note(payload: SavePropertyNoteRequest):
+    """Upsert a property note via service role key — bypasses RLS."""
     try:
-        result = supabase.table("properties").select("*").order("created_at", desc=True).execute()
-        all_props = result.data or []
-        if not agent_name:
-            return all_props
-        # Return records where agent is primary OR co-agent
-        return [p for p in all_props if
-                p.get("agent_name") == agent_name or
-                agent_name in (p.get("subfolder_drive_ids") or {}).get("_co_agents", [])]
+        supabase.table("property_notes") \
+            .delete() \
+            .eq("property_id", payload.property_id) \
+            .eq("subfolder", payload.subfolder) \
+            .execute()
+        result = supabase.table("property_notes").insert({
+            "property_id": payload.property_id,
+            "subfolder":   payload.subfolder,
+            "content":     payload.content,
+        }).execute()
+        return result.data[0] if result.data else {"ok": True}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Save note failed: {e}")
 
 
-@app.delete("/properties/{property_id}")
-async def delete_property(property_id: str):
-    """Delete a property record (service_role, works for any agent)."""
-    try:
-        supabase.table("properties").delete().eq("id", property_id).execute()
-        return {"deleted": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ── Buyer Management (service_role — bypasses RLS for all agents) ──────────
-
-class CreateBuyerRequest(BaseModel):
-    buyer_name: str
-    agent_name: str
-    agent_email: str = ""
-    email: str = ""
-    phone: str = ""
-    status: str = "active"
-
-@app.post("/create-buyer")
-async def create_buyer(req: CreateBuyerRequest):
-    """Insert a buyer using service_role — works for every agent."""
-    if not req.buyer_name.strip():
-        raise HTTPException(status_code=400, detail="buyer_name is required.")
-    data = {
-        "buyer_name":  req.buyer_name.strip(),
-        "agent_name":  req.agent_name,
-        "agent_email": req.agent_email,
-        "email":       req.email or None,
-        "phone":       req.phone or None,
-        "status":      req.status,
-        "drive_folder_id":     "",
-        "subfolder_drive_ids": {},
-    }
-    try:
-        result = supabase.table("buyers").insert(data).execute()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database insert failed: {e}")
-    if not result.data:
-        raise HTTPException(status_code=500, detail="Insert returned no data.")
-    return result.data[0]
-
-
-@app.get("/buyers")
-async def get_all_buyers(agent_name: Optional[str] = None):
-    """
-    Fetch buyers via service_role.
-    - No agent_name → all active buyers (admin view)
-    - agent_name → primary agent OR listed as co-agent
-    """
-    try:
-        result = supabase.table("buyers").select("*").eq("status", "active").order("created_at", desc=True).execute()
-        all_buyers = result.data or []
-        if not agent_name:
-            return all_buyers
-        return [b for b in all_buyers if
-                b.get("agent_name") == agent_name or
-                agent_name in (b.get("subfolder_drive_ids") or {}).get("_co_agents", [])]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.delete("/buyers/{buyer_id}")
-async def delete_buyer(buyer_id: str):
-    """Delete a buyer (service_role, works for any agent)."""
-    try:
-        supabase.table("buyers").delete().eq("id", buyer_id).execute()
-        return {"deleted": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ── Generic property / buyer update (service_role) ────────────────────────
-
-class UpdateRecordRequest(BaseModel):
+class UpdatePropertyRequest(BaseModel):
     fields: dict
 
 @app.patch("/properties/{property_id}")
-async def update_property(property_id: str, req: UpdateRecordRequest):
-    """PATCH any property fields via service_role — works for every agent."""
+async def update_property(property_id: str, payload: UpdatePropertyRequest):
+    """Update specific fields on a property record."""
+    allowed = {"seller_name", "address", "status", "market", "agent_name"}
+    safe_fields = {k: v for k, v in payload.fields.items() if k in allowed}
+    if not safe_fields:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
     try:
-        result = supabase.table("properties").update(req.fields).eq("id", property_id).execute()
-        return result.data[0] if result.data else {"updated": True}
+        result = supabase.table("properties").update(safe_fields).eq("id", property_id).execute()
+        return result.data[0] if result.data else {"ok": True}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.patch("/buyers/{buyer_id}")
-async def update_buyer(buyer_id: str, req: UpdateRecordRequest):
-    """PATCH any buyer fields via service_role — works for every agent."""
-    try:
-        result = supabase.table("buyers").update(req.fields).eq("id", buyer_id).execute()
-        return result.data[0] if result.data else {"updated": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ── Revision requests (service_role) ──────────────────────────────────────
-
-class CreateRevisionRequest(BaseModel):
-    property_id: str
-    revision_number: int
-    requested_by_email: str
-    requested_by_name: str
-    revision_notes: str = ""
-    input_method: str = "text"
-    status: str = "pending"
-
-@app.post("/create-revision")
-async def create_revision(req: CreateRevisionRequest):
-    """Insert a revision request via service_role."""
-    try:
-        result = supabase.table("revision_requests").insert(req.dict()).execute()
-        return result.data[0] if result.data else {"created": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ── Deal Partners (co-agents on listings and buyers) ──────────────────────
-# Co-agents are stored as _co_agents key inside the existing
-# subfolder_drive_ids JSONB column — no schema migration required.
-
-AGENT_LIST = [
-    "Marc Cashin", "Ash McGowan", "Niki Lang",
-    "Cesar Rivera", "Charlotte Lee", "Shannon Casey"
-]
-
-def _get_co_agents(record: dict) -> list:
-    sdi = record.get("subfolder_drive_ids") or {}
-    return sdi.get("_co_agents", [])
-
-def _set_co_agents(record: dict, co_agents: list) -> dict:
-    sdi = dict(record.get("subfolder_drive_ids") or {})
-    sdi["_co_agents"] = co_agents
-    return sdi
-
-
-class PartnerRequest(BaseModel):
-    agent_name: str
-
-
-@app.post("/properties/{property_id}/add-partner")
-async def add_property_partner(property_id: str, req: PartnerRequest):
-    result = supabase.table("properties").select("subfolder_drive_ids").eq("id", property_id).execute()
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Property not found.")
-    record = result.data[0]
-    co_agents = _get_co_agents(record)
-    if req.agent_name not in co_agents:
-        co_agents.append(req.agent_name)
-    new_sdi = _set_co_agents(record, co_agents)
-    supabase.table("properties").update({"subfolder_drive_ids": new_sdi}).eq("id", property_id).execute()
-    return {"co_agents": co_agents}
-
-
-@app.post("/properties/{property_id}/remove-partner")
-async def remove_property_partner(property_id: str, req: PartnerRequest):
-    result = supabase.table("properties").select("subfolder_drive_ids").eq("id", property_id).execute()
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Property not found.")
-    record = result.data[0]
-    co_agents = [a for a in _get_co_agents(record) if a != req.agent_name]
-    new_sdi = _set_co_agents(record, co_agents)
-    supabase.table("properties").update({"subfolder_drive_ids": new_sdi}).eq("id", property_id).execute()
-    return {"co_agents": co_agents}
-
-
-@app.post("/buyers/{buyer_id}/add-partner")
-async def add_buyer_partner(buyer_id: str, req: PartnerRequest):
-    result = supabase.table("buyers").select("subfolder_drive_ids").eq("id", buyer_id).execute()
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Buyer not found.")
-    record = result.data[0]
-    co_agents = _get_co_agents(record)
-    if req.agent_name not in co_agents:
-        co_agents.append(req.agent_name)
-    new_sdi = _set_co_agents(record, co_agents)
-    supabase.table("buyers").update({"subfolder_drive_ids": new_sdi}).eq("id", buyer_id).execute()
-    return {"co_agents": co_agents}
-
-
-@app.post("/buyers/{buyer_id}/remove-partner")
-async def remove_buyer_partner(buyer_id: str, req: PartnerRequest):
-    result = supabase.table("buyers").select("subfolder_drive_ids").eq("id", buyer_id).execute()
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Buyer not found.")
-    record = result.data[0]
-    co_agents = [a for a in _get_co_agents(record) if a != req.agent_name]
-    new_sdi = _set_co_agents(record, co_agents)
-    supabase.table("buyers").update({"subfolder_drive_ids": new_sdi}).eq("id", buyer_id).execute()
-    return {"co_agents": co_agents}
+        raise HTTPException(status_code=500, detail=f"Update failed: {e}")
