@@ -2107,3 +2107,17 @@ async def update_property(property_id: str, payload: UpdatePropertyRequest):
         return result.data[0] if result.data else {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Update failed: {e}")
+
+@app.delete("/properties/{property_id}")
+async def delete_property(property_id: str):
+    """Delete a property and all related records (notes, assets, offers)."""
+    try:
+        # Delete related records first (FK constraints)
+        supabase.table("property_notes").delete().eq("property_id", property_id).execute()
+        supabase.table("property_assets").delete().eq("property_id", property_id).execute()
+        supabase.table("property_offers").delete().eq("property_id", property_id).execute()
+        # Delete the property itself
+        supabase.table("properties").delete().eq("id", property_id).execute()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
