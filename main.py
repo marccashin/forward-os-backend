@@ -1657,7 +1657,9 @@ async def parse_offer(file: UploadFile = File(...)):
     if len(pdf_bytes) > 20 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="PDF exceeds 20 MB limit")
 
+    # Encode and immediately free raw bytes to reduce peak memory usage
     b64_pdf = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+    del pdf_bytes
 
     prompt = """You are parsing a real estate purchase offer contract. Extract ALL of the following fields. Return ONLY a valid JSON object with these exact keys. If a field is not present or not applicable, use an empty string "".
 
@@ -1731,11 +1733,19 @@ Return ONLY the JSON object. No explanation, no markdown, no code fences."""
         }]
     }
 
-    async with httpx.AsyncClient(timeout=90) as client:
-        resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
-        resp.raise_for_status()
+    import gc
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
+            resp.raise_for_status()
+        raw = resp.json()["content"][0]["text"].strip()
+    finally:
+        # Free the large base64 payload and force GC so the next request
+        # doesn't inherit peak memory from this one (prevents Railway OOM restarts)
+        del b64_pdf
+        del payload
+        gc.collect()
 
-    raw = resp.json()["content"][0]["text"].strip()
     raw = re.sub(r"^```(?:json)?\n?", "", raw)
     raw = re.sub(r"\n?```$", "", raw)
     return json.loads(raw)
@@ -2090,208 +2100,3 @@ async def update_property(property_id: str, payload: UpdatePropertyRequest):
         return result.data[0] if result.data else {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Update failed: {e}")
-
-# ── Property & Buyer CRUD endpoints (restored) ──────────────────────────────
-
-@app.get("/properties")
-async def get_all_properties(agent_name: Optional[str] = None):
-    """
-    Fetch properties via service_role.
-    - No agent_name → all properties (admin view)
-    - agent_name → primary agent OR listed as co-agent
-    """
-    try:
-        result = supabase.table("properties").select("*").order("created_at", desc=True).execute()
-        all_props = result.data or []
-        if not agent_name:
-            return all_props
-        # Return records where agent is primary OR co-agent
-        return [p for p in all_props if
-                p.get("agent_name") == agent_name or
-                agent_name in (p.get("subfolder_drive_ids") or {}).get("_co_agents", [])]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.delete("/properties/{property_id}")
-async def delete_property(property_id: str):
-    """Delete a property record (service_role, works for any agent)."""
-    try:
-        supabase.table("properties").delete().eq("id", property_id).execute()
-        return {"deleted": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ── Buyer Management (service_role — bypasses RLS for all agents) ──────────
-
-class CreateBuyerRequest(BaseModel):
-    buyer_name: str
-    agent_name: str
-    agent_email: str = ""
-    email: str = ""
-    phone: str = ""
-    status: str = "active"
-
-@app.post("/create-buyer")
-async def create_buyer(req: CreateBuyerRequest):
-    """Insert a buyer using service_role — works for every agent."""
-    if not req.buyer_name.strip():
-        raise HTTPException(status_code=400, detail="buyer_name is required.")
-    data = {
-        "buyer_name":  req.buyer_name.strip(),
-        "agent_name":  req.agent_name,
-        "agent_email": req.agent_email,
-        "email":       req.email or None,
-        "phone":       req.phone or None,
-        "status":      req.status,
-        "drive_folder_id":     "",
-        "subfolder_drive_ids": {},
-    }
-    try:
-        result = supabase.table("buyers").insert(data).execute()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database insert failed: {e}")
-    if not result.data:
-        raise HTTPException(status_code=500, detail="Insert returned no data.")
-    return result.data[0]
-
-
-@app.get("/buyers")
-async def get_all_buyers(agent_name: Optional[str] = None):
-    """
-    Fetch buyers via service_role.
-    - No agent_name → all active buyers (admin view)
-    - agent_name → primary agent OR listed as co-agent
-    """
-    try:
-        result = supabase.table("buyers").select("*").eq("status", "active").order("created_at", desc=True).execute()
-        all_buyers = result.data or []
-        if not agent_name:
-            return all_buyers
-        return [b for b in all_buyers if
-                b.get("agent_name") == agent_name or
-                agent_name in (b.get("subfolder_drive_ids") or {}).get("_co_agents", [])]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.delete("/buyers/{buyer_id}")
-async def delete_buyer(buyer_id: str):
-    """Delete a buyer (service_role, works for any agent)."""
-    try:
-        supabase.table("buyers").delete().eq("id", buyer_id).execute()
-        return {"deleted": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ── Generic property / buyer update (service_role) ────────────────────────
-
-class UpdateRecordRequest(BaseModel):
-    fields: dict
-
-@app.patch("/buyers/{buyer_id}")
-async def update_buyer(buyer_id: str, req: UpdateRecordRequest):
-    """PATCH any buyer fields via service_role — works for every agent."""
-    try:
-        result = supabase.table("buyers").update(req.fields).eq("id", buyer_id).execute()
-        return result.data[0] if result.data else {"updated": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ── Revision requests (service_role) ──────────────────────────────────────
-
-class CreateRevisionRequest(BaseModel):
-    property_id: str
-    revision_number: int
-    requested_by_email: str
-    requested_by_name: str
-    revision_notes: str = ""
-    input_method: str = "text"
-    status: str = "pending"
-
-@app.post("/create-revision")
-async def create_revision(req: CreateRevisionRequest):
-    """Insert a revision request via service_role."""
-    try:
-        result = supabase.table("revision_requests").insert(req.dict()).execute()
-        return result.data[0] if result.data else {"created": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ── Deal Partners (co-agents on listings and buyers) ──────────────────────
-# Co-agents are stored as _co_agents key inside the existing
-# subfolder_drive_ids JSONB column — no schema migration required.
-
-AGENT_LIST = [
-    "Marc Cashin", "Ash McGowan", "Niki Lang",
-    "Cesar Rivera", "Charlotte Lee", "Shannon Casey"
-]
-
-def _get_co_agents(record: dict) -> list:
-    sdi = record.get("subfolder_drive_ids") or {}
-    return sdi.get("_co_agents", [])
-
-def _set_co_agents(record: dict, co_agents: list) -> dict:
-    sdi = dict(record.get("subfolder_drive_ids") or {})
-    sdi["_co_agents"] = co_agents
-    return sdi
-
-
-class PartnerRequest(BaseModel):
-    agent_name: str
-
-
-@app.post("/properties/{property_id}/add-partner")
-async def add_property_partner(property_id: str, req: PartnerRequest):
-    result = supabase.table("properties").select("subfolder_drive_ids").eq("id", property_id).execute()
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Property not found.")
-    record = result.data[0]
-    co_agents = _get_co_agents(record)
-    if req.agent_name not in co_agents:
-        co_agents.append(req.agent_name)
-    new_sdi = _set_co_agents(record, co_agents)
-    supabase.table("properties").update({"subfolder_drive_ids": new_sdi}).eq("id", property_id).execute()
-    return {"co_agents": co_agents}
-
-
-@app.post("/properties/{property_id}/remove-partner")
-async def remove_property_partner(property_id: str, req: PartnerRequest):
-    result = supabase.table("properties").select("subfolder_drive_ids").eq("id", property_id).execute()
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Property not found.")
-    record = result.data[0]
-    co_agents = [a for a in _get_co_agents(record) if a != req.agent_name]
-    new_sdi = _set_co_agents(record, co_agents)
-    supabase.table("properties").update({"subfolder_drive_ids": new_sdi}).eq("id", property_id).execute()
-    return {"co_agents": co_agents}
-
-
-@app.post("/buyers/{buyer_id}/add-partner")
-async def add_buyer_partner(buyer_id: str, req: PartnerRequest):
-    result = supabase.table("buyers").select("subfolder_drive_ids").eq("id", buyer_id).execute()
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Buyer not found.")
-    record = result.data[0]
-    co_agents = _get_co_agents(record)
-    if req.agent_name not in co_agents:
-        co_agents.append(req.agent_name)
-    new_sdi = _set_co_agents(record, co_agents)
-    supabase.table("buyers").update({"subfolder_drive_ids": new_sdi}).eq("id", buyer_id).execute()
-    return {"co_agents": co_agents}
-
-
-@app.post("/buyers/{buyer_id}/remove-partner")
-async def remove_buyer_partner(buyer_id: str, req: PartnerRequest):
-    result = supabase.table("buyers").select("subfolder_drive_ids").eq("id", buyer_id).execute()
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Buyer not found.")
-    record = result.data[0]
-    co_agents = [a for a in _get_co_agents(record) if a != req.agent_name]
-    new_sdi = _set_co_agents(record, co_agents)
-    supabase.table("buyers").update({"subfolder_drive_ids": new_sdi}).eq("id", buyer_id).execute()
-    return {"co_agents": co_agents}
