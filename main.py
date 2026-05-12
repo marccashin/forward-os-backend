@@ -2174,7 +2174,19 @@ class UpdateBuyerRequest(BaseModel):
 @app.patch("/buyers/{buyer_id}")
 async def update_buyer(buyer_id: str, payload: UpdateBuyerRequest):
     """Update specific fields on a buyer record."""
-    allowed = {"buyer_name", "email", "phone", "status", "agent_name"}
+    allowed = {
+        "buyer_name", "first_name", "last_name", "email", "phone", "status", "agent_name",
+        "market_area", "target_areas", "areas_note",
+        "budget_min", "budget_max", "down_payment", "loan_type",
+        "pre_approved", "pre_approval_amount", "pre_approval_lender", "approval_status",
+        "bedrooms_min", "bedrooms_note", "bathrooms", "home_type", "home_type_note",
+        "outdoor_space", "outdoor_note", "parking", "parking_note",
+        "hoa_acceptable", "school_district",
+        "must_haves", "deal_breakers",
+        "timeline", "move_in_target", "urgency", "urgency_note",
+        "current_status", "current_note", "motivation", "agent_notes",
+        "drive_folder_id", "subfolder_drive_ids",
+    }
     safe_fields = {k: v for k, v in payload.fields.items() if k in allowed}
     if not safe_fields:
         raise HTTPException(status_code=400, detail="No valid fields to update")
