@@ -2121,3 +2121,75 @@ async def delete_property(property_id: str):
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+
+# ── Buyer CRUD ────────────────────────────────────────────────────────────────
+
+class CreateBuyerRequest(BaseModel):
+    buyer_name: str
+    agent_name: str
+    agent_email: str = ""
+    email: str = ""
+    phone: str = ""
+    status: str = "active"
+
+@app.post("/create-buyer")
+async def create_buyer(payload: CreateBuyerRequest):
+    """Create a new buyer record via service role key — bypasses RLS."""
+    try:
+        result = supabase.table("buyers").insert({
+            "buyer_name":  payload.buyer_name,
+            "agent_name":  payload.agent_name,
+            "agent_email": payload.agent_email,
+            "email":       payload.email,
+            "phone":       payload.phone,
+            "status":      payload.status,
+        }).execute()
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Insert returned no data")
+        return result.data[0]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database insert failed: {e}")
+
+@app.get("/buyers")
+async def get_buyers(agent_name: str = None):
+    """Return buyers. Admins pass no agent_name and get all; agents pass their name."""
+    try:
+        if agent_name:
+            # Primary agent OR co-agent stored in subfolder_drive_ids._co_agents
+            primary = supabase.table("buyers").select("*").eq("agent_name", agent_name).order("created_at", desc=True).execute().data or []
+            all_buyers = supabase.table("buyers").select("*").order("created_at", desc=True).execute().data or []
+            co_agent_buyers = [b for b in all_buyers if agent_name in ((b.get("subfolder_drive_ids") or {}).get("_co_agents", []))]
+            seen = {b["id"] for b in primary}
+            combined = primary + [b for b in co_agent_buyers if b["id"] not in seen]
+            return combined
+        else:
+            result = supabase.table("buyers").select("*").order("created_at", desc=True).execute()
+            return result.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Fetch buyers failed: {e}")
+
+class UpdateBuyerRequest(BaseModel):
+    fields: dict
+
+@app.patch("/buyers/{buyer_id}")
+async def update_buyer(buyer_id: str, payload: UpdateBuyerRequest):
+    """Update specific fields on a buyer record."""
+    allowed = {"buyer_name", "email", "phone", "status", "agent_name"}
+    safe_fields = {k: v for k, v in payload.fields.items() if k in allowed}
+    if not safe_fields:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    try:
+        result = supabase.table("buyers").update(safe_fields).eq("id", buyer_id).execute()
+        return result.data[0] if result.data else {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Update failed: {e}")
+
+@app.delete("/buyers/{buyer_id}")
+async def delete_buyer(buyer_id: str):
+    """Delete a buyer and all related records (assets)."""
+    try:
+        supabase.table("buyer_assets").delete().eq("buyer_id", buyer_id).execute()
+        supabase.table("buyers").delete().eq("id", buyer_id).execute()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
