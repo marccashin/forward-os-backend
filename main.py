@@ -2205,26 +2205,3 @@ async def delete_buyer(buyer_id: str):
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
-
-# ── Temporary column check endpoint ──────────────────────────────────────
-@app.get("/admin/check-buyer-schema")
-async def check_buyer_schema():
-    """Check which profile columns exist on the buyers table."""
-    test_cols = [
-        "first_name","last_name","market_area","target_areas","areas_note",
-        "budget_min","budget_max","down_payment","loan_type",
-        "pre_approved","pre_approval_amount","pre_approval_lender","approval_status",
-        "bedrooms_min","bedrooms_note","bathrooms","home_type","home_type_note",
-        "outdoor_space","outdoor_note","parking","parking_note","hoa_acceptable",
-        "school_district","must_haves","deal_breakers","timeline","move_in_target",
-        "urgency","urgency_note","current_status","current_note","motivation","agent_notes"
-    ]
-    missing = []
-    present = []
-    for col in test_cols:
-        try:
-            supabase.table("buyers").select(col).limit(1).execute()
-            present.append(col)
-        except Exception:
-            missing.append(col)
-    return {"present": present, "missing": missing}
