@@ -37,6 +37,7 @@ from supabase import create_client, Client
 from jose import jwt, JWTError
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -95,6 +96,17 @@ def get_drive_service():
     info = json.loads(GOOGLE_SA_JSON)
     creds = service_account.Credentials.from_service_account_info(
         info, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+    )
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def get_drive_service_write():
+    """Drive service with full write access (for uploads/deletes)."""
+    if not GOOGLE_SA_JSON:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not set")
+    info = json.loads(GOOGLE_SA_JSON)
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/drive"]
     )
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
@@ -2090,6 +2102,144 @@ async def save_property_note(payload: SavePropertyNoteRequest):
         return result.data[0] if result.data else {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Save note failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# File upload / delete endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/upload-file")
+async def upload_property_file(
+    file: UploadFile = File(...),
+    folder_id: str = Form(""),
+    subfolder: str = Form(""),
+    property_id: str = Form(""),
+    uploaded_by: str = Form(""),
+):
+    """Upload a file to Drive and record it in property_assets."""
+    try:
+        contents = await file.read()
+        buf = io.BytesIO(contents)
+        drive = get_drive_service_write()
+
+        file_meta = {"name": file.filename}
+        if folder_id:
+            file_meta["parents"] = [folder_id]
+
+        media = MediaIoBaseUpload(buf, mimetype=file.content_type or "application/octet-stream", resumable=False)
+        uploaded = drive.files().create(
+            body=file_meta, media_body=media, fields="id,webViewLink"
+        ).execute()
+
+        drive_file_id = uploaded.get("id", "")
+        drive_link = uploaded.get("webViewLink", f"https://drive.google.com/file/d/{drive_file_id}/view")
+
+        # Make file readable by anyone with link
+        drive.permissions().create(
+            fileId=drive_file_id,
+            body={"type": "anyone", "role": "reader"},
+        ).execute()
+
+        asset = None
+        if property_id:
+            result = supabase.table("property_assets").insert({
+                "property_id": property_id,
+                "subfolder": subfolder,
+                "file_name": file.filename,
+                "drive_link": drive_link,
+                "uploaded_by": uploaded_by,
+            }).execute()
+            asset = result.data[0] if result.data else {}
+
+        return {
+            "ok": True,
+            "file_id": drive_file_id,
+            "drive_link": drive_link,
+            "asset_id": asset.get("id") if asset else None,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
+
+
+@app.post("/upload-buyer-file")
+async def upload_buyer_file(
+    file: UploadFile = File(...),
+    folder_id: str = Form(""),
+    subfolder: str = Form(""),
+    buyer_id: str = Form(""),
+    uploaded_by: str = Form(""),
+):
+    """Upload a file to Drive and record it in buyer_assets."""
+    try:
+        contents = await file.read()
+        buf = io.BytesIO(contents)
+        drive = get_drive_service_write()
+
+        file_meta = {"name": file.filename}
+        if folder_id:
+            file_meta["parents"] = [folder_id]
+
+        media = MediaIoBaseUpload(buf, mimetype=file.content_type or "application/octet-stream", resumable=False)
+        uploaded = drive.files().create(
+            body=file_meta, media_body=media, fields="id,webViewLink"
+        ).execute()
+
+        drive_file_id = uploaded.get("id", "")
+        drive_link = uploaded.get("webViewLink", f"https://drive.google.com/file/d/{drive_file_id}/view")
+
+        drive.permissions().create(
+            fileId=drive_file_id,
+            body={"type": "anyone", "role": "reader"},
+        ).execute()
+
+        asset = None
+        if buyer_id:
+            result = supabase.table("buyer_assets").insert({
+                "buyer_id": buyer_id,
+                "subfolder": subfolder,
+                "file_name": file.filename,
+                "drive_link": drive_link,
+                "uploaded_by": uploaded_by,
+            }).execute()
+            asset = result.data[0] if result.data else {}
+
+        return {
+            "ok": True,
+            "file_id": drive_file_id,
+            "drive_link": drive_link,
+            "asset_id": asset.get("id") if asset else None,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
+
+
+class DeleteFileRequest(BaseModel):
+    file_id: str = ""
+    asset_id: str = ""
+    asset_type: str = "property"  # "property" or "buyer"
+
+
+@app.delete("/delete-file")
+async def delete_file(payload: DeleteFileRequest):
+    """Delete a file from Drive and remove its asset record from Supabase."""
+    errors = []
+    # Delete from Drive
+    if payload.file_id:
+        try:
+            drive = get_drive_service_write()
+            drive.files().delete(fileId=payload.file_id).execute()
+        except Exception as e:
+            errors.append(f"Drive delete failed: {e}")
+    # Delete from Supabase
+    if payload.asset_id:
+        try:
+            table = "property_assets" if payload.asset_type != "buyer" else "buyer_assets"
+            supabase.table(table).delete().eq("id", payload.asset_id).execute()
+        except Exception as e:
+            errors.append(f"Supabase delete failed: {e}")
+    if errors:
+        raise HTTPException(status_code=500, detail="; ".join(errors))
+    return {"ok": True}
 
 
 class UpdatePropertyRequest(BaseModel):
