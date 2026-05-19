@@ -2283,3 +2283,85 @@ async def meeting_prep_research(payload: MeetingPrepResearchRequest):
     except Exception as e:
         logging.warning(f"Meeting prep research failed: {e}")
         return {"found": False, "error": str(e), "sources": []}
+
+
+# ── Deal Partners ─────────────────────────────────────────────────────────────
+
+def _get_co_agents(record):
+    return (record.get("subfolder_drive_ids") or {}).get("_co_agents", [])
+
+def _set_co_agents(sdi, co_agents):
+    d = dict(sdi or {})
+    d["_co_agents"] = co_agents
+    return d
+
+class PartnerRequest(BaseModel):
+    agent_name: str
+
+@app.post("/properties/{property_id}/add-partner")
+async def add_property_partner(property_id: str, payload: PartnerRequest):
+    try:
+        rows = supabase.table("properties").select("subfolder_drive_ids").eq("id", property_id).execute()
+        if not rows.data:
+            raise HTTPException(status_code=404, detail="Property not found")
+        record = rows.data[0]
+        co_agents = _get_co_agents(record)
+        if payload.agent_name not in co_agents:
+            co_agents.append(payload.agent_name)
+        new_sdi = _set_co_agents(record.get("subfolder_drive_ids"), co_agents)
+        supabase.table("properties").update({"subfolder_drive_ids": new_sdi}).eq("id", property_id).execute()
+        return {"co_agents": co_agents}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/properties/{property_id}/remove-partner")
+async def remove_property_partner(property_id: str, payload: PartnerRequest):
+    try:
+        rows = supabase.table("properties").select("subfolder_drive_ids").eq("id", property_id).execute()
+        if not rows.data:
+            raise HTTPException(status_code=404, detail="Property not found")
+        record = rows.data[0]
+        co_agents = [a for a in _get_co_agents(record) if a != payload.agent_name]
+        new_sdi = _set_co_agents(record.get("subfolder_drive_ids"), co_agents)
+        supabase.table("properties").update({"subfolder_drive_ids": new_sdi}).eq("id", property_id).execute()
+        return {"co_agents": co_agents}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/buyers/{buyer_id}/add-partner")
+async def add_buyer_partner(buyer_id: str, payload: PartnerRequest):
+    try:
+        rows = supabase.table("buyers").select("subfolder_drive_ids").eq("id", buyer_id).execute()
+        if not rows.data:
+            raise HTTPException(status_code=404, detail="Buyer not found")
+        record = rows.data[0]
+        co_agents = _get_co_agents(record)
+        if payload.agent_name not in co_agents:
+            co_agents.append(payload.agent_name)
+        new_sdi = _set_co_agents(record.get("subfolder_drive_ids"), co_agents)
+        supabase.table("buyers").update({"subfolder_drive_ids": new_sdi}).eq("id", buyer_id).execute()
+        return {"co_agents": co_agents}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/buyers/{buyer_id}/remove-partner")
+async def remove_buyer_partner(buyer_id: str, payload: PartnerRequest):
+    try:
+        rows = supabase.table("buyers").select("subfolder_drive_ids").eq("id", buyer_id).execute()
+        if not rows.data:
+            raise HTTPException(status_code=404, detail="Buyer not found")
+        record = rows.data[0]
+        co_agents = [a for a in _get_co_agents(record) if a != payload.agent_name]
+        new_sdi = _set_co_agents(record.get("subfolder_drive_ids"), co_agents)
+        supabase.table("buyers").update({"subfolder_drive_ids": new_sdi}).eq("id", buyer_id).execute()
+        return {"co_agents": co_agents}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
