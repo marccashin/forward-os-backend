@@ -2365,3 +2365,44 @@ async def remove_buyer_partner(buyer_id: str, payload: PartnerRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Knowledge Docs (Training Library sync) ────────────────────────────────────
+
+class KnowledgeDocEntry(BaseModel):
+    file_name: str
+    content: str
+    category: str = ""
+
+class KnowledgeDocsSyncRequest(BaseModel):
+    entries: list[KnowledgeDocEntry]
+
+@app.post("/knowledge-docs/sync")
+async def sync_knowledge_docs(payload: KnowledgeDocsSyncRequest):
+    """
+    Upsert all Training Library entries into knowledge_docs.
+    Uses file_name as the unique key — uploading the same title again
+    replaces the old version automatically.
+    """
+    try:
+        for entry in payload.entries:
+            # Delete any existing row with this file_name (handles versioning)
+            supabase.table("knowledge_docs").delete().eq("file_name", entry.file_name).execute()
+            # Insert fresh
+            supabase.table("knowledge_docs").insert({
+                "file_name": entry.file_name,
+                "content":   entry.content,
+                "category":  entry.category,
+            }).execute()
+        return {"ok": True, "synced": len(payload.entries)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/knowledge-docs")
+async def delete_knowledge_doc(file_name: str):
+    """Remove a single document from knowledge_docs by file_name (title)."""
+    try:
+        supabase.table("knowledge_docs").delete().eq("file_name", file_name).execute()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
