@@ -2098,7 +2098,7 @@ class UpdatePropertyRequest(BaseModel):
 @app.patch("/properties/{property_id}")
 async def update_property(property_id: str, payload: UpdatePropertyRequest):
     """Update specific fields on a property record."""
-    allowed = {"seller_name", "address", "status", "market", "agent_name"}
+    allowed = {"seller_name", "address", "status", "market", "agent_name", "archived"}
     safe_fields = {k: v for k, v in payload.fields.items() if k in allowed}
     if not safe_fields:
         raise HTTPException(status_code=400, detail="No valid fields to update")
@@ -2186,6 +2186,7 @@ async def update_buyer(buyer_id: str, payload: UpdateBuyerRequest):
         "timeline", "move_in_target", "urgency", "urgency_note",
         "current_status", "current_note", "motivation", "agent_notes",
         "drive_folder_id", "subfolder_drive_ids",
+        "archived",
     }
     safe_fields = {k: v for k, v in payload.fields.items() if k in allowed}
     if not safe_fields:
