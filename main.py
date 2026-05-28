@@ -2233,13 +2233,44 @@ class CreateBuyerRequest(BaseModel):
     phone: str = ""
     status: str = "active"
 
+# Canonical agent names — must match exactly what FORWARD OS stores in the buyers table.
+# Add new agents here when they join the team.
+KNOWN_AGENTS: set[str] = {
+    "Marc Cashin",
+    "Ashling McGowan",
+    "Ash McGowan",
+    "Niki Lang",
+    "Cesar Rivera",
+    "Charlotte Lee",
+    "Shannon Casey",
+    "Operations",
+    "Concierge",
+}
+
 @app.post("/create-buyer")
 async def create_buyer(payload: CreateBuyerRequest):
     """Create a new buyer record via service role key — bypasses RLS."""
+    # Reject empty, whitespace-only, or unrecognised agent names so no buyer
+    # ever lands in the "Unknown" bucket on the frontend.
+    agent = (payload.agent_name or "").strip()
+    if not agent:
+        raise HTTPException(
+            status_code=400,
+            detail="agent_name is required. The creating agent's session may not be fully loaded — please refresh and try again."
+        )
+    if agent not in KNOWN_AGENTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unrecognised agent '{agent}'. Ensure you are logged in with a valid FORWARD agent account."
+        )
+    buyer_name = (payload.buyer_name or "").strip()
+    if not buyer_name:
+        raise HTTPException(status_code=400, detail="buyer_name is required.")
+
     try:
         result = supabase.table("buyers").insert({
-            "buyer_name":  payload.buyer_name,
-            "agent_name":  payload.agent_name,
+            "buyer_name":  buyer_name,
+            "agent_name":  agent,
             "agent_email": payload.agent_email,
             "email":       payload.email,
             "phone":       payload.phone,
@@ -2248,6 +2279,8 @@ async def create_buyer(payload: CreateBuyerRequest):
         if not result.data:
             raise HTTPException(status_code=500, detail="Insert returned no data")
         return result.data[0]
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database insert failed: {e}")
 
