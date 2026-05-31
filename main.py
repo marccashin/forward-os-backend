@@ -87,11 +87,6 @@ TASK_SKIP_PATTERNS: list[str] = [
     "update fub stage",
 ]
 
-BUYER_ACTIVE_STAGES: set[str]  = {"ba signed", "actively showing", "pending"}
-SELLER_ACTIVE_STAGES: set[str] = {
-    "listing agreement signed", "coming soon", "listed",
-    "back on the market", "pending"
-}
 
 # ---------------------------------------------------------------------------
 # Supabase admin client
@@ -222,15 +217,6 @@ app.add_middleware(
 scheduler = AsyncIOScheduler(timezone="America/New_York")
 
 
-async def job_sync_fub_pipeline():
-    """Daily 6am ET: pull FUB pipeline data and cache in Supabase."""
-    logger.info("Running FUB pipeline sync...")
-    try:
-        await _sync_fub_pipeline()
-        logger.info("FUB pipeline sync complete.")
-    except Exception as e:
-        logger.error("FUB sync failed: %s", e)
-
 
 async def job_check_drive_automations():
     """Daily 6am ET: check Drive folders and update automation_health status."""
@@ -290,11 +276,11 @@ async def _sync_agent_task_cache(agent_filter: str | None = None):
 
         if "seller" in pipeline:
             ptype = "seller"
-            if stage_lower not in SELLER_ACTIVE_STAGES:
+            if stage_lower not in {"listing agreement signed", "coming soon", "listed", "back on the market", "pending"}:
                 continue
         elif "buyer" in pipeline:
             ptype = "buyer"
-            if stage_lower not in BUYER_ACTIVE_STAGES:
+            if stage_lower not in {"ba signed", "actively showing", "pending"}:
                 continue
         else:
             continue  # skip Rentals, Referrals, etc.
@@ -364,13 +350,6 @@ async def _sync_agent_task_cache(agent_filter: str | None = None):
 
 @app.on_event("startup")
 async def startup():
-    # Daily 6am ET FUB sync
-    scheduler.add_job(
-        job_sync_fub_pipeline,
-        CronTrigger(hour=6, minute=0, timezone="America/New_York"),
-        id="fub_sync",
-        replace_existing=True
-    )
     # Daily 6am ET Drive check (runs alongside FUB sync)
     scheduler.add_job(
         job_check_drive_automations,
@@ -400,15 +379,6 @@ async def shutdown():
 async def health():
     return {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()}
 
-# ---------------------------------------------------------------------------
-# Pipeline routes
-# ---------------------------------------------------------------------------
-@app.post("/pipeline/sync")
-async def trigger_pipeline_sync(user=Depends(get_current_user)):
-    """Manual sync trigger — Ops only."""
-    await _sync_fub_pipeline()
-    return {"status": "synced", "ts": datetime.now(timezone.utc).isoformat()}
-
 
 class AgentTaskSyncRequest(BaseModel):
     agent_name: Optional[str] = None
@@ -432,17 +402,6 @@ async def trigger_agent_task_sync(req: AgentTaskSyncRequest = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/pipeline/buyers")
-async def get_buyers(user=Depends(get_current_user)):
-    res = supabase.table("pipeline_cache").select("*").eq("type", "buyer").execute()
-    return res.data
-
-
-@app.get("/pipeline/sellers")
-async def get_sellers(user=Depends(get_current_user)):
-    res = supabase.table("pipeline_cache").select("*").eq("type", "seller").execute()
-    return res.data
-
 
 async def _get_next_task(person_id: str) -> tuple[str, Optional[str]]:
     """
@@ -464,160 +423,6 @@ async def _get_next_task(person_id: str) -> tuple[str, Optional[str]]:
         logger.warning("Task fetch for person %s: %s", person_id, e)
         return "", None
 
-
-async def _sync_fub_pipeline():
-    now = datetime.now(timezone.utc)
-    quarter_start = _this_quarter_start()
-
-    # ---------------------------------------------------------------------------
-    # Fetch ALL deals with pagination (FUB /deals endpoint)
-    # ---------------------------------------------------------------------------
-    all_deals: list = []
-    offset = 0
-    limit = 100
-    while True:
-        data = await fub_get("/deals", {"limit": limit, "offset": offset})
-        batch = data.get("deals", [])
-        logger.info("FUB /deals offset=%d got %d", offset, len(batch))
-        if not batch:
-            break
-        all_deals.extend(batch)
-        if len(batch) < limit:
-            break
-        offset += limit
-
-    logger.info("FUB: %d total deals fetched", len(all_deals))
-
-    # ---------------------------------------------------------------------------
-    # Stage sets — exact match on FUB stageName values
-    # Buyers:  BA Signed → Actively Showing → Pending → Closed This Quarter
-    # Sellers: Listing Agreement Signed → Coming Soon → Listed →
-    #          Back on the Market → Pending → Closed This Quarter
-    # ---------------------------------------------------------------------------
-    BUYER_STAGES  = {"ba signed", "actively showing", "pending", "closed this quarter"}
-    SELLER_STAGES = {"listing agreement signed", "coming soon", "listed",
-                     "back on the market", "pending", "closed this quarter"}
-
-    rows = []
-    for deal in all_deals:
-        if not isinstance(deal, dict):
-            continue
-
-        # FUB uses pipelineName (Buyers/Sellers/Rentals/Referrals) and stageName
-        pipeline = _safe_str(deal.get("pipelineName") or "").lower()
-        stage    = _safe_str(deal.get("stageName") or "")
-
-        if "seller" in pipeline:
-            ptype = "seller"
-        elif "buyer" in pipeline:
-            ptype = "buyer"
-        else:
-            continue  # Skip Rentals, Referrals, etc.
-
-        # Stage filter
-        if ptype == "buyer"  and stage.lower() not in BUYER_STAGES:
-            continue
-        if ptype == "seller" and stage.lower() not in SELLER_STAGES:
-            continue
-
-        # Log first filtered deal — show users field for agent
-        if not rows:
-            logger.info("DEAL users: %s", deal.get("users"))
-
-        # people array: [{'id': 6743, 'name': 'Mahmood Mohamadi', 'avatar': ''}]
-        people_list = deal.get("people") or []
-        person_id   = str(people_list[0]["id"]) if people_list and isinstance(people_list[0], dict) else ""
-
-        # Client name: buyers → person name, sellers → deal name (property address)
-        if ptype == "buyer" and people_list and isinstance(people_list[0], dict):
-            client_name = _safe_str(people_list[0].get("name") or deal.get("name") or "")
-        else:
-            client_name = _safe_str(deal.get("name") or "")
-
-        # Agent — from users array: [{'id', 'name', 'email', 'role', ...}]
-        users = deal.get("users") or []
-        agent = ""
-        if isinstance(users, list) and users:
-            for u in users:
-                if isinstance(u, dict):
-                    role = u.get("role", "").lower()
-                    if "agent" in role or role == "":
-                        agent = u.get("name", "")
-                        break
-            if not agent:
-                agent = _safe_str(users[0])
-
-        # Property address — sellers: use deal name; buyers: build from parts if available
-        street  = _safe_str(deal.get("street") or deal.get("propertyStreet") or "")
-        city    = _safe_str(deal.get("city")   or deal.get("propertyCity")   or "")
-        state   = _safe_str(deal.get("state")  or deal.get("propertyState")  or "")
-        address = ", ".join(p for p in [street, city, state] if p) if street else _safe_str(deal.get("name") or "")
-
-        # Price and projected close date
-        price           = deal.get("price")
-        projected_close = deal.get("projectedCloseDate") or deal.get("closeDate")
-
-        # Next due task
-        next_task, next_task_due = await _get_next_task(person_id) if person_id else ("", None)
-
-        rows.append({
-            "type":                 ptype,
-            "fub_id":               str(deal.get("id", "")),
-            "client_name":          client_name,
-            "agent":                agent,
-            "lead_stage":           stage,
-            "last_activity":        None,
-            "days_since_contact":   None,
-            "property_address":     address,
-            "list_date":            None,
-            "dom":                  None,
-            "price":                price,
-            "projected_close_date": projected_close,
-            "next_due_task":        next_task,
-            "next_task_due_date":   next_task_due,
-            "synced_at":            now.isoformat()
-        })
-
-    logger.info("Pipeline rows: %d buyers, %d sellers",
-                len([r for r in rows if r["type"] == "buyer"]),
-                len([r for r in rows if r["type"] == "seller"]))
-
-    # Replace cache
-    supabase.table("pipeline_cache").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
-    if rows:
-        supabase.table("pipeline_cache").insert(rows).execute()
-
-    # Update last sync on KPI row for this week
-    monday = _this_monday()
-    supabase.table("kpis").upsert(
-        {
-            "week_start":    monday,
-            "active_buyers": len([r for r in rows if r["type"] == "buyer"]),
-            "fub_synced_at": now.isoformat()
-        },
-        on_conflict="week_start"
-    ).execute()
-
-
-def _this_monday() -> str:
-    today  = datetime.now(timezone.utc).date()
-    monday = today - timedelta(days=today.weekday())
-    return str(monday)
-
-
-def _this_quarter_start() -> datetime:
-    now           = datetime.now(timezone.utc)
-    quarter_month = ((now.month - 1) // 3) * 3 + 1   # 1, 4, 7, or 10
-    return datetime(now.year, quarter_month, 1, tzinfo=timezone.utc)
-
-# ---------------------------------------------------------------------------
-# KPI routes
-# ---------------------------------------------------------------------------
-@app.post("/kpis/sync")
-async def kpi_sync(user=Depends(get_current_user)):
-    """Trigger FUB data pull and update KPI row."""
-    await _sync_fub_pipeline()
-    return {"status": "ok"}
 
 # ---------------------------------------------------------------------------
 # Automation Health — Drive check
