@@ -68,6 +68,17 @@ AGENT_NAME_MAP: dict[str, str] = {
     # All other FUB agent names are expected to match FORWARD OS names exactly
 }
 
+# FUB agent name → OS agent email (mirrors AGENT_EMAILS in index.html)
+AGENT_EMAIL_MAP: dict[str, str] = {
+    "Marc Cashin":     "marc@marccashin.com",
+    "Ashling McGowan": "ashling@fwrdrealestate.com",
+    "Ash McGowan":     "ashling@fwrdrealestate.com",
+    "Charlotte Lee":   "charlotte@fwrdrealestate.com",
+    "Niki Lang":       "niki@fwrdrealestate.com",
+    "Cesar Rivera":    "cesar@fwrdrealestate.com",
+    "Shannon Casey":   "shannon@fwrdrealestate.com",
+}
+
 # Active deal stages for task feed (excludes "Closed This Quarter")
 TASK_SKIP_PATTERNS: list[str] = [
     "slide fub deal card",
@@ -651,6 +662,107 @@ class AutomationPing(BaseModel):
     timestamp:       Optional[str] = None
     notes:           Optional[str] = None
 
+
+
+@app.post("/webhooks/fub-deal-engaged")
+async def fub_deal_engaged(request: Request):
+    """
+    FUB fires this webhook when a deal moves to "Buyer Engaged" or "Seller Engaged".
+    Creates the corresponding OS buyer or property card in Supabase, filed under
+    the assigned agent.
+
+    Configure in FUB: Admin > Settings > API > Webhooks (or via FUB automation)
+    URL: https://forward-os-backend-production.up.railway.app/webhooks/fub-deal-engaged
+    Events: Deals — stage changed to "Buyer Engaged" or "Seller Engaged"
+
+    Expected payload fields (FUB sends these on deal events):
+      data.stageName       — "Buyer Engaged" | "Seller Engaged"
+      data.pipelineName    — "Buyers" | "Sellers"
+      data.name            — deal name (for sellers: property address)
+      data.users           — [{"name": "Charlotte Lee", ...}]
+      data.people          — [{"name": "John Smith", "email": "...", "phones": [...]}]
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return {"received": True, "error": "invalid JSON"}
+
+    logger.info("FUB deal-engaged webhook: %s", str(body)[:500])
+
+    # FUB wraps the deal in body["data"] for webhook events
+    data = body.get("data") or body  # handle both wrapped and flat payloads
+
+    stage = _safe_str(data.get("stageName") or "").strip().lower()
+    if stage not in ("buyer engaged", "seller engaged"):
+        return {"received": True, "skipped": f"stage '{stage}' not handled"}
+
+    # Resolve assigned agent
+    users = data.get("users") or []
+    fub_agent_name = ""
+    if isinstance(users, list) and users:
+        for u in users:
+            if isinstance(u, dict):
+                role = (u.get("role") or "").lower()
+                if "agent" in role or role == "":
+                    fub_agent_name = u.get("name", "")
+                    break
+        if not fub_agent_name and isinstance(users[0], dict):
+            fub_agent_name = users[0].get("name", "")
+
+    # Map FUB name → OS canonical name
+    os_agent = AGENT_NAME_MAP.get(fub_agent_name, fub_agent_name).strip()
+    if not os_agent or os_agent not in KNOWN_AGENTS:
+        logger.warning("fub-deal-engaged: unrecognised agent '%s' — defaulting to Marc Cashin", os_agent)
+        os_agent = "Marc Cashin"
+    agent_email = AGENT_EMAIL_MAP.get(os_agent, "")
+
+    # Extract contact info from people array
+    people = data.get("people") or []
+    person = people[0] if (isinstance(people, list) and people and isinstance(people[0], dict)) else {}
+    contact_name = _safe_str(person.get("name") or data.get("name") or "")
+    contact_email = _safe_str(person.get("email") or "")
+    # FUB phones: [{"value": "...", "type": "mobile"}, ...]
+    phones = person.get("phones") or person.get("phone") or []
+    contact_phone = ""
+    if isinstance(phones, list) and phones:
+        contact_phone = _safe_str(phones[0].get("value") if isinstance(phones[0], dict) else phones[0])
+    elif isinstance(phones, str):
+        contact_phone = phones
+
+    try:
+        if stage == "buyer engaged":
+            if not contact_name:
+                return {"received": True, "error": "no contact name for buyer"}
+            result = supabase.table("buyers").insert({
+                "buyer_name":  contact_name,
+                "agent_name":  os_agent,
+                "agent_email": agent_email,
+                "email":       contact_email,
+                "phone":       contact_phone,
+                "status":      "active",
+            }).execute()
+            logger.info("Created OS buyer: %s → %s", contact_name, os_agent)
+            return {"received": True, "created": "buyer", "name": contact_name, "agent": os_agent}
+
+        else:  # seller engaged
+            # For sellers, deal name is typically the property address
+            address = _safe_str(data.get("name") or contact_name or "")
+            if not address:
+                return {"received": True, "error": "no address for seller"}
+            result = supabase.table("properties").insert({
+                "address":     address,
+                "agent_name":  os_agent,
+                "agent_email": agent_email,
+                "seller_name": contact_name,
+                "market":      "DC",
+                "status":      "draft",
+            }).execute()
+            logger.info("Created OS property: %s → %s", address, os_agent)
+            return {"received": True, "created": "property", "address": address, "agent": os_agent}
+
+    except Exception as e:
+        logger.error("fub-deal-engaged DB insert failed: %s", e)
+        return {"received": True, "error": str(e)}
 
 @app.post("/webhooks/fub-task-update")
 async def fub_task_webhook(request: Request, background_tasks: BackgroundTasks):
