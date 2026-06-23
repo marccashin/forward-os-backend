@@ -2162,7 +2162,6 @@ class CreateBuyerRequest(BaseModel):
 KNOWN_AGENTS: set[str] = {
     "Marc Cashin",
     "Ashling McGowan",
-    "Ash McGowan",
     "Niki Lang",
     "Cesar Rivera",
     "Charlotte Lee",
@@ -2176,7 +2175,7 @@ async def create_buyer(payload: CreateBuyerRequest):
     """Create a new buyer record via service role key — bypasses RLS."""
     # Reject empty, whitespace-only, or unrecognised agent names so no buyer
     # ever lands in the "Unknown" bucket on the frontend.
-    agent = (payload.agent_name or "").strip()
+    agent = AGENT_NAME_MAP.get((payload.agent_name or "").strip(), (payload.agent_name or "").strip()).strip()
     if not agent:
         raise HTTPException(
             status_code=400,
