@@ -561,6 +561,11 @@ async def fub_deal_engaged(request: Request):
             address = _safe_str(data.get("name") or contact_name or "")
             if not address:
                 return {"received": True, "error": "no address for seller"}
+            # Duplicate guard: check by address + agent
+            _dup_prop = supabase.table("properties").select("id,address").eq("agent_name", os_agent).eq("address", address).execute().data
+            if _dup_prop:
+                logger.info("Webhook duplicate skipped: property '%s' already exists for %s (id=%s)", address, os_agent, _dup_prop[0]["id"])
+                return {"received": True, "skipped": "duplicate", "existing_id": _dup_prop[0]["id"]}
             result = supabase.table("properties").insert({
                 "address":     address,
                 "agent_name":  os_agent,
@@ -1984,6 +1989,17 @@ class CreatePropertyRequest(BaseModel):
 @app.post("/create-property")
 async def create_property(payload: CreatePropertyRequest):
     """Create a new property record. co_seller stored in subfolder_drive_ids JSONB."""
+    # Normalize agent name
+    agent = AGENT_NAME_MAP.get((payload.agent_name or "").strip(), (payload.agent_name or "").strip()).strip()
+    # Duplicate guard: check by address + agent
+    try:
+        _dup = supabase.table("properties").select("id,address").eq("agent_name", agent).eq("address", (payload.address or "").strip()).execute().data
+        if _dup:
+            raise HTTPException(status_code=409, detail=f"A property at '{_dup[0]['address']}' already exists in your list.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning("Property duplicate check failed (proceeding): %s", e)
     insert_data = {
         "address":     payload.address,
         "agent_name":  payload.agent_name,
