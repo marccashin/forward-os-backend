@@ -517,8 +517,8 @@ async def fub_deal_engaged(request: Request):
     # Map FUB name → OS canonical name
     os_agent = AGENT_NAME_MAP.get(fub_agent_name, fub_agent_name).strip()
     if not os_agent or os_agent not in KNOWN_AGENTS:
-        logger.warning("fub-deal-engaged: unrecognised agent '%s' — defaulting to Marc Cashin", os_agent)
-        os_agent = "Marc Cashin"
+        logger.warning("fub-deal-engaged: unrecognised agent '%s' — rejecting webhook to prevent misassignment", fub_agent_name)
+        return {"received": True, "skipped": f"unrecognised agent '{fub_agent_name}' — no record created"}
     agent_email = AGENT_EMAIL_MAP.get(os_agent, "")
 
     # Extract contact info from people array
@@ -538,6 +538,13 @@ async def fub_deal_engaged(request: Request):
         if stage == "buyer engaged":
             if not contact_name:
                 return {"received": True, "error": "no contact name for buyer"}
+            # Duplicate guard: check by name + agent, or email + agent
+            _dup_q = supabase.table("buyers").select("id,buyer_name").eq("agent_name", os_agent).eq("buyer_name", contact_name).execute().data
+            if not _dup_q and contact_email:
+                _dup_q = supabase.table("buyers").select("id,buyer_name").eq("agent_name", os_agent).eq("email", contact_email).neq("email", "").execute().data
+            if _dup_q:
+                logger.info("Webhook duplicate skipped: '%s' already exists for %s (id=%s)", contact_name, os_agent, _dup_q[0]["id"])
+                return {"received": True, "skipped": "duplicate", "existing_id": _dup_q[0]["id"]}
             result = supabase.table("buyers").insert({
                 "buyer_name":  contact_name,
                 "agent_name":  os_agent,
@@ -2183,6 +2190,20 @@ async def create_buyer(payload: CreateBuyerRequest):
     buyer_name = (payload.buyer_name or "").strip()
     if not buyer_name:
         raise HTTPException(status_code=400, detail="buyer_name is required.")
+
+    # Duplicate guard: check name + agent, email + agent, or phone + agent
+    try:
+        _dup = supabase.table("buyers").select("id,buyer_name").eq("agent_name", agent).eq("buyer_name", buyer_name).execute().data
+        if not _dup and payload.email and payload.email.strip():
+            _dup = supabase.table("buyers").select("id,buyer_name").eq("agent_name", agent).eq("email", payload.email.strip()).execute().data
+        if not _dup and payload.phone and payload.phone.strip():
+            _dup = supabase.table("buyers").select("id,buyer_name").eq("agent_name", agent).eq("phone", payload.phone.strip()).execute().data
+        if _dup:
+            raise HTTPException(status_code=409, detail=f"A buyer named '{_dup[0]['buyer_name']}' already exists in your list.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning("Duplicate check failed (proceeding with insert): %s", e)
 
     try:
         result = supabase.table("buyers").insert({
