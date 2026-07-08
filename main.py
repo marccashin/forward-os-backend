@@ -76,7 +76,6 @@ AGENT_EMAIL_MAP: dict[str, str] = {
     "Charlotte Lee":   "charlotte@fwrdrealestate.com",
     "Niki Lang":       "niki@fwrdrealestate.com",
     "Cesar Rivera":    "cesar@fwrdrealestate.com",
-    "Shannon Casey":   "shannon@fwrdrealestate.com",
 }
 
 # Active deal stages for task feed (excludes "Closed This Quarter")
@@ -2184,7 +2183,6 @@ KNOWN_AGENTS: set[str] = {
     "Niki Lang",
     "Cesar Rivera",
     "Charlotte Lee",
-    "Shannon Casey",
     "Operations",
     "Concierge",
 }
