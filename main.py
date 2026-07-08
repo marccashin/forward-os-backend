@@ -68,6 +68,17 @@ AGENT_NAME_MAP: dict[str, str] = {
     # All other FUB agent names are expected to match FORWARD OS names exactly
 }
 
+# FUB agent name → OS agent email (mirrors AGENT_EMAILS in index.html)
+AGENT_EMAIL_MAP: dict[str, str] = {
+    "Marc Cashin":     "marc@marccashin.com",
+    "Ashling McGowan": "ashling@fwrdrealestate.com",
+    "Ash McGowan":     "ashling@fwrdrealestate.com",
+    "Charlotte Lee":   "charlotte@fwrdrealestate.com",
+    "Niki Lang":       "niki@fwrdrealestate.com",
+    "Cesar Rivera":    "cesar@fwrdrealestate.com",
+    "Shannon Casey":   "shannon@fwrdrealestate.com",
+}
+
 # Active deal stages for task feed (excludes "Closed This Quarter")
 TASK_SKIP_PATTERNS: list[str] = [
     "slide fub deal card",
@@ -76,11 +87,6 @@ TASK_SKIP_PATTERNS: list[str] = [
     "update fub stage",
 ]
 
-BUYER_ACTIVE_STAGES: set[str]  = {"ba signed", "actively showing", "pending"}
-SELLER_ACTIVE_STAGES: set[str] = {
-    "listing agreement signed", "coming soon", "listed",
-    "back on the market", "pending"
-}
 
 # ---------------------------------------------------------------------------
 # Supabase admin client
@@ -211,15 +217,6 @@ app.add_middleware(
 scheduler = AsyncIOScheduler(timezone="America/New_York")
 
 
-async def job_sync_fub_pipeline():
-    """Daily 6am ET: pull FUB pipeline data and cache in Supabase."""
-    logger.info("Running FUB pipeline sync...")
-    try:
-        await _sync_fub_pipeline()
-        logger.info("FUB pipeline sync complete.")
-    except Exception as e:
-        logger.error("FUB sync failed: %s", e)
-
 
 async def job_check_drive_automations():
     """Daily 6am ET: check Drive folders and update automation_health status."""
@@ -279,11 +276,11 @@ async def _sync_agent_task_cache(agent_filter: str | None = None):
 
         if "seller" in pipeline:
             ptype = "seller"
-            if stage_lower not in SELLER_ACTIVE_STAGES:
+            if stage_lower not in {"listing agreement signed", "coming soon", "listed", "back on the market", "pending"}:
                 continue
         elif "buyer" in pipeline:
             ptype = "buyer"
-            if stage_lower not in BUYER_ACTIVE_STAGES:
+            if stage_lower not in {"ba signed", "actively showing", "pending"}:
                 continue
         else:
             continue  # skip Rentals, Referrals, etc.
@@ -353,13 +350,6 @@ async def _sync_agent_task_cache(agent_filter: str | None = None):
 
 @app.on_event("startup")
 async def startup():
-    # Daily 6am ET FUB sync
-    scheduler.add_job(
-        job_sync_fub_pipeline,
-        CronTrigger(hour=6, minute=0, timezone="America/New_York"),
-        id="fub_sync",
-        replace_existing=True
-    )
     # Daily 6am ET Drive check (runs alongside FUB sync)
     scheduler.add_job(
         job_check_drive_automations,
@@ -389,15 +379,6 @@ async def shutdown():
 async def health():
     return {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()}
 
-# ---------------------------------------------------------------------------
-# Pipeline routes
-# ---------------------------------------------------------------------------
-@app.post("/pipeline/sync")
-async def trigger_pipeline_sync(user=Depends(get_current_user)):
-    """Manual sync trigger — Ops only."""
-    await _sync_fub_pipeline()
-    return {"status": "synced", "ts": datetime.now(timezone.utc).isoformat()}
-
 
 class AgentTaskSyncRequest(BaseModel):
     agent_name: Optional[str] = None
@@ -418,19 +399,8 @@ async def trigger_agent_task_sync(req: AgentTaskSyncRequest = None):
         return {"status": "synced", "ts": datetime.now(timezone.utc).isoformat()}
     except Exception as e:
         logger.error("Manual agent task sync failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Agent task sync failed — could not pull tasks from FUB. The FUB API may be temporarily unavailable. Try again in a moment.")
 
-
-@app.get("/pipeline/buyers")
-async def get_buyers(user=Depends(get_current_user)):
-    res = supabase.table("pipeline_cache").select("*").eq("type", "buyer").execute()
-    return res.data
-
-
-@app.get("/pipeline/sellers")
-async def get_sellers(user=Depends(get_current_user)):
-    res = supabase.table("pipeline_cache").select("*").eq("type", "seller").execute()
-    return res.data
 
 
 async def _get_next_task(person_id: str) -> tuple[str, Optional[str]]:
@@ -453,160 +423,6 @@ async def _get_next_task(person_id: str) -> tuple[str, Optional[str]]:
         logger.warning("Task fetch for person %s: %s", person_id, e)
         return "", None
 
-
-async def _sync_fub_pipeline():
-    now = datetime.now(timezone.utc)
-    quarter_start = _this_quarter_start()
-
-    # ---------------------------------------------------------------------------
-    # Fetch ALL deals with pagination (FUB /deals endpoint)
-    # ---------------------------------------------------------------------------
-    all_deals: list = []
-    offset = 0
-    limit = 100
-    while True:
-        data = await fub_get("/deals", {"limit": limit, "offset": offset})
-        batch = data.get("deals", [])
-        logger.info("FUB /deals offset=%d got %d", offset, len(batch))
-        if not batch:
-            break
-        all_deals.extend(batch)
-        if len(batch) < limit:
-            break
-        offset += limit
-
-    logger.info("FUB: %d total deals fetched", len(all_deals))
-
-    # ---------------------------------------------------------------------------
-    # Stage sets — exact match on FUB stageName values
-    # Buyers:  BA Signed → Actively Showing → Pending → Closed This Quarter
-    # Sellers: Listing Agreement Signed → Coming Soon → Listed →
-    #          Back on the Market → Pending → Closed This Quarter
-    # ---------------------------------------------------------------------------
-    BUYER_STAGES  = {"ba signed", "actively showing", "pending", "closed this quarter"}
-    SELLER_STAGES = {"listing agreement signed", "coming soon", "listed",
-                     "back on the market", "pending", "closed this quarter"}
-
-    rows = []
-    for deal in all_deals:
-        if not isinstance(deal, dict):
-            continue
-
-        # FUB uses pipelineName (Buyers/Sellers/Rentals/Referrals) and stageName
-        pipeline = _safe_str(deal.get("pipelineName") or "").lower()
-        stage    = _safe_str(deal.get("stageName") or "")
-
-        if "seller" in pipeline:
-            ptype = "seller"
-        elif "buyer" in pipeline:
-            ptype = "buyer"
-        else:
-            continue  # Skip Rentals, Referrals, etc.
-
-        # Stage filter
-        if ptype == "buyer"  and stage.lower() not in BUYER_STAGES:
-            continue
-        if ptype == "seller" and stage.lower() not in SELLER_STAGES:
-            continue
-
-        # Log first filtered deal — show users field for agent
-        if not rows:
-            logger.info("DEAL users: %s", deal.get("users"))
-
-        # people array: [{'id': 6743, 'name': 'Mahmood Mohamadi', 'avatar': ''}]
-        people_list = deal.get("people") or []
-        person_id   = str(people_list[0]["id"]) if people_list and isinstance(people_list[0], dict) else ""
-
-        # Client name: buyers → person name, sellers → deal name (property address)
-        if ptype == "buyer" and people_list and isinstance(people_list[0], dict):
-            client_name = _safe_str(people_list[0].get("name") or deal.get("name") or "")
-        else:
-            client_name = _safe_str(deal.get("name") or "")
-
-        # Agent — from users array: [{'id', 'name', 'email', 'role', ...}]
-        users = deal.get("users") or []
-        agent = ""
-        if isinstance(users, list) and users:
-            for u in users:
-                if isinstance(u, dict):
-                    role = u.get("role", "").lower()
-                    if "agent" in role or role == "":
-                        agent = u.get("name", "")
-                        break
-            if not agent:
-                agent = _safe_str(users[0])
-
-        # Property address — sellers: use deal name; buyers: build from parts if available
-        street  = _safe_str(deal.get("street") or deal.get("propertyStreet") or "")
-        city    = _safe_str(deal.get("city")   or deal.get("propertyCity")   or "")
-        state   = _safe_str(deal.get("state")  or deal.get("propertyState")  or "")
-        address = ", ".join(p for p in [street, city, state] if p) if street else _safe_str(deal.get("name") or "")
-
-        # Price and projected close date
-        price           = deal.get("price")
-        projected_close = deal.get("projectedCloseDate") or deal.get("closeDate")
-
-        # Next due task
-        next_task, next_task_due = await _get_next_task(person_id) if person_id else ("", None)
-
-        rows.append({
-            "type":                 ptype,
-            "fub_id":               str(deal.get("id", "")),
-            "client_name":          client_name,
-            "agent":                agent,
-            "lead_stage":           stage,
-            "last_activity":        None,
-            "days_since_contact":   None,
-            "property_address":     address,
-            "list_date":            None,
-            "dom":                  None,
-            "price":                price,
-            "projected_close_date": projected_close,
-            "next_due_task":        next_task,
-            "next_task_due_date":   next_task_due,
-            "synced_at":            now.isoformat()
-        })
-
-    logger.info("Pipeline rows: %d buyers, %d sellers",
-                len([r for r in rows if r["type"] == "buyer"]),
-                len([r for r in rows if r["type"] == "seller"]))
-
-    # Replace cache
-    supabase.table("pipeline_cache").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
-    if rows:
-        supabase.table("pipeline_cache").insert(rows).execute()
-
-    # Update last sync on KPI row for this week
-    monday = _this_monday()
-    supabase.table("kpis").upsert(
-        {
-            "week_start":    monday,
-            "active_buyers": len([r for r in rows if r["type"] == "buyer"]),
-            "fub_synced_at": now.isoformat()
-        },
-        on_conflict="week_start"
-    ).execute()
-
-
-def _this_monday() -> str:
-    today  = datetime.now(timezone.utc).date()
-    monday = today - timedelta(days=today.weekday())
-    return str(monday)
-
-
-def _this_quarter_start() -> datetime:
-    now           = datetime.now(timezone.utc)
-    quarter_month = ((now.month - 1) // 3) * 3 + 1   # 1, 4, 7, or 10
-    return datetime(now.year, quarter_month, 1, tzinfo=timezone.utc)
-
-# ---------------------------------------------------------------------------
-# KPI routes
-# ---------------------------------------------------------------------------
-@app.post("/kpis/sync")
-async def kpi_sync(user=Depends(get_current_user)):
-    """Trigger FUB data pull and update KPI row."""
-    await _sync_fub_pipeline()
-    return {"status": "ok"}
 
 # ---------------------------------------------------------------------------
 # Automation Health — Drive check
@@ -651,6 +467,119 @@ class AutomationPing(BaseModel):
     timestamp:       Optional[str] = None
     notes:           Optional[str] = None
 
+
+
+@app.post("/webhooks/fub-deal-engaged")
+async def fub_deal_engaged(request: Request):
+    """
+    FUB fires this webhook when a deal moves to "Buyer Engaged" or "Seller Engaged".
+    Creates the corresponding OS buyer or property card in Supabase, filed under
+    the assigned agent.
+
+    Configure in FUB: Admin > Settings > API > Webhooks (or via FUB automation)
+    URL: https://forward-os-backend-production.up.railway.app/webhooks/fub-deal-engaged
+    Events: Deals — stage changed to "Buyer Engaged" or "Seller Engaged"
+
+    Expected payload fields (FUB sends these on deal events):
+      data.stageName       — "Buyer Engaged" | "Seller Engaged"
+      data.pipelineName    — "Buyers" | "Sellers"
+      data.name            — deal name (for sellers: property address)
+      data.users           — [{"name": "Charlotte Lee", ...}]
+      data.people          — [{"name": "John Smith", "email": "...", "phones": [...]}]
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return {"received": True, "error": "invalid JSON"}
+
+    logger.info("FUB deal-engaged webhook: %s", str(body)[:500])
+
+    # FUB wraps the deal in body["data"] for webhook events
+    data = body.get("data") or body  # handle both wrapped and flat payloads
+
+    stage = _safe_str(data.get("stageName") or "").strip().lower()
+    if stage not in ("buyer engaged", "seller engaged"):
+        return {"received": True, "skipped": f"stage '{stage}' not handled"}
+
+    # Resolve assigned agent
+    users = data.get("users") or []
+    fub_agent_name = ""
+    if isinstance(users, list) and users:
+        for u in users:
+            if isinstance(u, dict):
+                role = (u.get("role") or "").lower()
+                if "agent" in role or role == "":
+                    fub_agent_name = u.get("name", "")
+                    break
+        if not fub_agent_name and isinstance(users[0], dict):
+            fub_agent_name = users[0].get("name", "")
+
+    # Map FUB name → OS canonical name
+    os_agent = AGENT_NAME_MAP.get(fub_agent_name, fub_agent_name).strip()
+    if not os_agent or os_agent not in KNOWN_AGENTS:
+        logger.warning("fub-deal-engaged: unrecognised agent '%s' — rejecting webhook to prevent misassignment", fub_agent_name)
+        return {"received": True, "skipped": f"unrecognised agent '{fub_agent_name}' — no record created"}
+    agent_email = AGENT_EMAIL_MAP.get(os_agent, "")
+
+    # Extract contact info from people array
+    people = data.get("people") or []
+    person = people[0] if (isinstance(people, list) and people and isinstance(people[0], dict)) else {}
+    contact_name = _safe_str(person.get("name") or data.get("name") or "")
+    contact_email = _safe_str(person.get("email") or "")
+    # FUB phones: [{"value": "...", "type": "mobile"}, ...]
+    phones = person.get("phones") or person.get("phone") or []
+    contact_phone = ""
+    if isinstance(phones, list) and phones:
+        contact_phone = _safe_str(phones[0].get("value") if isinstance(phones[0], dict) else phones[0])
+    elif isinstance(phones, str):
+        contact_phone = phones
+
+    try:
+        if stage == "buyer engaged":
+            if not contact_name:
+                return {"received": True, "error": "no contact name for buyer"}
+            # Duplicate guard: check by name + agent, or email + agent
+            _dup_q = supabase.table("buyers").select("id,buyer_name").eq("agent_name", os_agent).eq("buyer_name", contact_name).execute().data
+            if not _dup_q and contact_email:
+                _dup_q = supabase.table("buyers").select("id,buyer_name").eq("agent_name", os_agent).eq("email", contact_email).neq("email", "").execute().data
+            if _dup_q:
+                logger.info("Webhook duplicate skipped: '%s' already exists for %s (id=%s)", contact_name, os_agent, _dup_q[0]["id"])
+                return {"received": True, "skipped": "duplicate", "existing_id": _dup_q[0]["id"]}
+            result = supabase.table("buyers").insert({
+                "buyer_name":  contact_name,
+                "agent_name":  os_agent,
+                "agent_email": agent_email,
+                "email":       contact_email,
+                "phone":       contact_phone,
+                "status":      "active",
+            }).execute()
+            logger.info("Created OS buyer: %s → %s", contact_name, os_agent)
+            return {"received": True, "created": "buyer", "name": contact_name, "agent": os_agent}
+
+        else:  # seller engaged
+            # For sellers, deal name is typically the property address
+            address = _safe_str(data.get("name") or contact_name or "")
+            if not address:
+                return {"received": True, "error": "no address for seller"}
+            # Duplicate guard: check by address + agent
+            _dup_prop = supabase.table("properties").select("id,address").eq("agent_name", os_agent).eq("address", address).execute().data
+            if _dup_prop:
+                logger.info("Webhook duplicate skipped: property '%s' already exists for %s (id=%s)", address, os_agent, _dup_prop[0]["id"])
+                return {"received": True, "skipped": "duplicate", "existing_id": _dup_prop[0]["id"]}
+            result = supabase.table("properties").insert({
+                "address":     address,
+                "agent_name":  os_agent,
+                "agent_email": agent_email,
+                "seller_name": contact_name,
+                "market":      "DC",
+                "status":      "draft",
+            }).execute()
+            logger.info("Created OS property: %s → %s", address, os_agent)
+            return {"received": True, "created": "property", "address": address, "agent": os_agent}
+
+    except Exception as e:
+        logger.error("fub-deal-engaged DB insert failed: %s", e)
+        return {"received": True, "error": f"Failed to create record from FUB webhook — database insert error. The contact data was received but could not be saved. Check the webhook_errors table."}
 
 @app.post("/webhooks/fub-task-update")
 async def fub_task_webhook(request: Request, background_tasks: BackgroundTasks):
@@ -2060,6 +1989,17 @@ class CreatePropertyRequest(BaseModel):
 @app.post("/create-property")
 async def create_property(payload: CreatePropertyRequest):
     """Create a new property record. co_seller stored in subfolder_drive_ids JSONB."""
+    # Normalize agent name
+    agent = AGENT_NAME_MAP.get((payload.agent_name or "").strip(), (payload.agent_name or "").strip()).strip()
+    # Duplicate guard: check by address + agent
+    try:
+        _dup = supabase.table("properties").select("id,address").eq("agent_name", agent).eq("address", (payload.address or "").strip()).execute().data
+        if _dup:
+            raise HTTPException(status_code=409, detail=f"A property at '{_dup[0]['address']}' already exists in your list.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning("Property duplicate check failed (proceeding): %s", e)
     insert_data = {
         "address":     payload.address,
         "agent_name":  payload.agent_name,
@@ -2074,10 +2014,10 @@ async def create_property(payload: CreatePropertyRequest):
     try:
         result = supabase.table("properties").insert(insert_data).execute()
         if not result.data:
-            raise HTTPException(status_code=500, detail="Insert returned no data")
+            raise HTTPException(status_code=500, detail="Property could not be created — the database insert returned no data. This may indicate a schema mismatch or constraint violation. Please check the server logs.")
         return result.data[0]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database insert failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Property creation failed — database error: {e}. Check that all required fields are valid and try again.")
 
 
 class SavePropertyNoteRequest(BaseModel):
@@ -2101,7 +2041,7 @@ async def save_property_note(payload: SavePropertyNoteRequest):
         }).execute()
         return result.data[0] if result.data else {"ok": True}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Save note failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not save the property note — database error. Try saving again. If the problem persists, refresh the page.")
 
 
 # ---------------------------------------------------------------------------
@@ -2137,7 +2077,7 @@ async def upload_property_file(
             "asset_id": asset.get("id") if asset else None,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upload record failed: {e}")
+        raise HTTPException(status_code=500, detail=f"The file was received but could not be recorded in the database — upload metadata save failed. Try re-uploading the file.")
 
 
 @app.post("/upload-buyer-file")
@@ -2169,7 +2109,7 @@ async def upload_buyer_file(
             "asset_id": asset.get("id") if asset else None,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upload record failed: {e}")
+        raise HTTPException(status_code=500, detail=f"The file was received but could not be recorded in the database — upload metadata save failed. Try re-uploading the file.")
 
 
 class DeleteFileRequest(BaseModel):
@@ -2207,7 +2147,7 @@ async def update_property(property_id: str, payload: UpdatePropertyRequest):
         result = supabase.table("properties").update(safe_fields).eq("id", property_id).execute()
         return result.data[0] if result.data else {"ok": True}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Update failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Property update failed — database error: {e}. The changes were not saved. Please try again.")
 
 @app.delete("/properties/{property_id}")
 async def delete_property(property_id: str):
@@ -2221,7 +2161,7 @@ async def delete_property(property_id: str):
         supabase.table("properties").delete().eq("id", property_id).execute()
         return {"ok": True}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Property could not be deleted — database error: {e}. The record may have dependent data. Please check the server logs.")
 
 # ── Buyer CRUD ────────────────────────────────────────────────────────────────
 
@@ -2233,23 +2173,69 @@ class CreateBuyerRequest(BaseModel):
     phone: str = ""
     status: str = "active"
 
+# Canonical agent names — must match exactly what FORWARD OS stores in the buyers table.
+# Add new agents here when they join the team.
+KNOWN_AGENTS: set[str] = {
+    "Marc Cashin",
+    "Ashling McGowan",
+    "Niki Lang",
+    "Cesar Rivera",
+    "Charlotte Lee",
+    "Shannon Casey",
+    "Operations",
+    "Concierge",
+}
+
 @app.post("/create-buyer")
 async def create_buyer(payload: CreateBuyerRequest):
     """Create a new buyer record via service role key — bypasses RLS."""
+    # Reject empty, whitespace-only, or unrecognised agent names so no buyer
+    # ever lands in the "Unknown" bucket on the frontend.
+    agent = AGENT_NAME_MAP.get((payload.agent_name or "").strip(), (payload.agent_name or "").strip()).strip()
+    if not agent:
+        raise HTTPException(
+            status_code=400,
+            detail="agent_name is required. The creating agent's session may not be fully loaded — please refresh and try again."
+        )
+    if agent not in KNOWN_AGENTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unrecognised agent '{agent}'. Ensure you are logged in with a valid FORWARD agent account."
+        )
+    buyer_name = (payload.buyer_name or "").strip()
+    if not buyer_name:
+        raise HTTPException(status_code=400, detail="buyer_name is required.")
+
+    # Duplicate guard: check name + agent, email + agent, or phone + agent
+    try:
+        _dup = supabase.table("buyers").select("id,buyer_name").eq("agent_name", agent).eq("buyer_name", buyer_name).execute().data
+        if not _dup and payload.email and payload.email.strip():
+            _dup = supabase.table("buyers").select("id,buyer_name").eq("agent_name", agent).eq("email", payload.email.strip()).execute().data
+        if not _dup and payload.phone and payload.phone.strip():
+            _dup = supabase.table("buyers").select("id,buyer_name").eq("agent_name", agent).eq("phone", payload.phone.strip()).execute().data
+        if _dup:
+            raise HTTPException(status_code=409, detail=f"A buyer named '{_dup[0]['buyer_name']}' already exists in your list.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning("Duplicate check failed (proceeding with insert): %s", e)
+
     try:
         result = supabase.table("buyers").insert({
-            "buyer_name":  payload.buyer_name,
-            "agent_name":  payload.agent_name,
+            "buyer_name":  buyer_name,
+            "agent_name":  agent,
             "agent_email": payload.agent_email,
             "email":       payload.email,
             "phone":       payload.phone,
             "status":      payload.status,
         }).execute()
         if not result.data:
-            raise HTTPException(status_code=500, detail="Insert returned no data")
+            raise HTTPException(status_code=500, detail="Buyer could not be created — the database insert returned no data. This may indicate a schema mismatch or constraint violation. Please check the server logs.")
         return result.data[0]
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database insert failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Buyer creation failed — database error: {e}. Check that all required fields are valid and try again.")
 
 @app.get("/buyers")
 async def get_buyers(agent_name: str = None):
@@ -2267,7 +2253,7 @@ async def get_buyers(agent_name: str = None):
             result = supabase.table("buyers").select("*").order("created_at", desc=True).execute()
             return result.data or []
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Fetch buyers failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not load your buyers list — database error. Refresh the page to try again.")
 
 class UpdateBuyerRequest(BaseModel):
     fields: dict
@@ -2296,7 +2282,7 @@ async def update_buyer(buyer_id: str, payload: UpdateBuyerRequest):
         result = supabase.table("buyers").update(safe_fields).eq("id", buyer_id).execute()
         return result.data[0] if result.data else {"ok": True}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Update failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Buyer update failed — database error: {e}. The changes were not saved. Please try again.")
 
 @app.delete("/buyers/{buyer_id}")
 async def delete_buyer(buyer_id: str):
@@ -2306,7 +2292,7 @@ async def delete_buyer(buyer_id: str):
         supabase.table("buyers").delete().eq("id", buyer_id).execute()
         return {"ok": True}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Buyer could not be deleted — database error: {e}. The record may have dependent data. Please check the server logs.")
 
 
 # ── Meeting Prep Web Research ──────────────────────────────────────────────
@@ -2416,7 +2402,7 @@ async def add_property_partner(property_id: str, payload: PartnerRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Could not add partner to property — database error: {e}. Check that the partner ID is valid.")
 
 @app.post("/properties/{property_id}/remove-partner")
 async def remove_property_partner(property_id: str, payload: PartnerRequest):
@@ -2432,7 +2418,7 @@ async def remove_property_partner(property_id: str, payload: PartnerRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Could not remove partner from property — database error: {e}.")
 
 @app.post("/buyers/{buyer_id}/add-partner")
 async def add_buyer_partner(buyer_id: str, payload: PartnerRequest):
@@ -2450,7 +2436,7 @@ async def add_buyer_partner(buyer_id: str, payload: PartnerRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Could not add partner to buyer — database error: {e}. Check that the partner ID is valid.")
 
 @app.post("/buyers/{buyer_id}/remove-partner")
 async def remove_buyer_partner(buyer_id: str, payload: PartnerRequest):
@@ -2466,7 +2452,7 @@ async def remove_buyer_partner(buyer_id: str, payload: PartnerRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Could not remove partner from buyer — database error: {e}.")
 
 
 # ── Knowledge Docs (Training Library sync) ────────────────────────────────────
@@ -2498,7 +2484,7 @@ async def sync_knowledge_docs(payload: KnowledgeDocsSyncRequest):
             }).execute()
         return {"ok": True, "synced": len(payload.entries)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Knowledge sync failed — could not reach the documents source or database. Try syncing again. If the problem persists, check the document storage connection.")
 
 @app.delete("/knowledge-docs")
 async def delete_knowledge_doc(file_name: str):
@@ -2507,4 +2493,4 @@ async def delete_knowledge_doc(file_name: str):
         supabase.table("knowledge_docs").delete().eq("file_name", file_name).execute()
         return {"ok": True}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Could not delete the knowledge document — database error: {e}. The document may have already been deleted or the ID is invalid.")
