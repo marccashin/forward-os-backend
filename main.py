@@ -215,6 +215,7 @@ app.add_middleware(
 # Scheduled jobs
 # ---------------------------------------------------------------------------
 scheduler = AsyncIOScheduler(timezone="America/New_York")
+_buyer_create_lock = asyncio.Lock()  # Prevents race-condition duplicate buyers on concurrent FUB webhooks
 
 
 
@@ -538,21 +539,23 @@ async def fub_deal_engaged(request: Request):
         if stage == "buyer engaged":
             if not contact_name:
                 return {"received": True, "error": "no contact name for buyer"}
-            # Duplicate guard: check by name + agent, or email + agent
-            _dup_q = supabase.table("buyers").select("id,buyer_name").eq("agent_name", os_agent).eq("buyer_name", contact_name).execute().data
-            if not _dup_q and contact_email:
-                _dup_q = supabase.table("buyers").select("id,buyer_name").eq("agent_name", os_agent).eq("email", contact_email).neq("email", "").execute().data
-            if _dup_q:
-                logger.info("Webhook duplicate skipped: '%s' already exists for %s (id=%s)", contact_name, os_agent, _dup_q[0]["id"])
-                return {"received": True, "skipped": "duplicate", "existing_id": _dup_q[0]["id"]}
-            result = supabase.table("buyers").insert({
-                "buyer_name":  contact_name,
-                "agent_name":  os_agent,
-                "agent_email": agent_email,
-                "email":       contact_email,
-                "phone":       contact_phone,
-                "status":      "active",
-            }).execute()
+            # Duplicate guard + insert: held under a lock so concurrent FUB bulk-webhooks
+            # can't race past the dup check and create duplicate records.
+            async with _buyer_create_lock:
+                _dup_q = supabase.table("buyers").select("id,buyer_name").eq("agent_name", os_agent).eq("buyer_name", contact_name).execute().data
+                if not _dup_q and contact_email:
+                    _dup_q = supabase.table("buyers").select("id,buyer_name").eq("agent_name", os_agent).eq("email", contact_email).neq("email", "").execute().data
+                if _dup_q:
+                    logger.info("Webhook duplicate skipped: '%s' already exists for %s (id=%s)", contact_name, os_agent, _dup_q[0]["id"])
+                    return {"received": True, "skipped": "duplicate", "existing_id": _dup_q[0]["id"]}
+                result = supabase.table("buyers").insert({
+                    "buyer_name":  contact_name,
+                    "agent_name":  os_agent,
+                    "agent_email": agent_email,
+                    "email":       contact_email,
+                    "phone":       contact_phone,
+                    "status":      "active",
+                }).execute()
             logger.info("Created OS buyer: %s → %s", contact_name, os_agent)
             return {"received": True, "created": "buyer", "name": contact_name, "agent": os_agent}
 
@@ -2218,7 +2221,8 @@ async def create_buyer(payload: CreateBuyerRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.warning("Duplicate check failed (proceeding with insert): %s", e)
+        logger.error("Duplicate check query failed — rejecting insert to prevent accidental duplicate: %s", e)
+        raise HTTPException(status_code=503, detail="Duplicate check temporarily unavailable — please retry in a moment.")
 
     try:
         result = supabase.table("buyers").insert({
