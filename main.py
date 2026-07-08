@@ -29,7 +29,7 @@ from typing import Any, Optional
 import httpx
 from fastapi import FastAPI, HTTPException, Depends, Request, Header, BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -1918,11 +1918,32 @@ Answer the agent's follow-up questions directly and specifically. Use actual num
     headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
     body = {"model": BMR_MODEL, "max_tokens": 1024, "temperature": 0, "system": system, "messages": messages}
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
-        resp.raise_for_status()
+    async def _stream():
+        async with httpx.AsyncClient(timeout=60) as client:
+            async with client.stream(
+                "POST",
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json={**body, "stream": True},
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        evt = json.loads(data)
+                        if evt.get("type") == "content_block_delta":
+                            text = evt.get("delta", {}).get("text", "")
+                            if text:
+                                yield f"data: {json.dumps({'text': text})}\n\n"
+                    except Exception:
+                        pass
+        yield "data: [DONE]\n\n"
 
-    return {"answer": resp.json()["content"][0]["text"].strip()}
+    return StreamingResponse(_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ── Market Report Links ──────────────────────────────────────────────────────
