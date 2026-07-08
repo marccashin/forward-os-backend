@@ -2014,10 +2014,10 @@ async def create_property(payload: CreatePropertyRequest):
     try:
         result = supabase.table("properties").insert(insert_data).execute()
         if not result.data:
-            raise HTTPException(status_code=500, detail="Insert returned no data")
+            raise HTTPException(status_code=500, detail="Property could not be created — the database insert returned no data. This may indicate a schema mismatch or constraint violation. Please check the server logs.")
         return result.data[0]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database insert failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Property creation failed — database error: {e}. Check that all required fields are valid and try again.")
 
 
 class SavePropertyNoteRequest(BaseModel):
@@ -2230,12 +2230,12 @@ async def create_buyer(payload: CreateBuyerRequest):
             "status":      payload.status,
         }).execute()
         if not result.data:
-            raise HTTPException(status_code=500, detail="Insert returned no data")
+            raise HTTPException(status_code=500, detail="Buyer could not be created — the database insert returned no data. This may indicate a schema mismatch or constraint violation. Please check the server logs.")
         return result.data[0]
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database insert failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Buyer creation failed — database error: {e}. Check that all required fields are valid and try again.")
 
 @app.get("/buyers")
 async def get_buyers(agent_name: str = None):
