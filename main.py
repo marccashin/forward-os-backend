@@ -399,7 +399,7 @@ async def trigger_agent_task_sync(req: AgentTaskSyncRequest = None):
         return {"status": "synced", "ts": datetime.now(timezone.utc).isoformat()}
     except Exception as e:
         logger.error("Manual agent task sync failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Agent task sync failed — could not pull tasks from FUB. The FUB API may be temporarily unavailable. Try again in a moment.")
 
 
 
@@ -579,7 +579,7 @@ async def fub_deal_engaged(request: Request):
 
     except Exception as e:
         logger.error("fub-deal-engaged DB insert failed: %s", e)
-        return {"received": True, "error": str(e)}
+        return {"received": True, "error": f"Failed to create record from FUB webhook — database insert error. The contact data was received but could not be saved. Check the webhook_errors table."}
 
 @app.post("/webhooks/fub-task-update")
 async def fub_task_webhook(request: Request, background_tasks: BackgroundTasks):
@@ -2041,7 +2041,7 @@ async def save_property_note(payload: SavePropertyNoteRequest):
         }).execute()
         return result.data[0] if result.data else {"ok": True}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Save note failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not save the property note — database error. Try saving again. If the problem persists, refresh the page.")
 
 
 # ---------------------------------------------------------------------------
@@ -2077,7 +2077,7 @@ async def upload_property_file(
             "asset_id": asset.get("id") if asset else None,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upload record failed: {e}")
+        raise HTTPException(status_code=500, detail=f"The file was received but could not be recorded in the database — upload metadata save failed. Try re-uploading the file.")
 
 
 @app.post("/upload-buyer-file")
@@ -2109,7 +2109,7 @@ async def upload_buyer_file(
             "asset_id": asset.get("id") if asset else None,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upload record failed: {e}")
+        raise HTTPException(status_code=500, detail=f"The file was received but could not be recorded in the database — upload metadata save failed. Try re-uploading the file.")
 
 
 class DeleteFileRequest(BaseModel):
@@ -2147,7 +2147,7 @@ async def update_property(property_id: str, payload: UpdatePropertyRequest):
         result = supabase.table("properties").update(safe_fields).eq("id", property_id).execute()
         return result.data[0] if result.data else {"ok": True}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Update failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Property update failed — database error: {e}. The changes were not saved. Please try again.")
 
 @app.delete("/properties/{property_id}")
 async def delete_property(property_id: str):
@@ -2161,7 +2161,7 @@ async def delete_property(property_id: str):
         supabase.table("properties").delete().eq("id", property_id).execute()
         return {"ok": True}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Property could not be deleted — database error: {e}. The record may have dependent data. Please check the server logs.")
 
 # ── Buyer CRUD ────────────────────────────────────────────────────────────────
 
@@ -2253,7 +2253,7 @@ async def get_buyers(agent_name: str = None):
             result = supabase.table("buyers").select("*").order("created_at", desc=True).execute()
             return result.data or []
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Fetch buyers failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not load your buyers list — database error. Refresh the page to try again.")
 
 class UpdateBuyerRequest(BaseModel):
     fields: dict
@@ -2282,7 +2282,7 @@ async def update_buyer(buyer_id: str, payload: UpdateBuyerRequest):
         result = supabase.table("buyers").update(safe_fields).eq("id", buyer_id).execute()
         return result.data[0] if result.data else {"ok": True}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Update failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Buyer update failed — database error: {e}. The changes were not saved. Please try again.")
 
 @app.delete("/buyers/{buyer_id}")
 async def delete_buyer(buyer_id: str):
@@ -2292,7 +2292,7 @@ async def delete_buyer(buyer_id: str):
         supabase.table("buyers").delete().eq("id", buyer_id).execute()
         return {"ok": True}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Buyer could not be deleted — database error: {e}. The record may have dependent data. Please check the server logs.")
 
 
 # ── Meeting Prep Web Research ──────────────────────────────────────────────
@@ -2402,7 +2402,7 @@ async def add_property_partner(property_id: str, payload: PartnerRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Could not add partner to property — database error: {e}. Check that the partner ID is valid.")
 
 @app.post("/properties/{property_id}/remove-partner")
 async def remove_property_partner(property_id: str, payload: PartnerRequest):
@@ -2418,7 +2418,7 @@ async def remove_property_partner(property_id: str, payload: PartnerRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Could not remove partner from property — database error: {e}.")
 
 @app.post("/buyers/{buyer_id}/add-partner")
 async def add_buyer_partner(buyer_id: str, payload: PartnerRequest):
@@ -2436,7 +2436,7 @@ async def add_buyer_partner(buyer_id: str, payload: PartnerRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Could not add partner to buyer — database error: {e}. Check that the partner ID is valid.")
 
 @app.post("/buyers/{buyer_id}/remove-partner")
 async def remove_buyer_partner(buyer_id: str, payload: PartnerRequest):
@@ -2452,7 +2452,7 @@ async def remove_buyer_partner(buyer_id: str, payload: PartnerRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Could not remove partner from buyer — database error: {e}.")
 
 
 # ── Knowledge Docs (Training Library sync) ────────────────────────────────────
@@ -2484,7 +2484,7 @@ async def sync_knowledge_docs(payload: KnowledgeDocsSyncRequest):
             }).execute()
         return {"ok": True, "synced": len(payload.entries)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Knowledge sync failed — could not reach the documents source or database. Try syncing again. If the problem persists, check the document storage connection.")
 
 @app.delete("/knowledge-docs")
 async def delete_knowledge_doc(file_name: str):
@@ -2493,4 +2493,4 @@ async def delete_knowledge_doc(file_name: str):
         supabase.table("knowledge_docs").delete().eq("file_name", file_name).execute()
         return {"ok": True}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Could not delete the knowledge document — database error: {e}. The document may have already been deleted or the ID is invalid.")
