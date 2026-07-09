@@ -76,7 +76,6 @@ AGENT_EMAIL_MAP: dict[str, str] = {
     "Charlotte Lee":   "charlotte@fwrdrealestate.com",
     "Niki Lang":       "niki@fwrdrealestate.com",
     "Cesar Rivera":    "cesar@fwrdrealestate.com",
-    "Shannon Casey":   "shannon@fwrdrealestate.com",
 }
 
 # Active deal stages for task feed (excludes "Closed This Quarter")
@@ -215,6 +214,7 @@ app.add_middleware(
 # Scheduled jobs
 # ---------------------------------------------------------------------------
 scheduler = AsyncIOScheduler(timezone="America/New_York")
+_buyer_create_lock = asyncio.Lock()  # Prevents race-condition duplicate buyers on concurrent FUB webhooks
 
 
 
@@ -538,22 +538,30 @@ async def fub_deal_engaged(request: Request):
         if stage == "buyer engaged":
             if not contact_name:
                 return {"received": True, "error": "no contact name for buyer"}
-            # Duplicate guard: check by name + agent, or email + agent
-            _dup_q = supabase.table("buyers").select("id,buyer_name").eq("agent_name", os_agent).eq("buyer_name", contact_name).execute().data
-            if not _dup_q and contact_email:
-                _dup_q = supabase.table("buyers").select("id,buyer_name").eq("agent_name", os_agent).eq("email", contact_email).neq("email", "").execute().data
-            if _dup_q:
-                logger.info("Webhook duplicate skipped: '%s' already exists for %s (id=%s)", contact_name, os_agent, _dup_q[0]["id"])
-                return {"received": True, "skipped": "duplicate", "existing_id": _dup_q[0]["id"]}
-            result = supabase.table("buyers").insert({
-                "buyer_name":  contact_name,
-                "agent_name":  os_agent,
-                "agent_email": agent_email,
-                "email":       contact_email,
-                "phone":       contact_phone,
-                "status":      "active",
-            }).execute()
+            # Duplicate guard + insert: held under a lock so concurrent FUB bulk-webhooks
+            # can't race past the dup check and create duplicate records.
+            async with _buyer_create_lock:
+                _dup_q = supabase.table("buyers").select("id,buyer_name").eq("agent_name", os_agent).eq("buyer_name", contact_name).execute().data
+                if not _dup_q and contact_email:
+                    _dup_q = supabase.table("buyers").select("id,buyer_name").eq("agent_name", os_agent).eq("email", contact_email).neq("email", "").execute().data
+                if _dup_q:
+                    logger.info("Webhook duplicate skipped: '%s' already exists for %s (id=%s)", contact_name, os_agent, _dup_q[0]["id"])
+                    log_audit("buyer.dup_skipped", agent_name=os_agent,
+                              entity_type="buyer", entity_id=_dup_q[0]["id"],
+                              entity_name=contact_name, detail={"source": "fub_webhook"})
+                    return {"received": True, "skipped": "duplicate", "existing_id": _dup_q[0]["id"]}
+                result = supabase.table("buyers").insert({
+                    "buyer_name":  contact_name,
+                    "agent_name":  os_agent,
+                    "agent_email": agent_email,
+                    "email":       contact_email,
+                    "phone":       contact_phone,
+                    "status":      "active",
+                }).execute()
             logger.info("Created OS buyer: %s → %s", contact_name, os_agent)
+            log_audit("buyer.create", agent_name=os_agent,
+                      entity_type="buyer", entity_id=result.data[0].get("id") if result.data else None,
+                      entity_name=contact_name, detail={"source": "fub_webhook", "email": contact_email})
             return {"received": True, "created": "buyer", "name": contact_name, "agent": os_agent}
 
         else:  # seller engaged
@@ -2015,6 +2023,9 @@ async def create_property(payload: CreatePropertyRequest):
         result = supabase.table("properties").insert(insert_data).execute()
         if not result.data:
             raise HTTPException(status_code=500, detail="Insert returned no data")
+        log_audit("property.create", agent_name=payload.agent_name,
+                  entity_type="property", entity_id=result.data[0].get("id"),
+                  entity_name=payload.address, detail={"source": "manual"})
         return result.data[0]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database insert failed: {e}")
@@ -2150,15 +2161,21 @@ async def update_property(property_id: str, payload: UpdatePropertyRequest):
         raise HTTPException(status_code=500, detail=f"Update failed: {e}")
 
 @app.delete("/properties/{property_id}")
-async def delete_property(property_id: str):
+async def delete_property(property_id: str, agent_name: str = None):
     """Delete a property and all related records (notes, assets, offers)."""
     try:
+        row = supabase.table("properties").select("address,agent_name").eq("id", property_id).execute().data
+        address_val = row[0]["address"] if row else None
+        owner_agent = row[0]["agent_name"] if row else None
         # Delete related records first (FK constraints)
         supabase.table("property_notes").delete().eq("property_id", property_id).execute()
         supabase.table("property_assets").delete().eq("property_id", property_id).execute()
         supabase.table("property_offers").delete().eq("property_id", property_id).execute()
         # Delete the property itself
         supabase.table("properties").delete().eq("id", property_id).execute()
+        log_audit("property.delete", agent_name=agent_name or owner_agent,
+                  entity_type="property", entity_id=property_id,
+                  entity_name=address_val, detail={"deleted_by": agent_name})
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
@@ -2181,7 +2198,6 @@ KNOWN_AGENTS: set[str] = {
     "Niki Lang",
     "Cesar Rivera",
     "Charlotte Lee",
-    "Shannon Casey",
     "Operations",
     "Concierge",
 }
@@ -2218,7 +2234,8 @@ async def create_buyer(payload: CreateBuyerRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.warning("Duplicate check failed (proceeding with insert): %s", e)
+        logger.error("Duplicate check query failed — rejecting insert to prevent accidental duplicate: %s", e)
+        raise HTTPException(status_code=503, detail="Duplicate check temporarily unavailable — please retry in a moment.")
 
     try:
         result = supabase.table("buyers").insert({
@@ -2231,6 +2248,9 @@ async def create_buyer(payload: CreateBuyerRequest):
         }).execute()
         if not result.data:
             raise HTTPException(status_code=500, detail="Insert returned no data")
+        log_audit("buyer.create", agent_name=agent,
+                  entity_type="buyer", entity_id=result.data[0].get("id"),
+                  entity_name=buyer_name, detail={"source": "manual", "email": payload.email})
         return result.data[0]
     except HTTPException:
         raise
@@ -2280,16 +2300,27 @@ async def update_buyer(buyer_id: str, payload: UpdateBuyerRequest):
         raise HTTPException(status_code=400, detail="No valid fields to update")
     try:
         result = supabase.table("buyers").update(safe_fields).eq("id", buyer_id).execute()
+        if _is_archive:
+            row = result.data[0] if result.data else {}
+            log_audit("buyer.archive", agent_name=row.get("agent_name"),
+                      entity_type="buyer", entity_id=buyer_id,
+                      entity_name=row.get("buyer_name"), detail={})
         return result.data[0] if result.data else {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Update failed: {e}")
 
 @app.delete("/buyers/{buyer_id}")
-async def delete_buyer(buyer_id: str):
+async def delete_buyer(buyer_id: str, agent_name: str = None):
     """Delete a buyer and all related records (assets)."""
     try:
+        row = supabase.table("buyers").select("buyer_name,agent_name").eq("id", buyer_id).execute().data
+        buyer_name_val = row[0]["buyer_name"] if row else None
+        owner_agent    = row[0]["agent_name"] if row else None
         supabase.table("buyer_assets").delete().eq("buyer_id", buyer_id).execute()
         supabase.table("buyers").delete().eq("id", buyer_id).execute()
+        log_audit("buyer.delete", agent_name=agent_name or owner_agent,
+                  entity_type="buyer", entity_id=buyer_id,
+                  entity_name=buyer_name_val, detail={"deleted_by": agent_name})
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
@@ -2464,6 +2495,19 @@ class KnowledgeDocEntry(BaseModel):
 
 class KnowledgeDocsSyncRequest(BaseModel):
     entries: list[KnowledgeDocEntry]
+
+@app.get("/admin/audit-log")
+async def get_audit_log(agent_name: str = None, action: str = None, limit: int = 200, offset: int = 0):
+    """Audit log — Marc / Operations only (enforced client-side)."""
+    try:
+        q = supabase.table("audit_log").select("*").order("created_at", desc=True).limit(limit).offset(offset)
+        if agent_name:
+            q = q.eq("agent_name", agent_name)
+        if action:
+            q = q.eq("action", action)
+        return q.execute().data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Audit log fetch failed: {e}")
 
 @app.post("/knowledge-docs/sync")
 async def sync_knowledge_docs(payload: KnowledgeDocsSyncRequest):
