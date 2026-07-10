@@ -2538,3 +2538,139 @@ async def delete_knowledge_doc(file_name: str):
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+# ---------------------------------------------------------------------------
+# FUB Pipeline cache sync
+# ---------------------------------------------------------------------------
+
+BUYER_STAGES = {"BA Signed", "Actively Showing", "Pending"}
+SELLER_STAGES = {"Listing Agreement Signed", "Coming Soon", "Listed", "Back on the Market", "Pending"}
+
+
+async def _sync_fub_pipeline() -> dict:
+    """Fetch all active buyer/seller deals from FUB and write to pipeline_cache."""
+    now = datetime.now(timezone.utc)
+    rows: list[dict] = []
+    offset = 0
+    limit = 100
+
+    while True:
+        data = await fub_get("/deals", {"limit": limit, "offset": offset})
+        batch = data.get("deals", [])
+
+        for deal in batch:
+            if not isinstance(deal, dict):
+                continue
+
+            stage    = _safe_str(deal.get("stageName") or "")
+            pipeline = _safe_str(deal.get("pipelineName") or "").lower()
+
+            if "buyer" in pipeline:
+                if stage not in BUYER_STAGES:
+                    continue
+                ptype = "buyer"
+            elif "seller" in pipeline:
+                if stage not in SELLER_STAGES:
+                    continue
+                ptype = "seller"
+            else:
+                continue
+
+            # Agent name
+            users     = deal.get("users") or []
+            agent_fub = ""
+            if isinstance(users, list) and users:
+                for u in users:
+                    if isinstance(u, dict):
+                        role = u.get("role", "").lower()
+                        if "agent" in role or role == "":
+                            agent_fub = u.get("name", "")
+                            break
+                if not agent_fub and isinstance(users[0], dict):
+                    agent_fub = users[0].get("name", "")
+            agent = AGENT_NAME_MAP.get(agent_fub, agent_fub)
+
+            # Client name
+            people_list = deal.get("people") or []
+            if people_list and isinstance(people_list[0], dict):
+                client_name = _safe_str(people_list[0].get("name") or deal.get("name") or "")
+            else:
+                client_name = _safe_str(deal.get("name") or "")
+
+            # Last activity / days since contact
+            last_activity_str = _safe_str(deal.get("lastActivityDate") or deal.get("updated") or "")
+            last_activity = None
+            days_since    = None
+            if last_activity_str:
+                try:
+                    la = datetime.fromisoformat(last_activity_str.replace("Z", "+00:00"))
+                    if la.tzinfo is None:
+                        la = la.replace(tzinfo=timezone.utc)
+                    last_activity = la.isoformat()
+                    days_since    = (now - la).days
+                except Exception:
+                    pass
+
+            rows.append({
+                "id":                str(uuid4()),
+                "type":              ptype,
+                "fub_id":            str(deal.get("id") or ""),
+                "client_name":       client_name,
+                "agent":             agent,
+                "lead_stage":        stage,
+                "last_activity":     last_activity,
+                "days_since_contact": days_since,
+                "property_address":  _safe_str(deal.get("address") or ""),
+                "synced_at":         now.isoformat(),
+            })
+
+        if len(batch) < limit:
+            break
+        offset += limit
+
+    # Atomically replace pipeline_cache
+    supabase.table("pipeline_cache").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+    if rows:
+        supabase.table("pipeline_cache").insert(rows).execute()
+
+    logger.info("[pipeline-sync] wrote %d rows to pipeline_cache", len(rows))
+    return {"synced": len(rows)}
+
+
+async def job_sync_fub_pipeline():
+    """APScheduler job: daily 6am ET FUB pipeline cache sync."""
+    logger.info("[pipeline-sync] Starting scheduled sync...")
+    try:
+        result = await _sync_fub_pipeline()
+        logger.info("[pipeline-sync] Done: %s", result)
+    except Exception as e:
+        logger.error("[pipeline-sync] Failed: %s", e)
+
+
+@app.on_event("startup")
+async def register_pipeline_sync_job():
+    """Register daily FUB pipeline cache sync at 6am ET."""
+    scheduler.add_job(
+        job_sync_fub_pipeline,
+        CronTrigger(hour=6, minute=0, timezone="America/New_York"),
+        id="fub_pipeline_sync",
+        replace_existing=True,
+    )
+    logger.info("[pipeline-sync] Scheduled daily 6am ET sync registered")
+
+
+# ---------------------------------------------------------------------------
+# Pipeline sync trigger
+# ---------------------------------------------------------------------------
+
+@app.post("/pipeline/sync")
+async def trigger_pipeline_sync(user=Depends(get_current_user)):
+    """Manual FUB pipeline cache sync — callable from the CC app."""
+    try:
+        result = await _sync_fub_pipeline()
+        return {"status": "synced", **result, "ts": datetime.now(timezone.utc).isoformat()}
+    except Exception as e:
+        logger.error("Manual pipeline sync failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
