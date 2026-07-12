@@ -2722,31 +2722,24 @@ async def _run_os_audit() -> dict:
     """
     checks = []
     now_utc = datetime.now(timezone.utc)
-
-    # -----------------------------------------------------------------------
     # 1. Railway backend self-check
-    # -----------------------------------------------------------------------
     checks.append({
         "name": "Railway backend",
         "status": "PASS",
         "detail": f"Executing at {now_utc.strftime('%Y-%m-%d %H:%M UTC')}",
     })
-
-    # -----------------------------------------------------------------------
     # 2. FUB API — key still live?
-    # -----------------------------------------------------------------------
     try:
         result = await fub_get("/users", {"limit": 1})
         if result and not result.get("error"):
-            checks.append({"name": "FUB API", "status": "PASS", "detail": "Reachable and authenticated"})
+            checks.append({"name": "FUB API", "status": "PASS",
+                            "detail": "Reachable and authenticated"})
         else:
-            checks.append({"name": "FUB API", "status": "FAIL", "detail": f"Unexpected response: {str(result)[:120]}"})
+            checks.append({"name": "FUB API", "status": "FAIL",
+                            "detail": f"Unexpected response: {str(result)[:120]}"})
     except Exception as e:
         checks.append({"name": "FUB API", "status": "FAIL", "detail": str(e)})
-
-    # -----------------------------------------------------------------------
-    # 3. pipeline_cache — freshness (did the 6am FUB sync run?)
-    # -----------------------------------------------------------------------
+    # 3. pipeline_cache — freshness (did the 6:00am FUB sync run?)
     try:
         r = supabase.table("pipeline_cache").select("synced_at").order("synced_at", desc=True).limit(1).execute()
         if r.data:
@@ -2759,16 +2752,13 @@ async def _run_os_audit() -> dict:
                                 "detail": f"Last sync {ts.strftime('%Y-%m-%d %H:%M UTC')} ({age_h:.1f}h ago)"})
             else:
                 checks.append({"name": "pipeline_cache freshness", "status": "FAIL",
-                                "detail": f"Stale! Last sync {ts.strftime('%Y-%m-%d %H:%M UTC')} ({age_h:.1f}h ago)"})
+                                "detail": f"Stale — last sync {ts.strftime('%Y-%m-%d %H:%M UTC')} ({age_h:.1f}h ago)"})
         else:
             checks.append({"name": "pipeline_cache freshness", "status": "FAIL",
                             "detail": "Table empty — FUB pipeline sync has never run"})
     except Exception as e:
         checks.append({"name": "pipeline_cache freshness", "status": "FAIL", "detail": str(e)})
-
-    # -----------------------------------------------------------------------
     # 4. pipeline_cache — buyer deal count
-    # -----------------------------------------------------------------------
     try:
         r = supabase.table("pipeline_cache").select("id", count="exact").eq("type", "buyer").execute()
         count = r.count if r.count is not None else len(r.data)
@@ -2776,10 +2766,7 @@ async def _run_os_audit() -> dict:
                         "detail": f"{count} active buyer deal(s) cached"})
     except Exception as e:
         checks.append({"name": "pipeline_cache buyers", "status": "FAIL", "detail": str(e)})
-
-    # -----------------------------------------------------------------------
     # 5. pipeline_cache — seller deal count
-    # -----------------------------------------------------------------------
     try:
         r = supabase.table("pipeline_cache").select("id", count="exact").eq("type", "seller").execute()
         count = r.count if r.count is not None else len(r.data)
@@ -2787,10 +2774,7 @@ async def _run_os_audit() -> dict:
                         "detail": f"{count} active seller deal(s) cached"})
     except Exception as e:
         checks.append({"name": "pipeline_cache sellers", "status": "FAIL", "detail": str(e)})
-
-    # -----------------------------------------------------------------------
     # 6. agent_task_cache — freshness (did the 6:02am task sync run?)
-    # -----------------------------------------------------------------------
     try:
         r = supabase.table("agent_task_cache").select("synced_at").order("synced_at", desc=True).limit(1).execute()
         if r.data:
@@ -2803,16 +2787,13 @@ async def _run_os_audit() -> dict:
                                 "detail": f"Last sync {ts.strftime('%Y-%m-%d %H:%M UTC')} ({age_h:.1f}h ago)"})
             else:
                 checks.append({"name": "agent_task_cache freshness", "status": "FAIL",
-                                "detail": f"Stale! Last sync {ts.strftime('%Y-%m-%d %H:%M UTC')} ({age_h:.1f}h ago)"})
+                                "detail": f"Stale — last sync {ts.strftime('%Y-%m-%d %H:%M UTC')} ({age_h:.1f}h ago)"})
         else:
             checks.append({"name": "agent_task_cache freshness", "status": "FAIL",
                             "detail": "Table empty — agent task sync has never run"})
     except Exception as e:
         checks.append({"name": "agent_task_cache freshness", "status": "FAIL", "detail": str(e)})
-
-    # -----------------------------------------------------------------------
     # 7. agent_task_cache — row count
-    # -----------------------------------------------------------------------
     try:
         r = supabase.table("agent_task_cache").select("id", count="exact").execute()
         count = r.count if r.count is not None else len(r.data)
@@ -2820,10 +2801,7 @@ async def _run_os_audit() -> dict:
                         "detail": f"{count} agent task row(s) cached"})
     except Exception as e:
         checks.append({"name": "agent_task_cache rows", "status": "FAIL", "detail": str(e)})
-
-    # -----------------------------------------------------------------------
-    # 8. buyers table — accessible + total count
-    # -----------------------------------------------------------------------
+    # 8. buyers table — accessible + count
     try:
         r = supabase.table("buyers").select("id", count="exact").execute()
         total = r.count if r.count is not None else len(r.data)
@@ -2831,10 +2809,7 @@ async def _run_os_audit() -> dict:
                         "detail": f"Accessible — {total} total buyer record(s)"})
     except Exception as e:
         checks.append({"name": "buyers table", "status": "FAIL", "detail": str(e)})
-
-    # -----------------------------------------------------------------------
-    # 9. properties table — accessible + total count
-    # -----------------------------------------------------------------------
+    # 9. properties table — accessible + count
     try:
         r = supabase.table("properties").select("id", count="exact").execute()
         total = r.count if r.count is not None else len(r.data)
@@ -2842,17 +2817,14 @@ async def _run_os_audit() -> dict:
                         "detail": f"Accessible — {total} total property record(s)"})
     except Exception as e:
         checks.append({"name": "properties table", "status": "FAIL", "detail": str(e)})
-
-    # -----------------------------------------------------------------------
-    # 10. webhook_errors — pending count (unresolved FUB events)
-    # -----------------------------------------------------------------------
+    # 10. webhook_errors — pending unresolved FUB events (with agent breakdown)
     try:
         r = supabase.table("webhook_errors").select("id,fub_agent", count="exact").eq("status", "pending").execute()
         count = r.count if r.count is not None else len(r.data)
         if count == 0:
-            checks.append({"name": "webhook_errors pending", "status": "PASS", "detail": "No pending unmatched webhook events"})
+            checks.append({"name": "webhook_errors pending", "status": "PASS",
+                            "detail": "No pending unmatched webhook events"})
         else:
-            # Summarise by FUB agent
             from collections import Counter
             agent_counts = Counter(row.get("fub_agent", "unknown") for row in (r.data or []))
             breakdown = ", ".join(f"{v} for {k}" for k, v in agent_counts.most_common())
@@ -2860,34 +2832,25 @@ async def _run_os_audit() -> dict:
                             "detail": f"{count} pending unmatched event(s): {breakdown}"})
     except Exception as e:
         checks.append({"name": "webhook_errors pending", "status": "FAIL", "detail": str(e)})
-
-    # -----------------------------------------------------------------------
-    # 11. audit_log table — schema accessible
-    # -----------------------------------------------------------------------
+    # 11. audit_log — schema accessible
     try:
         supabase.table("audit_log").select("id").limit(1).execute()
         checks.append({"name": "audit_log table", "status": "PASS", "detail": "Accessible"})
     except Exception as e:
         checks.append({"name": "audit_log table", "status": "FAIL", "detail": str(e)})
-
-    # -----------------------------------------------------------------------
-    # 12. knowledge_docs (Forward Voice) — accessible + row count
-    # -----------------------------------------------------------------------
+    # 12. knowledge_docs — Forward Voice training content
     try:
         r = supabase.table("knowledge_docs").select("id", count="exact").execute()
         count = r.count if r.count is not None else len(r.data)
         if count > 0:
-            checks.append({"name": "knowledge_docs (Voice training)", "status": "PASS",
+            checks.append({"name": "knowledge_docs (Voice)", "status": "PASS",
                             "detail": f"{count} training doc(s) loaded"})
         else:
-            checks.append({"name": "knowledge_docs (Voice training)", "status": "WARN",
-                            "detail": "Table is empty — Voice Q&A will return no training context"})
+            checks.append({"name": "knowledge_docs (Voice)", "status": "WARN",
+                            "detail": "Table empty — Voice Q&A will return no training context"})
     except Exception as e:
-        checks.append({"name": "knowledge_docs (Voice training)", "status": "FAIL", "detail": str(e)})
-
-    # -----------------------------------------------------------------------
-    # 13. Anthropic API — key valid (powers BMR, offer analysis, meeting prep, Voice Q&A)
-    # -----------------------------------------------------------------------
+        checks.append({"name": "knowledge_docs (Voice)", "status": "FAIL", "detail": str(e)})
+    # 13. Anthropic API — powers BMR, offer analysis, meeting prep, Voice Q&A
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
@@ -2895,78 +2858,74 @@ async def _run_os_audit() -> dict:
                 headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"},
             )
         if resp.status_code == 200:
-            checks.append({"name": "Anthropic API", "status": "PASS", "detail": "Key valid and reachable"})
+            checks.append({"name": "Anthropic API", "status": "PASS",
+                            "detail": "Key valid and reachable"})
         elif resp.status_code == 401:
-            checks.append({"name": "Anthropic API", "status": "FAIL", "detail": "401 Unauthorized — ANTHROPIC_API_KEY is invalid or expired"})
+            checks.append({"name": "Anthropic API", "status": "FAIL",
+                            "detail": "401 Unauthorized — ANTHROPIC_API_KEY invalid or expired"})
         else:
-            checks.append({"name": "Anthropic API", "status": "FAIL", "detail": f"HTTP {resp.status_code}"})
+            checks.append({"name": "Anthropic API", "status": "FAIL",
+                            "detail": f"Unexpected HTTP {resp.status_code}"})
     except Exception as e:
         checks.append({"name": "Anthropic API", "status": "FAIL", "detail": str(e)})
-
-    # -----------------------------------------------------------------------
-    # 14. Netlify API — key valid (powers Buyer Report deploys)
-    # -----------------------------------------------------------------------
-    netlify_token = NETLIFY_ACCESS_TOKEN
-    if not netlify_token:
-        checks.append({"name": "Netlify API", "status": "WARN", "detail": "NETLIFY_ACCESS_TOKEN not set — Buyer Report deploys will fail"})
+    # 14. Netlify API — powers Buyer Report deploys
+    if not NETLIFY_ACCESS_TOKEN:
+        checks.append({"name": "Netlify API", "status": "WARN",
+                        "detail": "NETLIFY_ACCESS_TOKEN not set — Buyer Report deploys will fail"})
     else:
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(
                     "https://api.netlify.com/api/v1/sites",
-                    headers={"Authorization": f"Bearer {netlify_token}"},
+                    headers={"Authorization": f"Bearer {NETLIFY_ACCESS_TOKEN}"},
                     params={"per_page": 1},
                 )
             if resp.status_code == 200:
-                checks.append({"name": "Netlify API", "status": "PASS", "detail": "Key valid and reachable"})
+                checks.append({"name": "Netlify API", "status": "PASS",
+                                "detail": "Key valid and reachable"})
             elif resp.status_code == 401:
-                checks.append({"name": "Netlify API", "status": "FAIL", "detail": "401 Unauthorized — NETLIFY_ACCESS_TOKEN invalid or expired"})
+                checks.append({"name": "Netlify API", "status": "FAIL",
+                                "detail": "401 Unauthorized — NETLIFY_ACCESS_TOKEN invalid or expired"})
             else:
-                checks.append({"name": "Netlify API", "status": "FAIL", "detail": f"HTTP {resp.status_code}"})
+                checks.append({"name": "Netlify API", "status": "FAIL",
+                                "detail": f"Unexpected HTTP {resp.status_code}"})
         except Exception as e:
             checks.append({"name": "Netlify API", "status": "FAIL", "detail": str(e)})
-
-    # -----------------------------------------------------------------------
-    # 15. Google Drive service account — can we initialize the client?
-    # -----------------------------------------------------------------------
+    # 15. Google Drive service account
     if not GOOGLE_SA_JSON:
         checks.append({"name": "Google Drive SA", "status": "WARN",
                         "detail": "GOOGLE_SERVICE_ACCOUNT_JSON not set — Drive automation checks disabled"})
     else:
         try:
-            get_drive_service()  # raises if SA JSON is malformed or creds invalid
-            checks.append({"name": "Google Drive SA", "status": "PASS", "detail": "Service account credentials valid"})
+            get_drive_service()
+            checks.append({"name": "Google Drive SA", "status": "PASS",
+                            "detail": "Service account credentials valid"})
         except Exception as e:
-            checks.append({"name": "Google Drive SA", "status": "FAIL", "detail": f"Drive SA init failed: {str(e)[:150]}"})
-
-    # -----------------------------------------------------------------------
+            checks.append({"name": "Google Drive SA", "status": "FAIL",
+                            "detail": f"Drive SA init failed: {str(e)[:150]}"})
     # 16. automation_health — freshness (did the 6:05am Drive check run?)
-    # -----------------------------------------------------------------------
     try:
         r = supabase.table("automation_health").select("automation_name,status,last_run").order("last_run", desc=True).execute()
-        last_run_str = (r.data or [{}])[0].get("last_run") if r.data else None
+        last_run_str = (r.data[0].get("last_run") if r.data else None)
         if last_run_str:
-            most_recent_ts = datetime.fromisoformat(last_run_str.replace("Z", "+00:00"))
-            if most_recent_ts.tzinfo is None:
-                most_recent_ts = most_recent_ts.replace(tzinfo=timezone.utc)
-            age_h = (now_utc - most_recent_ts).total_seconds() / 3600
+            ts = datetime.fromisoformat(last_run_str.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age_h = (now_utc - ts).total_seconds() / 3600
             if age_h < 25:
                 checks.append({"name": "automation_health freshness", "status": "PASS",
-                                "detail": f"Last Drive check {most_recent_ts.strftime('%Y-%m-%d %H:%M UTC')} ({age_h:.1f}h ago)"})
+                                "detail": f"Last Drive check {ts.strftime('%Y-%m-%d %H:%M UTC')} ({age_h:.1f}h ago)"})
             else:
                 checks.append({"name": "automation_health freshness", "status": "WARN",
-                                "detail": f"Stale — last Drive check {most_recent_ts.strftime('%Y-%m-%d %H:%M UTC')} ({age_h:.1f}h ago)"})
+                                "detail": f"Stale — last Drive check {ts.strftime('%Y-%m-%d %H:%M UTC')} ({age_h:.1f}h ago)"})
         else:
             checks.append({"name": "automation_health freshness", "status": "WARN",
-                            "detail": "No Drive automation runs recorded yet (GOOGLE_SERVICE_ACCOUNT_JSON not set or never triggered)"})
+                            "detail": "No Drive automation runs recorded yet"})
     except Exception as e:
         checks.append({"name": "automation_health freshness", "status": "FAIL", "detail": str(e)})
-
-    # -----------------------------------------------------------------------
     # 17. automation_health — any automations in error state?
-    # -----------------------------------------------------------------------
     try:
-        r = supabase.table("automation_health").select("automation_name,status,last_run").execute()
+        r = supabase.table("automation_health").select("automation_name,status").execute()
         errored = [row for row in (r.data or []) if row.get("status") == "error"]
         if not errored:
             checks.append({"name": "automation_health errors", "status": "PASS",
@@ -2977,11 +2936,9 @@ async def _run_os_audit() -> dict:
                             "detail": f"{len(errored)} automation(s) in error state: {names}"})
     except Exception as e:
         checks.append({"name": "automation_health errors", "status": "FAIL", "detail": str(e)})
-
     fails  = [c for c in checks if c["status"] == "FAIL"]
     warns  = [c for c in checks if c["status"] == "WARN"]
     passes = [c for c in checks if c["status"] == "PASS"]
-
     return {
         "checks": checks,
         "fails":  fails,
@@ -2989,185 +2946,17 @@ async def _run_os_audit() -> dict:
         "passes": passes,
         "ran_at": now_utc.isoformat(),
     }
-
-async def _run_cc_audit() -> dict:
-    """
-    Run all Forward CC health checks.
-    Each check: {"name": str, "status": "PASS"|"FAIL"|"WARN", "detail": str}
-    """
-    checks = []
-    now_utc = datetime.now(timezone.utc)
-    cutoff_24h = (now_utc - timedelta(hours=24)).isoformat()
-
-    # -----------------------------------------------------------------------
-    # 1. Netlify site — CC frontend must be live
-    # -----------------------------------------------------------------------
-    try:
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-            resp = await client.get("https://forward-command-center.netlify.app")
-        if resp.status_code == 200:
-            checks.append({"name": "Netlify site", "status": "PASS",
-                            "detail": f"HTTP {resp.status_code} — site is up"})
-        else:
-            checks.append({"name": "Netlify site", "status": "FAIL",
-                            "detail": f"HTTP {resp.status_code} — site may be down"})
-    except Exception as e:
-        checks.append({"name": "Netlify site", "status": "FAIL", "detail": str(e)})
-
-    # -----------------------------------------------------------------------
-    # 2–11. CC Supabase tables — accessibility + row count
-    # -----------------------------------------------------------------------
-    cc_tables = [
-        "listings",
-        "listing_checklist_items",
-        "deal_tasks",
-        "seller_post_closing_items",
-        "inventory_items",
-        "agreement_buyers",
-        "agreement_sellers",
-        "agreement_rentals",
-        "virtual_staging_jobs",
-        "audit_log",
-    ]
-    for table in cc_tables:
-        try:
-            r = supabase.table(table).select("id", count="exact").limit(1).execute()
-            total = r.count if r.count is not None else len(r.data)
-            checks.append({"name": f"{table} table", "status": "PASS",
-                            "detail": f"Accessible ({total} rows)"})
-        except Exception as e:
-            checks.append({"name": f"{table} table", "status": "FAIL", "detail": str(e)})
-
-    # -----------------------------------------------------------------------
-    # 12. FUB API — reachable and authenticated
-    # -----------------------------------------------------------------------
-    try:
-        result = await fub_get("/users", {"limit": 1})
-        if result and not result.get("error"):
-            checks.append({"name": "FUB API", "status": "PASS",
-                            "detail": "Reachable and authenticated"})
-        else:
-            checks.append({"name": "FUB API", "status": "FAIL",
-                            "detail": f"Unexpected response: {str(result)[:100]}"})
-    except Exception as e:
-        checks.append({"name": "FUB API", "status": "FAIL", "detail": str(e)})
-
-    # -----------------------------------------------------------------------
-    # 13. Anthropic API key — required for Agent Intel (claude-sonnet)
-    # -----------------------------------------------------------------------
-    if not ANTHROPIC_API_KEY:
-        checks.append({"name": "Anthropic API", "status": "FAIL",
-                        "detail": "ANTHROPIC_API_KEY not set — Agent Intel will fail"})
-    else:
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(
-                    "https://api.anthropic.com/v1/models",
-                    headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"},
-                )
-            if resp.status_code == 200:
-                checks.append({"name": "Anthropic API", "status": "PASS",
-                                "detail": "Key valid and reachable"})
-            elif resp.status_code == 401:
-                checks.append({"name": "Anthropic API", "status": "FAIL",
-                                "detail": "401 Unauthorized — ANTHROPIC_API_KEY is invalid or expired"})
-            else:
-                checks.append({"name": "Anthropic API", "status": "FAIL",
-                                "detail": f"HTTP {resp.status_code}"})
-        except Exception as e:
-            checks.append({"name": "Anthropic API", "status": "FAIL", "detail": str(e)})
-
-    # -----------------------------------------------------------------------
-    # 14. InfiniteCreator API — WARN only (known account access issue)
-    # -----------------------------------------------------------------------
-    ic_key = os.environ.get("INFINITE_CREATOR_API_KEY", "") or os.environ.get("IC_API_KEY", "")
-    if not ic_key:
-        checks.append({"name": "InfiniteCreator API", "status": "WARN",
-                        "detail": "API key not found in env — known account issue, monitor manually"})
-    else:
-        checks.append({"name": "InfiniteCreator API", "status": "WARN",
-                        "detail": "Key set but live validation skipped — known account access issue"})
-
-    # -----------------------------------------------------------------------
-    # 15. Resend API key — required for CC audit email alerts
-    # -----------------------------------------------------------------------
-    resend_key = os.environ.get("RESEND_API_KEY", "")
-    if resend_key:
-        checks.append({"name": "Resend API key", "status": "PASS",
-                        "detail": "RESEND_API_KEY is set"})
-    else:
-        checks.append({"name": "Resend API key", "status": "FAIL",
-                        "detail": "RESEND_API_KEY not set — audit email alerts will not fire"})
-
-    # -----------------------------------------------------------------------
-    # 16. audit_log unresolved errors — last 24h
-    # -----------------------------------------------------------------------
-    try:
-        r = (supabase.table("audit_log")
-             .select("id", count="exact")
-             .gte("created_at", cutoff_24h)
-             .is_("resolved_at", "null")
-             .execute())
-        count = r.count if r.count is not None else len(r.data)
-        status = "WARN" if count > 0 else "PASS"
-        checks.append({"name": "audit_log unresolved errors", "status": status,
-                        "detail": f"{count} unresolved error(s) logged in last 24h"})
-    except Exception:
-        # resolved_at column may not exist — fall back to simple row count
-        try:
-            r = (supabase.table("audit_log")
-                 .select("id", count="exact")
-                 .gte("created_at", cutoff_24h)
-                 .execute())
-            count = r.count if r.count is not None else len(r.data)
-            checks.append({"name": "audit_log unresolved errors", "status": "PASS",
-                            "detail": f"audit_log accessible; {count} row(s) in last 24h"})
-        except Exception as e2:
-            checks.append({"name": "audit_log unresolved errors", "status": "FAIL",
-                            "detail": str(e2)})
-
-    # -----------------------------------------------------------------------
-    # 17. FUB webhook failures in audit_log — last 24h
-    # -----------------------------------------------------------------------
-    try:
-        r = (supabase.table("audit_log")
-             .select("id", count="exact")
-             .gte("created_at", cutoff_24h)
-             .eq("action", "fub.sync.failed")
-             .execute())
-        count = r.count if r.count is not None else len(r.data)
-        status = "WARN" if count > 0 else "PASS"
-        checks.append({"name": "FUB webhook failures", "status": status,
-                        "detail": f"{count} fub.sync.failed event(s) in last 24h"})
-    except Exception as e:
-        checks.append({"name": "FUB webhook failures", "status": "WARN",
-                        "detail": f"Could not query audit_log for webhook failures: {str(e)[:80]}"})
-
-    fails  = [c for c in checks if c["status"] == "FAIL"]
-    warns  = [c for c in checks if c["status"] == "WARN"]
-    passes = [c for c in checks if c["status"] == "PASS"]
-
-    return {
-        "checks": checks,
-        "fails":  fails,
-        "warns":  warns,
-        "passes": passes,
-        "ran_at": now_utc.isoformat(),
-    }
-
-
 
 
 def _build_os_audit_email_html(audit: dict) -> str:
-    """Build HTML email body for the Forward OS nightly audit report."""
     ran_at = audit["ran_at"]
     checks = audit["checks"]
     fails  = audit["fails"]
     warns  = audit["warns"]
-
     overall = "✅ ALL SYSTEMS GO" if not fails else f"🚨 {len(fails)} FAILURE(S) DETECTED"
     color   = "#16a34a" if not fails else "#dc2626"
-
+    pass_count = len(audit["passes"])
+    total      = len(checks)
     rows_html = ""
     for c in checks:
         icon = {"PASS": "✅", "FAIL": "❌", "WARN": "⚠️"}.get(c["status"], "?")
@@ -3179,7 +2968,6 @@ def _build_os_audit_email_html(audit: dict) -> str:
             f'<td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;color:#374151">{c["detail"]}</td>'
             f'</tr>'
         )
-
     fix_prompts_html = ""
     if fails:
         fix_prompts_html = '<h2 style="color:#dc2626;margin-top:32px">Claude Fix Prompts</h2>'
@@ -3193,7 +2981,6 @@ def _build_os_audit_email_html(audit: dict) -> str:
                 f'white-space:pre-wrap;word-break:break-word;margin-top:8px;font-size:13px">{prompt}</pre>'
                 f'</div>'
             )
-
     warn_html = ""
     if warns:
         warn_html = '<h2 style="color:#d97706;margin-top:32px">Warnings</h2>'
@@ -3203,21 +2990,15 @@ def _build_os_audit_email_html(audit: dict) -> str:
                 f'padding:12px;margin-bottom:12px">'
                 f'<strong>⚠️ {w["name"]}</strong>: {w["detail"]}</div>'
             )
-
-    pass_count = len(audit["passes"])
-    total      = len(checks)
-
     return f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>OS Nightly Audit</title></head>
 <body style="font-family:system-ui,sans-serif;max-width:720px;margin:0 auto;padding:24px;color:#111">
   <h1 style="color:{color};margin-bottom:4px">Forward OS — Nightly Audit</h1>
   <p style="color:#6b7280;margin-top:0">{ran_at}</p>
-
   <div style="background:{color};color:#fff;padding:16px 20px;border-radius:8px;font-size:18px;font-weight:bold;margin-bottom:24px">
     {overall} &nbsp;·&nbsp; {pass_count}/{total} checks passed
   </div>
-
   <table style="width:100%;border-collapse:collapse;font-size:14px">
     <thead>
       <tr style="background:#f3f4f6">
@@ -3228,12 +3009,10 @@ def _build_os_audit_email_html(audit: dict) -> str:
     </thead>
     <tbody>{rows_html}</tbody>
   </table>
-
   {fix_prompts_html}
   {warn_html}
-
   <p style="color:#9ca3af;font-size:12px;margin-top:32px">
-    Sent by Forward OS nightly audit job · Railway APScheduler · 11:01 PM ET daily<br>
+    Forward OS nightly audit · Railway APScheduler · 11:01 PM ET daily<br>
     Manual trigger: POST /audit/run?system=os
   </p>
 </body>
@@ -3241,22 +3020,20 @@ def _build_os_audit_email_html(audit: dict) -> str:
 
 
 def _get_os_fix_prompt(check_name: str, detail: str) -> str:
-    """Return a Claude-ready fix prompt for a failed Forward OS health check."""
     prompts = {
         "Railway backend": (
             f"The Forward OS Railway backend failed its self-check. Detail: {detail}\n\n"
             "Check Railway dashboard for the forward-os-backend service. Review deployment logs."
         ),
         "FUB API": (
-            f"The Forward OS nightly audit cannot reach the Follow Up Boss API. Detail: {detail}\n\n"
+            f"The Forward OS audit cannot reach Follow Up Boss. Detail: {detail}\n\n"
             "1. Verify FUB_API_KEY is set in Railway env vars for forward-os-backend.\n"
             "2. Check the key is active: app.followupboss.com → Admin → API.\n"
-            "3. Test: curl -u \'<FUB_API_KEY>:\' https://api.followupboss.com/v1/users?limit=1"
+            "3. Test: curl -u '<FUB_API_KEY>:' https://api.followupboss.com/v1/users?limit=1"
         ),
         "pipeline_cache freshness": (
-            f"The Forward OS nightly audit detected a stale pipeline_cache. Detail: {detail}\n\n"
-            "The FUB pipeline sync job (job_sync_fub_pipeline) runs at 6:00am ET via APScheduler "
-            "in marccashin/forward-os-backend main.py.\n"
+            f"Forward OS pipeline_cache is stale. Detail: {detail}\n\n"
+            "job_sync_fub_pipeline runs at 6:00am ET via APScheduler in main.py.\n"
             "1. Check Railway logs for forward-os-backend around 6am ET today.\n"
             "2. Manually trigger: POST /pipeline/sync (requires auth token).\n"
             "3. If errored, diagnose _sync_fub_pipeline() in main.py and submit a PR."
@@ -3264,282 +3041,108 @@ def _get_os_fix_prompt(check_name: str, detail: str) -> str:
         "pipeline_cache buyers": (
             f"Forward OS pipeline_cache has no buyer rows. Detail: {detail}\n\n"
             "Check BUYER_STAGES in main.py matches current FUB pipeline stage names.\n"
-            "Trigger manual sync: POST /pipeline/sync. Verify FUB /v1/deals returns buyer deals."
+            "Trigger manual sync: POST /pipeline/sync."
         ),
         "pipeline_cache sellers": (
             f"Forward OS pipeline_cache has no seller rows. Detail: {detail}\n\n"
             "Check SELLER_STAGES in main.py matches current FUB pipeline stage names.\n"
-            "Trigger manual sync: POST /pipeline/sync. Verify FUB /v1/deals returns seller deals."
+            "Trigger manual sync: POST /pipeline/sync."
         ),
         "agent_task_cache freshness": (
-            f"The Forward OS agent_task_cache is stale. Detail: {detail}\n\n"
-            "The task sync job (job_sync_agent_task_cache) runs at 6:02am ET.\n"
+            f"Forward OS agent_task_cache is stale. Detail: {detail}\n\n"
+            "job_sync_agent_task_cache runs at 6:02am ET.\n"
             "1. Check Railway logs around 6:02am ET today.\n"
             "2. Manually trigger: POST /sync-agent-tasks.\n"
             "3. If errored, diagnose _sync_agent_task_cache() in main.py."
         ),
         "agent_task_cache rows": (
             f"Forward OS agent_task_cache is empty. Detail: {detail}\n\n"
-            "This means agents have no next tasks in the dashboard. Manually trigger: POST /sync-agent-tasks "
-            "and check the FUB /v1/tasks response for active deal tasks."
+            "Agents have no next tasks in the dashboard.\n"
+            "Manually trigger: POST /sync-agent-tasks and verify FUB has active deal tasks."
         ),
         "buyers table": (
-            f"The Forward OS buyers Supabase table is inaccessible. Detail: {detail}\n\n"
-            "Check Supabase RLS policies on the buyers table. Verify SUPABASE_SERVICE_ROLE_KEY "
-            "is correctly set in Railway env vars. Confirm the table exists in Supabase."
+            f"Forward OS buyers Supabase table is inaccessible. Detail: {detail}\n\n"
+            "Check RLS policies on the buyers table. Verify SUPABASE_SERVICE_ROLE_KEY\n"
+            "is correctly set in Railway env vars."
         ),
         "properties table": (
-            f"The Forward OS properties Supabase table is inaccessible. Detail: {detail}\n\n"
-            "Check Supabase RLS on properties. Verify SUPABASE_SERVICE_ROLE_KEY is valid. "
-            "Confirm the table exists in Supabase."
+            f"Forward OS properties Supabase table is inaccessible. Detail: {detail}\n\n"
+            "Check RLS on properties. Verify SUPABASE_SERVICE_ROLE_KEY is valid."
         ),
         "webhook_errors pending": (
             f"Forward OS has pending unmatched FUB webhook events. Detail: {detail}\n\n"
-            "Go to the OS admin dashboard → Training Admin → \'Unmatched Webhook Events\'.\n"
-            "For each row, select the correct agent and click \'Create Record\'.\n"
+            "Go to OS admin dashboard → Training Admin → 'Unmatched Webhook Events'.\n"
+            "For each row, select the correct agent and click 'Create Record'.\n"
             "If the agent is new, add their alias to AGENT_NAME_MAP in main.py and submit a PR."
         ),
         "audit_log table": (
-            f"The Forward OS audit_log Supabase table is inaccessible. Detail: {detail}\n\n"
-            "The table may have been dropped. Re-create it using the SQL from Chat 44:\n"
-            "CREATE TABLE audit_log (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), "
-            "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), agent_name TEXT, action TEXT NOT NULL, "
-            "entity_type TEXT, entity_id TEXT, entity_name TEXT, detail JSONB NOT NULL DEFAULT \'{}\', "
-            "source TEXT NOT NULL DEFAULT \'backend\');\n"
-            "Then: ALTER TABLE audit_log ENABLE ROW LEVEL SECURITY;"
+            f"Forward OS audit_log table is inaccessible. Detail: {detail}\n\n"
+            "The table may have been dropped. Re-create it:\n"
+            "CREATE TABLE audit_log (\n"
+            "  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),\n"
+            "  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),\n"
+            "  agent_name TEXT, action TEXT NOT NULL,\n"
+            "  entity_type TEXT, entity_id TEXT, entity_name TEXT,\n"
+            "  detail JSONB NOT NULL DEFAULT '{}',\n"
+            "  source TEXT NOT NULL DEFAULT 'backend'\n"
+            ");\n"
+            "ALTER TABLE audit_log ENABLE ROW LEVEL SECURITY;"
         ),
-        "knowledge_docs (Voice training)": (
-            f"The Forward OS knowledge_docs table is empty. Detail: {detail}\n\n"
-            "Voice Q&A training modal will return no context. Re-sync the training library:\n"
-            "Go to the Training Admin view → Training Library → \'Sync to Knowledge Base\'."
+        "knowledge_docs (Voice)": (
+            f"Forward OS knowledge_docs table is empty. Detail: {detail}\n\n"
+            "Voice Q&A will return no training context.\n"
+            "Go to Training Admin → Training Library → 'Sync to Knowledge Base'."
         ),
         "Anthropic API": (
-            f"The Forward OS Anthropic API key is invalid or unreachable. Detail: {detail}\n\n"
-            "This breaks: Buyer Report analysis, offer parsing, offer analysis, meeting prep research, "
-            "and Voice Q&A streaming.\n"
-            "1. Check ANTHROPIC_API_KEY in Railway env vars for forward-os-backend.\n"
+            f"Forward OS Anthropic API key is invalid or unreachable. Detail: {detail}\n\n"
+            "This breaks: Buyer Report analysis, offer parsing, offer analysis,\n"
+            "meeting prep research, and Voice Q&A streaming.\n"
+            "1. Check ANTHROPIC_API_KEY in Railway env vars.\n"
             "2. Verify the key is active at console.anthropic.com → API Keys.\n"
             "3. Replace the key in Railway and redeploy."
         ),
         "Netlify API": (
-            f"The Forward OS Netlify API key is invalid or unreachable. Detail: {detail}\n\n"
-            "This breaks Buyer Report deployments — agents cannot generate shareable report links.\n"
+            f"Forward OS Netlify API key is invalid. Detail: {detail}\n\n"
+            "Buyer Report deployments will fail — agents cannot generate shareable report links.\n"
             "1. Check NETLIFY_ACCESS_TOKEN in Railway env vars.\n"
-            "2. Verify the token at app.netlify.com → User Settings → Applications → Personal access tokens.\n"
+            "2. Verify at app.netlify.com → User Settings → Personal access tokens.\n"
             "3. Regenerate if expired and update Railway env var."
         ),
         "Google Drive SA": (
-            f"The Google Drive service account cannot be initialized. Detail: {detail}\n\n"
-            "This breaks Drive automation health checks and any Drive-based folder monitoring.\n"
-            "1. Check GOOGLE_SERVICE_ACCOUNT_JSON in Railway env vars — ensure it\'s valid JSON.\n"
-            "2. Verify the service account is still active in Google Cloud Console.\n"
+            f"Google Drive service account cannot be initialized. Detail: {detail}\n\n"
+            "Drive automation health checks are disabled.\n"
+            "1. Check GOOGLE_SERVICE_ACCOUNT_JSON in Railway env vars.\n"
+            "2. Verify the service account is active in Google Cloud Console.\n"
             "3. Ensure the SA has been shared on the relevant Drive folders."
         ),
         "automation_health freshness": (
-            f"The Forward OS automation_health table is stale. Detail: {detail}\n\n"
-            "The Drive automation check job (job_check_drive_automations) runs at 6:05am ET.\n"
+            f"Forward OS automation_health table is stale. Detail: {detail}\n\n"
+            "job_check_drive_automations runs at 6:05am ET.\n"
             "1. Check Railway logs around 6:05am ET today.\n"
-            "2. Verify the Google Drive service account is still valid.\n"
+            "2. Verify Google Drive SA credentials are valid.\n"
             "3. If errored, diagnose _check_drive_automations() in main.py."
         ),
         "automation_health errors": (
             f"One or more Drive automations are in error state. Detail: {detail}\n\n"
-            "Check the automation_health table in Supabase for rows with status=\'error\'.\n"
-            "Each row has a \'name\' field identifying which automation failed.\n"
-            "Investigate the corresponding Drive folder or Zapier automation named in the error."
+            "Check the automation_health table in Supabase for rows with status='error'.\n"
+            "Investigate the named automation in Drive or Zapier."
         ),
     }
     return prompts.get(
         check_name,
-        f"Forward OS nightly audit failed check \'{check_name}\'. Detail: {detail}\n\n"
-        "Please review marccashin/forward-os-backend main.py and Railway logs."
+        f"Forward OS audit failed check '{check_name}'. Detail: {detail}\n\n"
+        "Review marccashin/forward-os-backend main.py and Railway logs."
     )
-
-def _build_audit_email_html(audit: dict) -> str:
-    """Build HTML email body for the Forward CC nightly audit report."""
-    ran_at = audit["ran_at"]
-    checks = audit["checks"]
-    fails  = audit["fails"]
-    warns  = audit["warns"]
-
-    pass_count = len(audit["passes"])
-    total      = len(checks)
-    overall = "✅ ALL SYSTEMS GO" if not fails else f"🚨 {len(fails)} FAILURE(S) DETECTED"
-    color   = "#16a34a" if not fails else "#dc2626"
-
-    rows_html = ""
-    for c in checks:
-        icon  = {"PASS": "✅", "FAIL": "❌", "WARN": "⚠️"}.get(c["status"], "?")
-        bg    = {"PASS": "#f0fdf4", "FAIL": "#fef2f2", "WARN": "#fffbeb"}.get(c["status"], "#fff")
-        rows_html += (
-            f'<tr style="background:{bg}">' +
-            f'<td style="padding:8px 12px;border-bottom:1px solid #e5e7eb">{icon} {c["name"]}</td>' +
-            f'<td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;font-weight:600">{c["status"]}</td>' +
-            f'<td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;color:#374151">{c["detail"]}</td>' +
-            '</tr>'
-        )
-
-    fix_prompts_html = ""
-    if fails:
-        fix_prompts_html = '<h2 style="color:#dc2626;margin-top:32px">Claude Fix Prompts</h2>'
-        for c in fails:
-            prompt = _get_fix_prompt(c["name"], c["detail"])
-            fix_prompts_html += (
-                f'<div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;' +
-                f'padding:16px;margin-bottom:16px">' +
-                f'<strong style="color:#dc2626">❌ {c["name"]}</strong><br>' +
-                f'<pre style="background:#fff;border:1px solid #e5e7eb;padding:12px;border-radius:4px;' +
-                f'white-space:pre-wrap;word-break:break-word;margin-top:8px;font-size:13px">{prompt}</pre>' +
-                '</div>'
-            )
-
-    warn_html = ""
-    if warns:
-        warn_html = '<h2 style="color:#d97706;margin-top:32px">Warnings</h2>'
-        for w in warns:
-            warn_html += (
-                f'<div style="background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;' +
-                f'padding:12px;margin-bottom:12px">' +
-                f'<strong>⚠️ {w["name"]}</strong>: {w["detail"]}</div>'
-            )
-
-    return f"""<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>CC Nightly Audit</title></head>
-<body style="font-family:system-ui,sans-serif;max-width:720px;margin:0 auto;padding:24px;color:#111">
-  <h1 style="color:{color};margin-bottom:4px">Forward CC — Nightly Audit</h1>
-  <p style="color:#6b7280;margin-top:0">{ran_at}</p>
-
-  <div style="background:{color};color:#fff;padding:16px 20px;border-radius:8px;font-size:18px;font-weight:bold;margin-bottom:24px">
-    {overall} &nbsp;·&nbsp; {pass_count}/{total} checks passed
-  </div>
-
-  <table style="width:100%;border-collapse:collapse;font-size:14px">
-    <thead>
-      <tr style="background:#f3f4f6">
-        <th style="padding:8px 12px;text-align:left">Check</th>
-        <th style="padding:8px 12px;text-align:left">Status</th>
-        <th style="padding:8px 12px;text-align:left">Detail</th>
-      </tr>
-    </thead>
-    <tbody>{rows_html}</tbody>
-  </table>
-
-  {fix_prompts_html}
-  {warn_html}
-
-  <p style="color:#9ca3af;font-size:12px;margin-top:32px">
-    Sent by Forward CC nightly audit job · Railway APScheduler · 11:00 PM ET daily<br>
-    Manual trigger: POST /audit/run?system=cc
-  </p>
-</body>
-</html>"""
-
-
-def _get_fix_prompt(check_name: str, detail: str) -> str:
-    """Return a Claude-ready fix prompt for a failed Forward CC health check."""
-    prompts = {
-        "Netlify site": (
-            f"The Forward CC Netlify site is down. Detail: {detail}\n\n"
-            "1. Check Netlify dashboard at app.netlify.com → forward-command-center.\n"
-            "2. Look for a failed deploy in the Deploys tab.\n"
-            "3. Trigger a manual redeploy or roll back to the last successful deploy.\n"
-            "4. Check the build logs for the error. Repo: marccashin/forward-command-center (staging → main)."
-        ),
-        "listings table": (
-            f"The CC listings Supabase table is inaccessible. Detail: {detail}\n\n"
-            "Check Supabase RLS on the listings table. Verify SUPABASE_SERVICE_ROLE_KEY "
-            "is correctly set in Railway env vars for forward-os-backend."
-        ),
-        "listing_checklist_items table": (
-            f"The CC listing_checklist_items table is inaccessible. Detail: {detail}\n\n"
-            "Check Supabase RLS policies. Verify SUPABASE_SERVICE_ROLE_KEY is valid."
-        ),
-        "deal_tasks table": (
-            f"The CC deal_tasks Supabase table is inaccessible. Detail: {detail}\n\n"
-            "Check Supabase RLS on deal_tasks. Verify SUPABASE_SERVICE_ROLE_KEY is valid."
-        ),
-        "seller_post_closing_items table": (
-            f"The CC seller_post_closing_items table is inaccessible. Detail: {detail}\n\n"
-            "Check Supabase RLS policies and that the table exists."
-        ),
-        "inventory_items table": (
-            f"The CC inventory_items table is inaccessible. Detail: {detail}\n\n"
-            "Check Supabase RLS policies and that the table exists."
-        ),
-        "agreement_buyers table": (
-            f"The CC agreement_buyers table is inaccessible. Detail: {detail}\n\n"
-            "Check Supabase RLS policies. This table powers buyer agreement tracking in CC."
-        ),
-        "agreement_sellers table": (
-            f"The CC agreement_sellers table is inaccessible. Detail: {detail}\n\n"
-            "Check Supabase RLS policies. This table powers seller agreement tracking in CC."
-        ),
-        "agreement_rentals table": (
-            f"The CC agreement_rentals table is inaccessible. Detail: {detail}\n\n"
-            "Check Supabase RLS policies. This table powers rental agreement tracking in CC."
-        ),
-        "virtual_staging_jobs table": (
-            f"The CC virtual_staging_jobs table is inaccessible. Detail: {detail}\n\n"
-            "Check Supabase RLS policies. This table tracks virtual staging job status in CC."
-        ),
-        "audit_log table": (
-            f"The CC audit_log Supabase table is inaccessible. Detail: {detail}\n\n"
-            "Check Supabase RLS on audit_log. Verify SUPABASE_SERVICE_ROLE_KEY is valid."
-        ),
-        "FUB API": (
-            f"The CC nightly audit cannot reach the Follow Up Boss API. Detail: {detail}\n\n"
-            "1. Verify FUB_API_KEY is set in Railway env vars for forward-os-backend.\n"
-            "2. Check the key is active: app.followupboss.com → Admin → API.\n"
-            "3. Test: curl -u '<FUB_API_KEY>:' https://api.followupboss.com/v1/users?limit=1"
-        ),
-        "Anthropic API": (
-            f"The CC Anthropic API key is missing or invalid. Detail: {detail}\n\n"
-            "Agent Intel (claude-sonnet) will fail without this key.\n"
-            "1. Check ANTHROPIC_API_KEY in Railway env vars for forward-os-backend.\n"
-            "2. Verify the key is active at console.anthropic.com → API Keys.\n"
-            "3. Replace the key in Railway and redeploy."
-        ),
-        "Resend API key": (
-            f"RESEND_API_KEY is not set. Detail: {detail}\n\n"
-            "CC audit email alerts will not fire.\n"
-            "1. Get the API key from resend.com → API Keys (use the 'FORWARD CC Backend' key).\n"
-            "2. Add RESEND_API_KEY to Railway env vars for forward-os-backend.\n"
-            "3. Redeploy."
-        ),
-        "audit_log unresolved errors": (
-            f"The CC audit_log has unresolved errors in the last 24h. Detail: {detail}\n\n"
-            "Check the audit_log table in Supabase for rows where resolved_at IS NULL "
-            "and created_at > NOW() - INTERVAL '24 hours'.\n"
-            "Review each error entry and resolve or escalate as appropriate."
-        ),
-        "FUB webhook failures": (
-            f"The CC audit_log has fub.sync.failed events in the last 24h. Detail: {detail}\n\n"
-            "1. Query: SELECT * FROM audit_log WHERE action = 'fub.sync.failed' "
-            "AND created_at > NOW() - INTERVAL '24 hours'.\n"
-            "2. Review the detail JSONB for each failure.\n"
-            "3. Check Railway logs around the time of each failure for the root cause."
-        ),
-    }
-    return prompts.get(
-        check_name,
-        f"The Forward CC nightly audit failed check '{check_name}'. Detail: {detail}\n\n"
-        "Please investigate marccashin/forward-os-backend main.py and Railway logs."
-    )
-
-
 
 
 async def job_nightly_os_audit():
     """APScheduler job: nightly 11:01pm ET OS health audit, sends report via Resend."""
     import resend as resend_sdk
-
     logger.info("[os-nightly-audit] Starting...")
     try:
         audit = await _run_os_audit()
         fails = audit["fails"]
         warns = audit["warns"]
-
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         subject = (
             f"✅ OS Audit PASSED — {date_str}"
@@ -3547,12 +3150,10 @@ async def job_nightly_os_audit():
             else f"🚨 OS Audit FAILED ({len(fails)} issue(s)) — {date_str}"
         )
         html_body = _build_os_audit_email_html(audit)
-
         resend_api_key = os.environ.get("RESEND_API_KEY", "")
         if not resend_api_key:
             logger.error("[os-nightly-audit] RESEND_API_KEY not set — cannot send email")
             return
-
         resend_sdk.api_key = resend_api_key
         resend_sdk.Emails.send({
             "from":    "Forward OS Audit <audit@marccashin.com>",
@@ -3567,7 +3168,7 @@ async def job_nightly_os_audit():
 
 @app.on_event("startup")
 async def register_nightly_os_audit_job():
-    """Register Forward OS nightly audit at 11:01pm ET (separate from CC audit at 11:00pm)."""
+    """Register Forward OS nightly audit at 11:01pm ET."""
     scheduler.add_job(
         job_nightly_os_audit,
         CronTrigger(hour=23, minute=1, timezone="America/New_York"),
