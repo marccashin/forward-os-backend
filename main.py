@@ -2944,8 +2944,9 @@ async def _run_os_audit() -> dict:
     # -----------------------------------------------------------------------
     try:
         r = supabase.table("automation_health").select("automation_name,status,last_run").order("last_run", desc=True).execute()
-        if r.data:
-            most_recent_ts = datetime.fromisoformat(r.data[0]["last_run"].replace("Z", "+00:00"))
+        last_run_str = (r.data or [{}])[0].get("last_run") if r.data else None
+        if last_run_str:
+            most_recent_ts = datetime.fromisoformat(last_run_str.replace("Z", "+00:00"))
             if most_recent_ts.tzinfo is None:
                 most_recent_ts = most_recent_ts.replace(tzinfo=timezone.utc)
             age_h = (now_utc - most_recent_ts).total_seconds() / 3600
@@ -2954,10 +2955,10 @@ async def _run_os_audit() -> dict:
                                 "detail": f"Last Drive check {most_recent_ts.strftime('%Y-%m-%d %H:%M UTC')} ({age_h:.1f}h ago)"})
             else:
                 checks.append({"name": "automation_health freshness", "status": "WARN",
-                                "detail": f"Stale! Last Drive check {most_recent_ts.strftime('%Y-%m-%d %H:%M UTC')} ({age_h:.1f}h ago)"})
+                                "detail": f"Stale — last Drive check {most_recent_ts.strftime('%Y-%m-%d %H:%M UTC')} ({age_h:.1f}h ago)"})
         else:
             checks.append({"name": "automation_health freshness", "status": "WARN",
-                            "detail": "No Drive automation runs recorded yet"})
+                            "detail": "No Drive automation runs recorded yet (GOOGLE_SERVICE_ACCOUNT_JSON not set or never triggered)"})
     except Exception as e:
         checks.append({"name": "automation_health freshness", "status": "FAIL", "detail": str(e)})
 
