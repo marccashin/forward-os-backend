@@ -2674,3 +2674,344 @@ async def trigger_pipeline_sync(user=Depends(get_current_user)):
     except Exception as e:
         logger.error("Manual pipeline sync failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------------------------------------------------------
+# Nightly CC audit job (APScheduler + Resend email)
+# ---------------------------------------------------------------------------
+
+async def _run_cc_audit() -> dict:
+    """
+    Run all CC health checks. Returns a dict with check results.
+    Each check: {"name": str, "status": "PASS"|"FAIL"|"WARN", "detail": str}
+    """
+    import resend as resend_sdk  # imported here so startup works without RESEND_API_KEY
+
+    checks = []
+    now_utc = datetime.now(timezone.utc)
+
+    # --- Check 1: Railway self (if we're executing, the backend is up) ---
+    checks.append({
+        "name": "Railway backend",
+        "status": "PASS",
+        "detail": f"Executing at {now_utc.strftime('%Y-%m-%d %H:%M UTC')}",
+    })
+
+    # --- Check 2: pipeline_cache freshness ---
+    try:
+        r = supabase.table("pipeline_cache").select("synced_at").order("synced_at", desc=True).limit(1).execute()
+        if r.data:
+            synced_at_str = r.data[0]["synced_at"]
+            synced_at = datetime.fromisoformat(synced_at_str.replace("Z", "+00:00"))
+            if synced_at.tzinfo is None:
+                synced_at = synced_at.replace(tzinfo=timezone.utc)
+            age_hours = (now_utc - synced_at).total_seconds() / 3600
+            if age_hours < 25:
+                checks.append({"name": "pipeline_cache freshness", "status": "PASS",
+                                "detail": f"Last sync: {synced_at.strftime('%Y-%m-%d %H:%M UTC')} ({age_hours:.1f}h ago)"})
+            else:
+                checks.append({"name": "pipeline_cache freshness", "status": "FAIL",
+                                "detail": f"Stale! Last sync: {synced_at.strftime('%Y-%m-%d %H:%M UTC')} ({age_hours:.1f}h ago)"})
+        else:
+            checks.append({"name": "pipeline_cache freshness", "status": "FAIL",
+                            "detail": "Table is empty — FUB sync has never run"})
+    except Exception as e:
+        checks.append({"name": "pipeline_cache freshness", "status": "FAIL", "detail": str(e)})
+
+    # --- Check 3: pipeline_cache buyer count ---
+    try:
+        r = supabase.table("pipeline_cache").select("id", count="exact").eq("type", "buyer").execute()
+        count = r.count if r.count is not None else len(r.data)
+        status = "PASS" if count > 0 else "WARN"
+        checks.append({"name": "pipeline_cache buyers", "status": status,
+                        "detail": f"{count} buyer row(s)"})
+    except Exception as e:
+        checks.append({"name": "pipeline_cache buyers", "status": "FAIL", "detail": str(e)})
+
+    # --- Check 4: pipeline_cache seller count ---
+    try:
+        r = supabase.table("pipeline_cache").select("id", count="exact").eq("type", "seller").execute()
+        count = r.count if r.count is not None else len(r.data)
+        status = "PASS" if count > 0 else "WARN"
+        checks.append({"name": "pipeline_cache sellers", "status": status,
+                        "detail": f"{count} seller row(s)"})
+    except Exception as e:
+        checks.append({"name": "pipeline_cache sellers", "status": "FAIL", "detail": str(e)})
+
+    # --- Check 5: webhook_errors pending count ---
+    try:
+        r = supabase.table("webhook_errors").select("id", count="exact").eq("status", "pending").execute()
+        count = r.count if r.count is not None else len(r.data)
+        status = "WARN" if count > 0 else "PASS"
+        checks.append({"name": "webhook_errors pending", "status": status,
+                        "detail": f"{count} pending unmatched webhook event(s)"})
+    except Exception as e:
+        checks.append({"name": "webhook_errors pending", "status": "FAIL", "detail": str(e)})
+
+    # --- Check 6: buyers table accessible ---
+    try:
+        r = supabase.table("buyers").select("id", count="exact").limit(1).execute()
+        total = r.count if r.count is not None else "?"
+        checks.append({"name": "buyers table", "status": "PASS",
+                        "detail": f"Accessible ({total} total rows)"})
+    except Exception as e:
+        checks.append({"name": "buyers table", "status": "FAIL", "detail": str(e)})
+
+    # --- Check 7: properties table accessible ---
+    try:
+        r = supabase.table("properties").select("id", count="exact").limit(1).execute()
+        total = r.count if r.count is not None else "?"
+        checks.append({"name": "properties table", "status": "PASS",
+                        "detail": f"Accessible ({total} total rows)"})
+    except Exception as e:
+        checks.append({"name": "properties table", "status": "FAIL", "detail": str(e)})
+
+    # --- Check 8: webhook_errors table accessible (schema check) ---
+    try:
+        supabase.table("webhook_errors").select("id").limit(1).execute()
+        checks.append({"name": "webhook_errors table", "status": "PASS",
+                        "detail": "Accessible"})
+    except Exception as e:
+        checks.append({"name": "webhook_errors table", "status": "FAIL", "detail": str(e)})
+
+    # --- Check 9: FUB API reachability ---
+    try:
+        result = await fub_get("/users", {"limit": 1})
+        if result and not result.get("error"):
+            checks.append({"name": "FUB API", "status": "PASS",
+                            "detail": "Reachable and authenticated"})
+        else:
+            checks.append({"name": "FUB API", "status": "FAIL",
+                            "detail": f"Unexpected response: {str(result)[:100]}"})
+    except Exception as e:
+        checks.append({"name": "FUB API", "status": "FAIL", "detail": str(e)})
+
+    fails  = [c for c in checks if c["status"] == "FAIL"]
+    warns  = [c for c in checks if c["status"] == "WARN"]
+    passes = [c for c in checks if c["status"] == "PASS"]
+
+    return {
+        "checks": checks,
+        "fails": fails,
+        "warns": warns,
+        "passes": passes,
+        "ran_at": now_utc.isoformat(),
+    }
+
+
+def _build_audit_email_html(audit: dict) -> str:
+    """Build HTML email body for the nightly audit report."""
+    ran_at = audit["ran_at"]
+    checks = audit["checks"]
+    fails  = audit["fails"]
+    warns  = audit["warns"]
+
+    overall = "✅ ALL SYSTEMS GO" if not fails else f"🚨 {len(fails)} FAILURE(S) DETECTED"
+    color   = "#16a34a" if not fails else "#dc2626"
+
+    rows_html = ""
+    for c in checks:
+        icon  = {"PASS": "✅", "FAIL": "❌", "WARN": "⚠️"}.get(c["status"], "?")
+        bg    = {"PASS": "#f0fdf4", "FAIL": "#fef2f2", "WARN": "#fffbeb"}.get(c["status"], "#fff")
+        rows_html += (
+            f'<tr style="background:{bg}">'
+            f'<td style="padding:8px 12px;border-bottom:1px solid #e5e7eb">{icon} {c["name"]}</td>'
+            f'<td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;font-weight:600">{c["status"]}</td>'
+            f'<td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;color:#374151">{c["detail"]}</td>'
+            f'</tr>'
+        )
+
+    fix_prompts_html = ""
+    if fails:
+        fix_prompts_html = '<h2 style="color:#dc2626;margin-top:32px">Claude Fix Prompts</h2>'
+        for c in fails:
+            prompt = _get_fix_prompt(c["name"], c["detail"])
+            fix_prompts_html += (
+                f'<div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;'
+                f'padding:16px;margin-bottom:16px">'
+                f'<strong style="color:#dc2626">❌ {c["name"]}</strong><br>'
+                f'<pre style="background:#fff;border:1px solid #e5e7eb;padding:12px;border-radius:4px;'
+                f'white-space:pre-wrap;word-break:break-word;margin-top:8px;font-size:13px">{prompt}</pre>'
+                f'</div>'
+            )
+
+    warn_html = ""
+    if warns:
+        warn_html = '<h2 style="color:#d97706;margin-top:32px">Warnings</h2>'
+        for w in warns:
+            warn_html += (
+                f'<div style="background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;'
+                f'padding:12px;margin-bottom:12px">'
+                f'<strong>⚠️ {w["name"]}</strong>: {w["detail"]}</div>'
+            )
+
+    return f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>CC Nightly Audit</title></head>
+<body style="font-family:system-ui,sans-serif;max-width:700px;margin:0 auto;padding:24px;color:#111">
+  <h1 style="color:{color};margin-bottom:4px">Forward CC — Nightly Audit</h1>
+  <p style="color:#6b7280;margin-top:0">{ran_at}</p>
+
+  <div style="background:{color};color:#fff;padding:16px 20px;border-radius:8px;font-size:18px;font-weight:bold;margin-bottom:24px">
+    {overall}
+  </div>
+
+  <table style="width:100%;border-collapse:collapse;font-size:14px">
+    <thead>
+      <tr style="background:#f3f4f6">
+        <th style="padding:8px 12px;text-align:left">Check</th>
+        <th style="padding:8px 12px;text-align:left">Status</th>
+        <th style="padding:8px 12px;text-align:left">Detail</th>
+      </tr>
+    </thead>
+    <tbody>{rows_html}</tbody>
+  </table>
+
+  {fix_prompts_html}
+  {warn_html}
+
+  <p style="color:#9ca3af;font-size:12px;margin-top:32px">
+    Sent by Forward CC nightly audit job · Railway APScheduler · 11 PM ET daily
+  </p>
+</body>
+</html>"""
+
+
+def _get_fix_prompt(check_name: str, detail: str) -> str:
+    """Return a Claude-ready fix prompt for a given failed check."""
+    prompts = {
+        "pipeline_cache freshness": (
+            "The Forward CC nightly audit detected a stale pipeline_cache. "
+            f"Detail: {detail}\n\n"
+            "The FUB pipeline sync job (job_sync_fub_pipeline) runs at 6am ET daily via APScheduler in "
+            "marccashin/forward-os-backend main.py. Please:\n"
+            "1. Check Railway logs for the forward-os-backend service for errors around 6am ET today.\n"
+            "2. Manually trigger a sync via POST /pipeline/sync on the Railway backend.\n"
+            "3. If the job errored, diagnose and fix the _sync_fub_pipeline() function in main.py and submit a PR."
+        ),
+        "pipeline_cache buyers": (
+            "The Forward CC nightly audit found zero buyer rows in pipeline_cache. "
+            f"Detail: {detail}\n\n"
+            "Check that BUYER_STAGES in main.py matches the current FUB pipeline stage names. "
+            "Trigger a manual sync via POST /pipeline/sync and verify the FUB /v1/deals response "
+            "contains buyer pipeline deals."
+        ),
+        "pipeline_cache sellers": (
+            "The Forward CC nightly audit found zero seller rows in pipeline_cache. "
+            f"Detail: {detail}\n\n"
+            "Check that SELLER_STAGES in main.py matches the current FUB pipeline stage names. "
+            "Trigger a manual sync via POST /pipeline/sync and verify the FUB /v1/deals response "
+            "contains seller pipeline deals."
+        ),
+        "webhook_errors pending": (
+            "The Forward CC nightly audit found pending unmatched webhook events. "
+            f"Detail: {detail}\n\n"
+            "Go to the CC Training Admin view → 'Unmatched Webhook Events' card. "
+            "For each row, select the correct agent from the dropdown and click 'Create Record'. "
+            "If the agent name is genuinely unknown, add the alias to AGENT_NAME_MAP in "
+            "marccashin/forward-os-backend main.py and submit a PR."
+        ),
+        "buyers table": (
+            "The Forward CC nightly audit cannot access the buyers Supabase table. "
+            f"Detail: {detail}\n\n"
+            "Check Supabase RLS policies on the buyers table. Ensure the service role key "
+            "(SUPABASE_SERVICE_ROLE_KEY in Railway env vars) is valid and the table exists."
+        ),
+        "properties table": (
+            "The Forward CC nightly audit cannot access the properties Supabase table. "
+            f"Detail: {detail}\n\n"
+            "Check Supabase RLS policies on the properties table. Ensure the service role key "
+            "(SUPABASE_SERVICE_ROLE_KEY in Railway env vars) is valid and the table exists."
+        ),
+        "webhook_errors table": (
+            "The Forward CC nightly audit cannot access the webhook_errors Supabase table. "
+            f"Detail: {detail}\n\n"
+            "Check Supabase RLS policies on the webhook_errors table. Ensure it exists with "
+            "columns: id, record_type, fub_agent, contact_name, email, phone, address, raw_payload, status."
+        ),
+        "FUB API": (
+            "The Forward CC nightly audit cannot reach the Follow Up Boss API. "
+            f"Detail: {detail}\n\n"
+            "Check that FUB_API_KEY is correctly set in Railway environment variables. "
+            "Verify the key is active at app.followupboss.com → Settings → API. "
+            "Test manually: curl -u '<FUB_API_KEY>:' https://api.followupboss.com/v1/users?limit=1"
+        ),
+        "Railway backend": (
+            "The Forward CC Railway backend itself failed its self-check. "
+            f"Detail: {detail}\n\n"
+            "This should never happen (the job can't run if the backend is down). "
+            "Check Railway deployment logs for the forward-os-backend service."
+        ),
+    }
+    return prompts.get(check_name,
+        f"The Forward CC nightly audit failed check '{check_name}'. Detail: {detail}\n\n"
+        "Please investigate marccashin/forward-os-backend main.py and the Railway deployment logs."
+    )
+
+
+async def job_nightly_audit():
+    """APScheduler job: nightly 11pm ET CC health audit, sends report via Resend."""
+    import resend as resend_sdk
+
+    logger.info("[nightly-audit] Starting...")
+    try:
+        audit = await _run_cc_audit()
+        fails = audit["fails"]
+        warns = audit["warns"]
+
+        subject = (
+            f"✅ CC Audit PASSED — {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
+            if not fails
+            else f"🚨 CC Audit FAILED ({len(fails)} issue(s)) — {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
+        )
+        html_body = _build_audit_email_html(audit)
+
+        resend_api_key = os.environ.get("RESEND_API_KEY", "")
+        if not resend_api_key:
+            logger.error("[nightly-audit] RESEND_API_KEY not set — cannot send email")
+            return
+
+        resend_sdk.api_key = resend_api_key
+        params = {
+            "from": "Forward CC Audit <audit@forward-os.com>",
+            "to": ["marc.cashin@corcoranmce.com"],
+            "subject": subject,
+            "html": html_body,
+        }
+        resend_sdk.Emails.send(params)
+        logger.info("[nightly-audit] Email sent. Fails: %d, Warns: %d", len(fails), len(warns))
+    except Exception as e:
+        logger.error("[nightly-audit] Uncaught error: %s", e)
+
+
+@app.on_event("startup")
+async def register_nightly_audit_job():
+    """Register nightly CC audit at 11pm ET."""
+    scheduler.add_job(
+        job_nightly_audit,
+        CronTrigger(hour=23, minute=0, timezone="America/New_York"),
+        id="nightly_audit",
+        replace_existing=True,
+    )
+    logger.info("[nightly-audit] Scheduled nightly 11pm ET audit registered")
+
+
+# ---------------------------------------------------------------------------
+# Audit manual trigger
+# ---------------------------------------------------------------------------
+
+@app.post("/audit/run")
+async def trigger_audit(user=Depends(get_current_user)):
+    """Manual trigger for the CC nightly audit — runs checks and sends email."""
+    try:
+        audit = await _run_cc_audit()
+        await job_nightly_audit()
+        return {
+            "status": "ok",
+            "checks": audit["checks"],
+            "fails": len(audit["fails"]),
+            "warns": len(audit["warns"]),
+            "ran_at": audit["ran_at"],
+        }
+    except Exception as e:
+        logger.error("Manual audit trigger failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))

@@ -9,3 +9,4 @@ google-api-python-client==2.128.0
 pydantic==2.7.1
 python-dotenv==1.0.1
 pypdf==3.17.4
+resend==2.3.0
