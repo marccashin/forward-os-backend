@@ -2897,7 +2897,8 @@ async def _run_os_audit() -> dict:
                         "detail": "GOOGLE_SERVICE_ACCOUNT_JSON not set — Drive automation checks disabled"})
     else:
         try:
-            get_drive_service()
+            import asyncio as _asyncio
+            await _asyncio.to_thread(get_drive_service)
             checks.append({"name": "Google Drive SA", "status": "PASS",
                             "detail": "Service account credentials valid"})
         except Exception as e:
