@@ -3230,28 +3230,29 @@ async def register_nightly_audit_job():
 # ---------------------------------------------------------------------------
 
 @app.post("/audit/run")
-async def trigger_audit(system: str = "os", user=Depends(get_current_user)):
+async def trigger_audit(system: str = "os", background_tasks: BackgroundTasks = None, user=Depends(get_current_user)):
     """
     Manual trigger for nightly audits.
     ?system=os  → Forward OS audit (default)
     ?system=cc  → Forward CC audit
+    Returns immediately; audit runs in a thread pool so the event loop is never blocked.
+    Email arrives within ~60 seconds.
     """
-    try:
-        if system == "cc":
-            audit = await _run_cc_audit()
-            await job_nightly_audit()
-        else:
-            audit = await _run_os_audit()
-            await job_nightly_os_audit()
-        return {
-            "status": "ok",
-            "system": system,
-            "checks": audit["checks"],
-            "fails": len(audit["fails"]),
-            "warns": len(audit["warns"]),
-            "ran_at": audit["ran_at"],
-        }
-    except Exception as e:
-        logger.error("Manual audit trigger failed (system=%s): %s", system, e)
-        raise HTTPException(status_code=500, detail=str(e))
+    import asyncio as _asyncio
+
+    def _run_in_thread():
+        """Run the full audit job in a dedicated thread with its own event loop."""
+        async def _async():
+            if system == "cc":
+                await job_nightly_audit()
+            else:
+                await job_nightly_os_audit()
+        _asyncio.run(_async())
+
+    background_tasks.add_task(_run_in_thread)
+    return {
+        "status": "started",
+        "system": system,
+        "message": f"{system.upper()} audit running — email will arrive in about 60 seconds",
+    }
 
