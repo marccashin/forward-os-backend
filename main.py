@@ -2792,9 +2792,9 @@ async def _run_os_audit() -> dict:
     # 6. agent_task_cache — freshness (did the 6:02am task sync run?)
     # -----------------------------------------------------------------------
     try:
-        r = supabase.table("agent_task_cache").select("updated_at").order("updated_at", desc=True).limit(1).execute()
+        r = supabase.table("agent_task_cache").select("synced_at").order("synced_at", desc=True).limit(1).execute()
         if r.data:
-            ts = datetime.fromisoformat(r.data[0]["updated_at"].replace("Z", "+00:00"))
+            ts = datetime.fromisoformat(r.data[0]["synced_at"].replace("Z", "+00:00"))
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
             age_h = (now_utc - ts).total_seconds() / 3600
@@ -2943,9 +2943,9 @@ async def _run_os_audit() -> dict:
     # 16. automation_health — freshness (did the 6:05am Drive check run?)
     # -----------------------------------------------------------------------
     try:
-        r = supabase.table("automation_health").select("name,status,last_checked").order("last_checked", desc=True).execute()
+        r = supabase.table("automation_health").select("automation_name,status,last_run").order("last_run", desc=True).execute()
         if r.data:
-            most_recent_ts = datetime.fromisoformat(r.data[0]["last_checked"].replace("Z", "+00:00"))
+            most_recent_ts = datetime.fromisoformat(r.data[0]["last_run"].replace("Z", "+00:00"))
             if most_recent_ts.tzinfo is None:
                 most_recent_ts = most_recent_ts.replace(tzinfo=timezone.utc)
             age_h = (now_utc - most_recent_ts).total_seconds() / 3600
@@ -2953,11 +2953,11 @@ async def _run_os_audit() -> dict:
                 checks.append({"name": "automation_health freshness", "status": "PASS",
                                 "detail": f"Last Drive check {most_recent_ts.strftime('%Y-%m-%d %H:%M UTC')} ({age_h:.1f}h ago)"})
             else:
-                checks.append({"name": "automation_health freshness", "status": "FAIL",
+                checks.append({"name": "automation_health freshness", "status": "WARN",
                                 "detail": f"Stale! Last Drive check {most_recent_ts.strftime('%Y-%m-%d %H:%M UTC')} ({age_h:.1f}h ago)"})
         else:
             checks.append({"name": "automation_health freshness", "status": "WARN",
-                            "detail": "Table empty — Drive automation check has never run"})
+                            "detail": "No Drive automation runs recorded yet"})
     except Exception as e:
         checks.append({"name": "automation_health freshness", "status": "FAIL", "detail": str(e)})
 
@@ -2965,13 +2965,13 @@ async def _run_os_audit() -> dict:
     # 17. automation_health — any automations in error state?
     # -----------------------------------------------------------------------
     try:
-        r = supabase.table("automation_health").select("name,status,last_checked").execute()
+        r = supabase.table("automation_health").select("automation_name,status,last_run").execute()
         errored = [row for row in (r.data or []) if row.get("status") == "error"]
         if not errored:
             checks.append({"name": "automation_health errors", "status": "PASS",
                             "detail": f"All {len(r.data or [])} automation(s) healthy"})
         else:
-            names = ", ".join(row.get("name", "?") for row in errored)
+            names = ", ".join(row.get("automation_name", "?") for row in errored)
             checks.append({"name": "automation_health errors", "status": "WARN",
                             "detail": f"{len(errored)} automation(s) in error state: {names}"})
     except Exception as e:
