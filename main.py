@@ -3158,7 +3158,7 @@ async def job_nightly_os_audit():
         resend_sdk.api_key = resend_api_key
         resend_sdk.Emails.send({
             "from":    "Forward OS Audit <audit@marccashin.com>",
-            "to":      ["marc.cashin@corcoranmce.com"],
+            "to":      ["marc@marccashin.com"],
             "subject": subject,
             "html":    html_body,
         })
@@ -3541,7 +3541,7 @@ async def job_nightly_audit():
         resend_sdk.api_key = resend_api_key
         params = {
             "from": "Forward CC Audit <audit@marccashin.com>",
-            "to": ["marc.cashin@corcoranmce.com"],
+            "to": ["marc@marccashin.com"],
             "subject": subject,
             "html": html_body,
         }
