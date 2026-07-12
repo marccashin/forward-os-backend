@@ -3053,33 +3053,7 @@ async def _run_cc_audit() -> dict:
         checks.append({"name": "FUB API", "status": "FAIL", "detail": str(e)})
 
     # -----------------------------------------------------------------------
-    # 13. OpenAI API key — required for virtual staging (gpt-image-1)
-    # -----------------------------------------------------------------------
-    openai_key = os.environ.get("OPENAI_API_KEY", "")
-    if not openai_key:
-        checks.append({"name": "OpenAI API", "status": "FAIL",
-                        "detail": "OPENAI_API_KEY not set — virtual staging (gpt-image-1) will fail"})
-    else:
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(
-                    "https://api.openai.com/v1/models",
-                    headers={"Authorization": f"Bearer {openai_key}"},
-                )
-            if resp.status_code == 200:
-                checks.append({"name": "OpenAI API", "status": "PASS",
-                                "detail": "Key valid and reachable"})
-            elif resp.status_code == 401:
-                checks.append({"name": "OpenAI API", "status": "FAIL",
-                                "detail": "401 Unauthorized — OPENAI_API_KEY is invalid or expired"})
-            else:
-                checks.append({"name": "OpenAI API", "status": "FAIL",
-                                "detail": f"HTTP {resp.status_code}: {resp.text[:80]}"})
-        except Exception as e:
-            checks.append({"name": "OpenAI API", "status": "FAIL", "detail": str(e)})
-
-    # -----------------------------------------------------------------------
-    # 14. Anthropic API key — required for Agent Intel (claude-sonnet)
+    # 13. Anthropic API key — required for Agent Intel (claude-sonnet)
     # -----------------------------------------------------------------------
     if not ANTHROPIC_API_KEY:
         checks.append({"name": "Anthropic API", "status": "FAIL",
@@ -3104,7 +3078,7 @@ async def _run_cc_audit() -> dict:
             checks.append({"name": "Anthropic API", "status": "FAIL", "detail": str(e)})
 
     # -----------------------------------------------------------------------
-    # 15. InfiniteCreator API — WARN only (known account access issue)
+    # 14. InfiniteCreator API — WARN only (known account access issue)
     # -----------------------------------------------------------------------
     ic_key = os.environ.get("INFINITE_CREATOR_API_KEY", "") or os.environ.get("IC_API_KEY", "")
     if not ic_key:
@@ -3115,7 +3089,7 @@ async def _run_cc_audit() -> dict:
                         "detail": "Key set but live validation skipped — known account access issue"})
 
     # -----------------------------------------------------------------------
-    # 16. Resend API key — required for CC audit email alerts
+    # 15. Resend API key — required for CC audit email alerts
     # -----------------------------------------------------------------------
     resend_key = os.environ.get("RESEND_API_KEY", "")
     if resend_key:
@@ -3126,7 +3100,7 @@ async def _run_cc_audit() -> dict:
                         "detail": "RESEND_API_KEY not set — audit email alerts will not fire"})
 
     # -----------------------------------------------------------------------
-    # 17. audit_log unresolved errors — last 24h
+    # 16. audit_log unresolved errors — last 24h
     # -----------------------------------------------------------------------
     try:
         r = (supabase.table("audit_log")
@@ -3153,7 +3127,7 @@ async def _run_cc_audit() -> dict:
                             "detail": str(e2)})
 
     # -----------------------------------------------------------------------
-    # 18. FUB webhook failures in audit_log — last 24h
+    # 17. FUB webhook failures in audit_log — last 24h
     # -----------------------------------------------------------------------
     try:
         r = (supabase.table("audit_log")
@@ -3518,13 +3492,6 @@ def _get_fix_prompt(check_name: str, detail: str) -> str:
             "1. Verify FUB_API_KEY is set in Railway env vars for forward-os-backend.\n"
             "2. Check the key is active: app.followupboss.com → Admin → API.\n"
             "3. Test: curl -u '<FUB_API_KEY>:' https://api.followupboss.com/v1/users?limit=1"
-        ),
-        "OpenAI API": (
-            f"The CC OpenAI API key is missing or invalid. Detail: {detail}\n\n"
-            "Virtual staging (gpt-image-1) will fail without this key.\n"
-            "1. Add OPENAI_API_KEY to Railway env vars for forward-os-backend.\n"
-            "2. Get the key from platform.openai.com → API keys.\n"
-            "3. Redeploy after adding the key."
         ),
         "Anthropic API": (
             f"The CC Anthropic API key is missing or invalid. Detail: {detail}\n\n"
