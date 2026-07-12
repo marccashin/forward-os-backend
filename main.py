@@ -2972,7 +2972,7 @@ async def job_nightly_audit():
 
         resend_sdk.api_key = resend_api_key
         params = {
-            "from": "Forward CC Audit <audit@forward-os.com>",
+            "from": "Forward CC Audit <audit@marccashin.com>",
             "to": ["marc.cashin@corcoranmce.com"],
             "subject": subject,
             "html": html_body,
