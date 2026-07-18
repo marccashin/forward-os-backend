@@ -563,6 +563,12 @@ async def fub_deal_engaged(request: Request):
     elif isinstance(phones, str):
         contact_phone = phones
 
+    # Grab FUB deal ID for bulletproof idempotency (checked before name/email)
+    fub_deal_id = str(data.get("id") or "").strip()
+
+    # Normalize contact name: collapse internal whitespace, strip edges
+    contact_name = " ".join(contact_name.split())
+
     try:
         if stage == "buyer engaged":
             if not contact_name:
@@ -570,7 +576,17 @@ async def fub_deal_engaged(request: Request):
             # Duplicate guard + insert: held under a lock so concurrent FUB bulk-webhooks
             # can't race past the dup check and create duplicate records.
             async with _buyer_create_lock:
-                _dup_q = supabase.table("buyers").select("id,buyer_name").eq("agent_name", os_agent).eq("buyer_name", contact_name).execute().data
+                # 1) FUB deal-ID check (most reliable — immune to name/email changes)
+                _dup_q = []
+                if fub_deal_id:
+                    _dup_q = supabase.table("buyers").select("id,buyer_name") \
+                        .eq("agent_name", os_agent) \
+                        .eq("subfolder_drive_ids->>_fub_deal_id", fub_deal_id) \
+                        .execute().data
+                # 2) Name + agent check (handles manually-created records with no fub_deal_id)
+                if not _dup_q:
+                    _dup_q = supabase.table("buyers").select("id,buyer_name").eq("agent_name", os_agent).eq("buyer_name", contact_name).execute().data
+                # 3) Email + agent check (catches name changes between FUB fires)
                 if not _dup_q and contact_email:
                     _dup_q = supabase.table("buyers").select("id,buyer_name").eq("agent_name", os_agent).eq("email", contact_email).neq("email", "").execute().data
                 if _dup_q:
@@ -579,13 +595,18 @@ async def fub_deal_engaged(request: Request):
                               entity_type="buyer", entity_id=_dup_q[0]["id"],
                               entity_name=contact_name, detail={"source": "fub_webhook"})
                     return {"received": True, "skipped": "duplicate", "existing_id": _dup_q[0]["id"]}
+                # Build subfolder_drive_ids with fub_deal_id for future idempotency checks
+                _sdi = {}
+                if fub_deal_id:
+                    _sdi["_fub_deal_id"] = fub_deal_id
                 result = supabase.table("buyers").insert({
-                    "buyer_name":  contact_name,
-                    "agent_name":  os_agent,
-                    "agent_email": agent_email,
-                    "email":       contact_email,
-                    "phone":       contact_phone,
-                    "status":      "active",
+                    "buyer_name":         contact_name,
+                    "agent_name":         os_agent,
+                    "agent_email":        agent_email,
+                    "email":              contact_email,
+                    "phone":             contact_phone,
+                    "status":            "active",
+                    "subfolder_drive_ids": _sdi if _sdi else None,
                 }).execute()
             logger.info("Created OS buyer: %s → %s", contact_name, os_agent)
             log_audit("buyer.create", agent_name=os_agent,
