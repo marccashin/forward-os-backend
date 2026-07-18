@@ -2327,6 +2327,7 @@ async def update_buyer(buyer_id: str, payload: UpdateBuyerRequest):
     safe_fields = {k: v for k, v in payload.fields.items() if k in allowed}
     if not safe_fields:
         raise HTTPException(status_code=400, detail="No valid fields to update")
+    _is_archive = safe_fields.get("archived") is True
     try:
         result = supabase.table("buyers").update(safe_fields).eq("id", buyer_id).execute()
         if _is_archive:
