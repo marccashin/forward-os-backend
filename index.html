@@ -17320,6 +17320,26 @@ const CHANGELOG = [
         detail: 'A race condition was causing FUB to create 2–3 duplicate buyer records when multiple contacts were synced at the same time. This is now fixed — each sync is processed one at a time so duplicates cannot form.\n\nBest practice: If you notice any remaining duplicates from before July 8, let Marc know and they can be cleaned up manually.'
       }
     ]
+  },
+  {
+    id: 'v2026-07-20',
+    date: 'July 20, 2026',
+    title: 'Smarter Meeting Intelligence',
+    summary: 'Meeting prep briefs are more accurate with deeper research, DISC profiling, and structured context inputs.',
+    updates: [
+      {
+        title: 'Structured Context Panel',
+        detail: 'The \'Additional Context\' free-text box has been replaced with a structured input panel. You can now select a communication style (e.g. Direct & Brief, Analytical), pick the contact\'s main concern (e.g. ROI, Family Lifestyle), paste a sample message from them, and add misc notes.\n\nBest practice: If you have a recent text or email from the contact, paste it in the \'Message from them\' box — it\'s the single highest-signal input for DISC profiling.'
+      },
+      {
+        title: 'Deeper Web Research',
+        detail: 'The research engine now runs up to 5 web searches per contact (up from 3) and uses your contact\'s LinkedIn URL and company email domain when available, so it can find more specific background before the meeting.\n\nBest practice: Make sure LinkedIn URLs are saved in FUB for your key contacts — the system will pick them up automatically.'
+      },
+      {
+        title: 'More Accurate DISC Profiling',
+        detail: 'The DISC personality inference has been rewritten with a clear signal priority hierarchy tuned for luxury real estate: a sample message or writing style carries the most weight, followed by professional role and lead source, then LinkedIn and CRM stage.\n\nBest practice: Fill in at least Communication Style and Main Concern for contacts you don\'t have a message from — it significantly improves brief accuracy.'
+      }
+    ]
   }
 
 ];
