@@ -2383,6 +2383,7 @@ class MeetingPrepResearchRequest(BaseModel):
     company: str = ""
     title: str = ""
     email: str = ""
+    linkedin_url: str = ""
     agent_context: str = ""
 
 @app.post("/api/meeting-prep-research")
@@ -2393,16 +2394,24 @@ async def meeting_prep_research(payload: MeetingPrepResearchRequest):
 
     system = (
         "You are a research assistant helping a real estate agent prepare for a client meeting. "
-        "Search the web to find professional information about the person named. "
-        "Focus on: LinkedIn bio, company website, news mentions, published writing, speaking engagements, or social media presence. "
+        "Search the web to find professional and behavioral information about the person named. "
+        "If a LinkedIn URL is provided, prioritize fetching that page first for the most reliable data. "
+        "Also search for: company website, news mentions, published writing, speaking engagements, social media presence. "
+        "\n\nWhen analyzing personality and DISC signals, look for these real-estate-relevant cues:\n"
+        "- LEAD SOURCE: Referral = relationship-driven (I or S), Zillow/Trulia/web = self-researching (C or D), Open house = impulse-curious (I)\n"
+        "- COMMUNICATION STYLE in notes: brief/direct messages = D, enthusiastic/emoji-heavy = I, careful/detailed = C, warm/personal = S\n"
+        "- PROFESSIONAL ROLE: Executive/entrepreneur = often D, Sales/marketing/creatives = often I, Operations/admin/teachers = often S, Finance/law/engineering = often C\n"
+        "- TIMELINE URGENCY: Hard deadline or 'need to move fast' = D; flexible/exploratory = S or I\n"
+        "- WRITING STYLE on LinkedIn/social: short punchy posts = D or I; thoughtful long-form = C; friendly personal = S or I\n"
+        "\n"
         "Return ONLY valid JSON in this exact format:\n"
         "{\n"
         '  "found": true,\n'
         '  "background": "2-3 sentence professional summary",\n'
         '  "title": "current role/title or empty string",\n'
         '  "company": "current company or empty string",\n'
-        '  "personalitySignals": "observed communication style, tone, writing patterns, interests",\n'
-        '  "discHints": "specific behavioral signals suggesting D/I/S/C type — be concrete",\n'
+        '  "personalitySignals": "specific observed signals: writing style, tone, post frequency, topics they engage with",\n'
+        '  "discHints": "concrete behavioral signals mapped to D/I/S/C — cite specific evidence, not generic guesses",\n'
         '  "sources": ["brief label of each source found e.g. LinkedIn, company bio, news article"]\n'
         "}\n"
         'If you cannot find meaningful information, return: {"found": false, "sources": []}'
@@ -2410,13 +2419,14 @@ async def meeting_prep_research(payload: MeetingPrepResearchRequest):
 
     user_msg = (
         "Research this person for a real estate agent meeting brief. "
-        "Find professional background, personality signals, and communication style.\n\n"
+        "Find professional background, personality signals, and DISC behavioral indicators.\n\n"
         f"Name: {payload.name}"
     )
+    if payload.linkedin_url: user_msg += f"\nLinkedIn URL: {payload.linkedin_url}"
     if payload.title:         user_msg += f"\nTitle: {payload.title}"
     if payload.company:       user_msg += f"\nCompany: {payload.company}"
-    if payload.email:         user_msg += f"\nEmail: {payload.email}"
-    if payload.agent_context: user_msg += f"\nAgent context: {payload.agent_context}"
+    if payload.email:         user_msg += f"\nEmail domain (for company research): {payload.email}"
+    if payload.agent_context: user_msg += f"\nAgent context / CRM notes: {payload.agent_context}"
 
     headers = {
         "x-api-key": ANTHROPIC_API_KEY,
@@ -2426,8 +2436,8 @@ async def meeting_prep_research(payload: MeetingPrepResearchRequest):
     }
     body = {
         "model": "claude-sonnet-4-6",
-        "max_tokens": 1024,
-        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+        "max_tokens": 1500,
+        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
         "system": system,
         "messages": [{"role": "user", "content": user_msg}]
     }
