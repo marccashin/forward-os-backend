@@ -7057,8 +7057,8 @@ body {
     <!-- Phase: review -->
     <template v-else-if="voiceModal.phase==='review'">
       <img v-if="voiceModal.imageData" :src="'data:'+voiceModal.imageMediaType+';base64,'+voiceModal.imageData" style="width:100%;max-height:130px;object-fit:cover;border-radius:12px;margin-bottom:12px;border:2px solid var(--gold);" alt="Business card">
-      <div style="font-size:11px;font-weight:700;color:#9ca3af;letter-spacing:1px;text-transform:uppercase;margin-bottom:8px;">You said</div>
-      <div class="voice-transcript" style="margin-bottom:14px;">{{ voiceModal.transcript }}</div>
+      <div style="font-size:11px;font-weight:700;color:#9ca3af;letter-spacing:1px;text-transform:uppercase;margin-bottom:8px;">You said <span style="font-weight:400;text-transform:none;letter-spacing:0;">(tap to edit)</span></div>
+      <textarea v-model="voiceModal.transcript" style="margin-bottom:14px;width:100%;box-sizing:border-box;font-family:'Cormorant Garamond',serif;font-size:15px;color:var(--navy);background:#f9fafb;border:1.5px solid #e2e8f0;border-radius:10px;padding:10px 12px;min-height:80px;resize:vertical;line-height:1.5;outline:none;" placeholder="Your question…"></textarea>
       <div style="display:flex;gap:10px;">
         <button class="btn-outline" @click="voiceRestart" style="flex:1;min-height:50px;">↺ Re-record</button>
         <button class="btn-gold" @click="voiceParse" :disabled="voiceModal.parsing" style="flex:2;min-height:50px;font-weight:700;">
@@ -7206,13 +7206,26 @@ body {
     <template v-else-if="voiceModal.phase==='answer'">
       <div style="font-size:12px;font-weight:700;color:rgba(247,244,239,0.6);letter-spacing:1px;text-transform:uppercase;margin-bottom:8px;">Your Question</div>
       <div style="font-family:'Cormorant Garamond',serif;font-size:13px;color:var(--navy);font-style:italic;margin-bottom:12px;padding:10px 12px;background:#f9fafb;border-radius:10px;line-height:1.5;">"{{ voiceModal.answerQuestion }}"</div>
-      <div style="overflow-y:auto;max-height:min(440px,55vh);padding-right:4px;margin-bottom:12px;">
+      <div style="overflow-y:auto;max-height:min(300px,42vh);padding-right:4px;margin-bottom:10px;">
         <div :class="{'fos-stream-cursor': voiceModal.streaming}" style="font-family:'Cormorant Garamond',serif;font-size:14px;color:var(--cream);line-height:1.75;white-space:pre-line;">{{ voiceModal.answerText.replace(/\[SOURCE:[^\]]*\]/g,'').trim() }}</div>
-        <div v-if="voiceModal.answerText.match(/\[SOURCE:([^\]]*?)\]/)" style="font-size:11px;color:rgba(247,244,239,0.5);background:rgba(255,255,255,0.06);border:1px solid rgba(200,169,110,0.15);border-radius:4px;padding:6px 10px;margin-top:10px;display:flex;align-items:center;gap:6px;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="rgba(200,169,110,0.7)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>{{ voiceModal.answerText.match(/\[SOURCE:([^\]]*?)\]/)?.[1]?.trim() || '' }}</div>
+        <div v-if="voiceModal.answerText.match(/\[SOURCE:([^\]]*?)\]/)" style="font-size:11px;color:rgba(247,244,239,0.5);background:rgba(255,255,255,0.06);border:1px solid rgba(200,169,110,0.15);border-radius:4px;padding:6px 10px;margin-top:10px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="rgba(200,169,110,0.7)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+          <span>{{ voiceModal.answerText.match(/\[SOURCE:([^\]]*?)\]/)?.[1]?.trim() || '' }}</span>
+          <a v-if="voiceGetSourceLink()" :href="voiceGetSourceLink().url" target="_blank" style="color:rgba(200,169,110,0.85);text-decoration:underline;font-size:10px;margin-left:4px;">Open doc ↗</a>
+        </div>
+      </div>
+      <!-- Follow-up input -->
+      <div v-if="!voiceModal.streaming" style="display:flex;align-items:center;gap:8px;background:rgba(255,255,255,0.07);border:1px solid rgba(200,169,110,0.2);border-radius:10px;padding:6px 10px;margin-bottom:10px;">
+        <input v-model="voiceModal.followupInput" @keydown.enter="voiceAskFollowup" placeholder="Ask a follow-up…" style="flex:1;border:none;background:transparent;font-size:13px;color:var(--cream);outline:none;min-height:30px;" />
+        <button @click="voiceAskFollowup" :disabled="!voiceModal.followupInput.trim()" style="width:30px;height:30px;border-radius:50%;background:var(--gold);color:var(--navy);border:none;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;flex-shrink:0;opacity:voiceModal.followupInput.trim()?1:0.4;">↑</button>
       </div>
       <div style="display:flex;gap:10px;">
         <button class="btn-outline" @click="voiceClose" style="flex:1;min-height:48px;">Close</button>
-        <button v-if="voiceModal.generatedContent" @click="navigator.clipboard.writeText(voiceModal.generatedContent)" style="flex:1;min-height:48px;background:#f0fdf4;color:#166534;border:1.5px solid #86efac;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;"><svg viewBox="0 0 24 24" style="width:1em;height:1em;display:inline-block;vertical-align:-3px;flex-shrink:0;" xmlns="http://www.w3.org/2000/svg"><rect x="8" y="1" width="8" height="4" rx="1" fill="#0d1f35"/><rect x="4" y="3" width="16" height="19" rx="1" fill="#0d1f35"/><rect x="7" y="8" width="10" height="1.5" fill="white"/><rect x="7" y="12" width="10" height="1.5" fill="white"/><rect x="7" y="16" width="6" height="1.5" fill="white"/></svg> Copy Content</button><template v-if="voiceModal.detectedTool!=='write-content'"><a v-if="voiceModal.kbSourceFiles && voiceModal.kbSourceFiles.length && voiceModal.kbSourceFiles[0].driveUrl && voiceModal.kbSourceFiles[0].name && voiceModal.kbSourceFiles[0].name.toUpperCase().includes('BRAND BOOK')" :href="voiceModal.kbSourceFiles[0].driveUrl" target="_blank" class="btn-navy" @click="voiceClose()" style="flex:1;min-height:48px;font-size:13px;display:flex;align-items:center;justify-content:center;gap:6px;text-decoration:none;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>FWRD Brand Book</a><button v-else class="btn-navy" @click="voiceClose(); go('training')" style="flex:1;min-height:48px;font-size:13px;display:flex;align-items:center;justify-content:center;gap:6px;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>Training Library</button></template>
+        <button v-if="voiceModal.generatedContent" @click="navigator.clipboard.writeText(voiceModal.generatedContent)" style="flex:1;min-height:48px;background:#f0fdf4;color:#166534;border:1.5px solid #86efac;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;"><svg viewBox="0 0 24 24" style="width:1em;height:1em;display:inline-block;vertical-align:-3px;flex-shrink:0;" xmlns="http://www.w3.org/2000/svg"><rect x="8" y="1" width="8" height="4" rx="1" fill="#0d1f35"/><rect x="4" y="3" width="16" height="19" rx="1" fill="#0d1f35"/><rect x="7" y="8" width="10" height="1.5" fill="white"/><rect x="7" y="12" width="10" height="1.5" fill="white"/><rect x="7" y="16" width="6" height="1.5" fill="white"/></svg> Copy Content</button>
+        <template v-if="voiceModal.detectedTool!=='write-content'">
+          <a v-if="voiceGetSourceLink()" :href="voiceGetSourceLink().url" target="_blank" class="btn-navy" @click="voiceClose()" style="flex:1;min-height:48px;font-size:12px;display:flex;align-items:center;justify-content:center;gap:6px;text-decoration:none;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>{{ voiceGetSourceLink().label.length > 22 ? voiceGetSourceLink().label.slice(0,22)+'…' : voiceGetSourceLink().label }}</a>
+          <button v-else class="btn-navy" @click="voiceClose(); go('training')" style="flex:1;min-height:48px;font-size:13px;display:flex;align-items:center;justify-content:center;gap:6px;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>Training Library</button>
+        </template>
       </div>
     </template>
 
@@ -17109,7 +17122,9 @@ const voiceModal = reactive({
   answerQuestion: '',
   answerText: '',
   kbSourceFiles: [],
-  streaming: false
+  streaming: false,
+  followupInput: '',
+  followupHistory: []   // [{q, a}] — prior Q&A pairs for context
 });
 
 let _voiceRecognition = null;
@@ -17656,11 +17671,62 @@ function voiceRestart() {
   voiceStart();
 }
 
+function voiceGetSourceLink() {
+  const match = voiceModal.answerText.match(/\[SOURCE:([^\]]*?)\]/);
+  if (!match) return null;
+  const src = match[1].trim();
+  // Uploaded KB doc — match by name
+  const kbMatch = voiceModal.kbSourceFiles.find(f => f.name && src.includes(f.name));
+  if (kbMatch && kbMatch.driveUrl) return { url: kbMatch.driveUrl, label: kbMatch.name };
+  if (kbMatch && kbMatch.name === 'FWRD BRAND BOOK') return { url: 'https://www.fwrdrealestate.com/s/BRAND-BOOK-2-8ebs.pdf', label: 'FWRD Brand Book' };
+  // FORWARD Team Document — match title against FORWARD_TRAINING_URLS
+  if (src.includes('FORWARD Team Document')) {
+    const docTitle = src.replace('FORWARD Team Document —', '').replace('FORWARD Team Document -', '').trim();
+    const tdMatch = FORWARD_TRAINING_URLS.find(d => d.title && (d.title === docTitle || src.includes(d.title)));
+    if (tdMatch) {
+      const idM = tdMatch.url.match(/\/d\/([a-zA-Z0-9_-]+)\//);
+      const viewUrl = idM ? 'https://docs.google.com/document/d/' + idM[1] + '/view' : tdMatch.url;
+      return { url: viewUrl, label: tdMatch.title };
+    }
+  }
+  return null;
+}
+
+async function voiceAskFollowup() {
+  const q = (voiceModal.followupInput || '').trim();
+  if (!q) return;
+  // Store current Q&A in history
+  voiceModal.followupHistory.push({ q: voiceModal.answerQuestion, a: voiceModal.answerText.replace(/\[SOURCE:[^\]]*\]/g, '').trim() });
+  voiceModal.followupInput = '';
+  voiceModal.answerQuestion = q;
+  voiceModal.answerText = '';
+  voiceModal.streaming = true;
+  voiceModal.phase = 'answer';
+  try {
+    const trainingContent = await getAgentToolsContent(q);
+    const _kbDocs = await kbSearch(q);
+    const _hasKb = _kbDocs.length > 0;
+    voiceModal.kbSourceFiles = _hasKb ? _kbDocs.map(d => ({ name: d.file_name || '', category: d.category || '', driveUrl: (d.drive_file_id && d.drive_file_id.startsWith('http')) ? d.drive_file_id : (d.file_name === 'FWRD BRAND BOOK' ? 'https://www.fwrdrealestate.com/s/BRAND-BOOK-2-8ebs.pdf' : '') })) : voiceModal.kbSourceFiles;
+    const _kbContext = _hasKb ? '\n\n━━ UPLOADED TRAINING MATERIALS ━━\n' + _kbDocs.map(d => '[' + d.file_name + ']\n' + kbExcerpt(d.content||'', q)).join('\n\n---\n\n') : '';
+    const historyCtx = voiceModal.followupHistory.map((h, i) => `Q${i+1}: ${h.q}\nA${i+1}: ${h.a}`).join('\n\n');
+    const userMsg = (historyCtx ? '=== PRIOR CONVERSATION ===\n' + historyCtx + '\n\n=== FOLLOW-UP QUESTION ===\n' : '') + q + '\n\n' + trainingContent + _kbContext;
+    const system = `You are a real estate assistant for FORWARD Real Estate (Corcoran McEnearney). Answer the follow-up question using the training materials provided. Be concise (2-4 sentences). End with a [SOURCE: ...] tag. If the prior conversation provides useful context, reference it naturally.`;
+    await claudeStream(userMsg, system, (chunk, full) => {
+      voiceModal.answerText = full;
+    }, 800);
+  } catch(e) {
+    voiceModal.answerText = '⚠️ Error: ' + e.message;
+  }
+  voiceModal.streaming = false;
+}
+
 function voiceClose() {
   if (_voiceRecognition) { try { _voiceRecognition.stop(); } catch(e) {} }
   if (_voiceFollowupRecognition) { try { _voiceFollowupRecognition.stop(); } catch(e) {} }
   voiceModal.show = false;
-            voiceModal.generatedContent = '';
+  voiceModal.generatedContent = '';
+  voiceModal.followupInput = '';
+  voiceModal.followupHistory = [];
 }
 
 
@@ -19938,7 +20004,7 @@ ${isContractQuestion ? FORWARD_JURISDICTION_KNOWLEDGE : FORWARD_MARC_METHODS}`;
       revVoiceRecording, revSubmitting, revActiveStatus, revLatestNumber,
       canRequestRevision, revVoiceStart, revVoiceStop, submitRevisionRequest,
       fetchRevisionRequests,
-      voiceModal, voiceStart, voiceStop, voiceClose, voiceRestart, voiceParse, voiceFollowupSubmit, voiceFollowupMic, voiceAttachImage, voiceCrmSubmit, aiMsgIdx, logAct, logActParse, logActSearch, logActSubmit, logActMicToggle, logActOpenForContact, partnerModal, partnerOpen, partnerAdd, partnerRemove, partnerGetCoAgents, partnerReassign,
+      voiceModal, voiceStart, voiceStop, voiceClose, voiceRestart, voiceParse, voiceFollowupSubmit, voiceFollowupMic, voiceAttachImage, voiceCrmSubmit, voiceGetSourceLink, voiceAskFollowup, aiMsgIdx, logAct, logActParse, logActSearch, logActSubmit, logActMicToggle, logActOpenForContact, partnerModal, partnerOpen, partnerAdd, partnerRemove, partnerGetCoAgents, partnerReassign,
       cardScan, cardScanAttach, cardScanProcess,
       // Agent Session
       sessionEmail, switchAgent, originalAgent, isOriginalAdmin, agentSwitchList, quickSwitchAgent,
