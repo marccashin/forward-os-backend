@@ -1757,6 +1757,177 @@ Return ONLY the JSON object. No explanation, no markdown, no code fences."""
     return json.loads(raw)
 
 
+
+
+# ── CMA: parse Bright MLS listing sheets ──────────────────────────────────
+# Agents upload one or more MLS "Agent Full" PDFs from the CMA tool. We pull
+# only OBJECTIVE facts. Condition, proximity and concession dollars are agent
+# judgement and are deliberately NOT returned — see CMA_PARSE_PROMPT.
+# Mirrors /api/parse-offer: extract text with pypdf, send text (never base64)
+# to keep the Railway container off its memory ceiling.
+
+CMA_PARSE_PROMPT = """You are reading a single real estate MLS listing sheet (usually a Bright MLS "Agent Full" report).
+
+Extract ONLY facts printed on the sheet. Never estimate, infer, or calculate a value that is not stated. If a field is absent, use an empty string "".
+
+Return ONLY a valid JSON object with exactly these keys:
+
+{
+  "status": "one of: active, pending, closed, off_market",
+  "status_raw": "the status word exactly as printed (Active, Under Contract, Closed, Canceled, Expired, Withdrawn, etc.)",
+  "mlsNumber": "MLS #",
+  "address": "street address only, no city/state/zip",
+  "city": "city name only",
+  "state": "2-letter state",
+  "zip": "5-digit zip",
+  "county": "county name if shown",
+  "propType": "one of: Single Family, Condo, Townhouse, Multi-Family, Land, Other",
+  "beds": "number of bedrooms, digits only",
+  "fullBaths": "number of full baths, digits only",
+  "halfBaths": "number of half baths, digits only",
+  "gla": "Above Grade Finished SQFT, digits only, no commas",
+  "below": "Below Grade FINISHED SQFT, digits only. If the sheet gives only unfinished sqft, or gives a percentage instead of a number, leave this EMPTY and set flag below_grade_unclear.",
+  "lotSize": "lot size in SQUARE FEET, digits only. If given in acres, convert (1 acre = 43560 sqft).",
+  "yearBuilt": "4-digit year",
+  "garageSpaces": "number of GARAGE spaces, digits only. If the sheet says Garage: No, use 0. If total parking is listed as Unknown, leave EMPTY and set flag parking_unknown.",
+  "hoaMonthly": "HOA fee converted to a MONTHLY dollar amount, digits only",
+  "condoFee": "condo fee converted to a MONTHLY dollar amount, digits only",
+  "listPrice": "current or original list price, digits only",
+  "salePrice": "CLOSE/SOLD price, digits only. Only for closed sales. Empty otherwise.",
+  "soldDate": "close date as YYYY-MM-DD. Only for closed sales.",
+  "listDate": "listing entry date as YYYY-MM-DD",
+  "dom": "days on market, digits only",
+  "concessionsRaw": "seller concessions exactly as printed, e.g. 'No' or '$5,000'. Do NOT convert to a number.",
+  "annualTax": "annual property tax amount, digits only",
+  "flags": {
+    "gla_from_assessor": true/false,
+    "lot_estimated": true/false,
+    "parking_unknown": true/false,
+    "below_grade_unclear": true/false,
+    "price_is_list_not_sold": true/false
+  }
+}
+
+Rules:
+- status: Active -> "active". Pending / Under Contract / Active Under Contract -> "pending". Closed / Sold -> "closed". Canceled / Expired / Withdrawn / Temporarily Off Market -> "off_market".
+- Set gla_from_assessor true when the sqft is labelled "Assessor" rather than measured.
+- Set lot_estimated true when the lot size is labelled "Estimated".
+- Set parking_unknown true when total parking spaces reads "Unknown".
+- Set price_is_list_not_sold true whenever salePrice is empty but listPrice is present.
+- Never output a condition, quality, or proximity rating. Those are the agent's call.
+
+Return ONLY the JSON object. No explanation, no markdown, no code fences."""
+
+
+@app.post("/api/cma/parse-listings")
+async def cma_parse_listings(files: list[UploadFile] = File(...)):
+    """Parse one or more MLS listing PDFs into CMA-ready objective fields.
+
+    Always returns HTTP 200 with a per-file result so that one bad PDF never
+    fails an agent's whole upload batch.
+    """
+    import gc
+    from pypdf import PdfReader
+
+    MAX_FILES = 12
+    MAX_BYTES = 20 * 1024 * 1024
+
+    if not files:
+        raise HTTPException(status_code=400, detail="No files were uploaded.")
+    if len(files) > MAX_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many files. Upload up to {MAX_FILES} at a time.",
+        )
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Listing parsing is not configured on the server.",
+        )
+
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+
+    results: list[dict] = []
+
+    for f in files:
+        name = f.filename or "listing.pdf"
+        try:
+            if f.content_type not in ("application/pdf", "application/octet-stream"):
+                results.append({"file": name, "ok": False,
+                                "error": "Not a PDF file."})
+                continue
+
+            pdf_bytes = await f.read()
+            if len(pdf_bytes) > MAX_BYTES:
+                results.append({"file": name, "ok": False,
+                                "error": "PDF is larger than 20 MB."})
+                continue
+
+            try:
+                reader = PdfReader(io.BytesIO(pdf_bytes))
+                pdf_text = "\n".join(p.extract_text() or "" for p in reader.pages)
+            except Exception:
+                pdf_text = ""
+            finally:
+                del pdf_bytes
+                gc.collect()
+
+            if len(pdf_text.strip()) < 200:
+                results.append({
+                    "file": name, "ok": False,
+                    "error": "This PDF looks like a scan and has no readable text. "
+                             "Print the MLS sheet to PDF again, or enter it by hand.",
+                })
+                continue
+
+            payload = {
+                "model": BMR_MODEL,
+                "max_tokens": 1500,
+                "messages": [{
+                    "role": "user",
+                    "content": f"MLS LISTING SHEET:\n\n{pdf_text}\n\n---\n\n{CMA_PARSE_PROMPT}",
+                }],
+            }
+            del pdf_text
+            gc.collect()
+
+            try:
+                async with httpx.AsyncClient(timeout=120) as client:
+                    resp = await client.post(
+                        "https://api.anthropic.com/v1/messages",
+                        headers=headers, json=payload,
+                    )
+                    resp.raise_for_status()
+                raw = resp.json()["content"][0]["text"].strip()
+            finally:
+                del payload
+                gc.collect()
+
+            raw = re.sub(r"^```(?:json)?\n?", "", raw)
+            raw = re.sub(r"\n?```$", "", raw)
+            data = json.loads(raw)
+
+            if not isinstance(data, dict):
+                raise ValueError("unexpected shape")
+            data.setdefault("flags", {})
+            data["file"] = name
+            data["ok"] = True
+            results.append(data)
+
+        except Exception as e:
+            logging.exception("cma_parse_listings failed for %s", name)
+            results.append({
+                "file": name, "ok": False,
+                "error": "Could not read this sheet. Try re-downloading it from the MLS.",
+            })
+
+    return {"success": True, "results": results}
+
+
 class AnalyzeOffersRequest(BaseModel):
     offers: list[dict]
     property_address: str = ""
