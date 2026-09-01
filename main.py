@@ -1787,7 +1787,9 @@ Return ONLY a valid JSON object of the form {"listings": [ ... ]}, where every e
   "beds": "number of bedrooms, digits only",
   "fullBaths": "number of full baths, digits only",
   "halfBaths": "number of half baths, digits only",
-  "gla": "Above Grade Finished SQFT, digits only, no commas",
+  "gla": "Above Grade Finished SQFT, digits only, no commas. This is the appraiser's gross living area. NEVER use Total SQFT or Tax Total Fin SQFT, which include below-grade space.",
+  "glaSource": "the label printed after the Above Grade Fin SQFT figure, exactly as shown: Assessor, Estimated, or blank",
+  "assessorGla": "the separate 'Assessor AbvGrd Fin SQFT' figure if the sheet prints one, digits only",
   "below": "Below Grade FINISHED SQFT, digits only. If the sheet gives only unfinished sqft, or gives a percentage instead of a number, leave this EMPTY and set flag below_grade_unclear.",
   "lotSize": "lot size in SQUARE FEET, digits only. If given in acres, convert (1 acre = 43560 sqft).",
   "yearBuilt": "4-digit year",
@@ -1799,10 +1801,11 @@ Return ONLY a valid JSON object of the form {"listings": [ ... ]}, where every e
   "soldDate": "close date as YYYY-MM-DD. Only for closed sales.",
   "listDate": "listing entry date as YYYY-MM-DD",
   "dom": "days on market, digits only",
-  "concessionsRaw": "seller concessions exactly as printed, e.g. 'No' or '$5,000'. Do NOT convert to a number.",
+  "concessions": "the dollar figure from 'Total Amount Paid by Seller Towards Closing Costs', digits only, no commas or dollar sign. Use 0 if that line prints $0.00. Leave EMPTY only if the line is absent from the sheet. IGNORE the yes/no 'Seller Concessions' field entirely - it is often wrong. A sheet can say Seller Concessions: No and still show a dollar amount here; the dollar amount wins.",
+  "concessionsRaw": "the 'Seller Concessions' yes/no field exactly as printed, for reference only",
   "annualTax": "annual property tax amount, digits only",
   "flags": {
-    "gla_from_assessor": true/false,
+    "gla_needs_check": true/false,
     "lot_estimated": true/false,
     "parking_unknown": true/false,
     "below_grade_unclear": true/false,
@@ -1812,7 +1815,7 @@ Return ONLY a valid JSON object of the form {"listings": [ ... ]}, where every e
 
 Rules:
 - status: Active -> "active". Pending / Under Contract / Active Under Contract -> "pending". Closed / Sold -> "closed". Canceled / Expired / Withdrawn / Temporarily Off Market -> "off_market".
-- Set gla_from_assessor true when the sqft is labelled "Assessor" rather than measured.
+- Set gla_needs_check true ONLY when the square footage is genuinely uncertain: the label reads "Estimated", OR the Above Grade Fin SQFT differs from the Assessor AbvGrd Fin SQFT printed on the same sheet. A plain "Assessor" label that matches is normal and must NOT be flagged.
 - Set lot_estimated true when the lot size is labelled "Estimated".
 - Set parking_unknown true when total parking spaces reads "Unknown".
 - Set price_is_list_not_sold true whenever salePrice is empty but listPrice is present.
