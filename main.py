@@ -1766,11 +1766,13 @@ Return ONLY the JSON object. No explanation, no markdown, no code fences."""
 # Mirrors /api/parse-offer: extract text with pypdf, send text (never base64)
 # to keep the Railway container off its memory ceiling.
 
-CMA_PARSE_PROMPT = """You are reading a single real estate MLS listing sheet (usually a Bright MLS "Agent Full" report).
+CMA_PARSE_PROMPT = """You are reading a real estate MLS report (usually a Bright MLS "Agent Full" export).
+
+IMPORTANT: One PDF often contains SEVERAL properties, one after another. Each new property begins with a header line holding an address, a status word, and a price. Find EVERY property in the document and return one entry for each. Do not stop after the first.
 
 Extract ONLY facts printed on the sheet. Never estimate, infer, or calculate a value that is not stated. If a field is absent, use an empty string "".
 
-Return ONLY a valid JSON object with exactly these keys:
+Return ONLY a valid JSON object of the form {"listings": [ ... ]}, where every element has exactly these keys:
 
 {
   "status": "one of: active, pending, closed, off_market",
@@ -1815,8 +1817,10 @@ Rules:
 - Set parking_unknown true when total parking spaces reads "Unknown".
 - Set price_is_list_not_sold true whenever salePrice is empty but listPrice is present.
 - Never output a condition, quality, or proximity rating. Those are the agent's call.
+- A closed sale's price is its Close Price, not its list price, and its soldDate is the Close Date.
+- Return one entry per property. A report holding 7 properties returns 7 entries.
 
-Return ONLY the JSON object. No explanation, no markdown, no code fences."""
+Return ONLY the JSON object {"listings": [...]}. No explanation, no markdown, no code fences."""
 
 
 @app.post("/api/cma/parse-listings")
@@ -1831,6 +1835,7 @@ async def cma_parse_listings(files: list[UploadFile] = File(...)):
 
     MAX_FILES = 12
     MAX_BYTES = 20 * 1024 * 1024
+    MAX_LISTINGS_PER_FILE = 30
 
     if not files:
         raise HTTPException(status_code=400, detail="No files were uploaded.")
@@ -1886,7 +1891,7 @@ async def cma_parse_listings(files: list[UploadFile] = File(...)):
 
             payload = {
                 "model": BMR_MODEL,
-                "max_tokens": 1500,
+                "max_tokens": 16000,
                 "messages": [{
                     "role": "user",
                     "content": f"MLS LISTING SHEET:\n\n{pdf_text}\n\n---\n\n{CMA_PARSE_PROMPT}",
@@ -1911,12 +1916,28 @@ async def cma_parse_listings(files: list[UploadFile] = File(...)):
             raw = re.sub(r"\n?```$", "", raw)
             data = json.loads(raw)
 
-            if not isinstance(data, dict):
+            # One PDF may hold many properties. Accept either shape.
+            if isinstance(data, dict) and isinstance(data.get("listings"), list):
+                listings = data["listings"]
+            elif isinstance(data, dict):
+                listings = [data]
+            elif isinstance(data, list):
+                listings = data
+            else:
                 raise ValueError("unexpected shape")
-            data.setdefault("flags", {})
-            data["file"] = name
-            data["ok"] = True
-            results.append(data)
+
+            if not listings:
+                results.append({"file": name, "ok": False,
+                                "error": "No properties were found in this sheet."})
+                continue
+
+            for item in listings[:MAX_LISTINGS_PER_FILE]:
+                if not isinstance(item, dict):
+                    continue
+                item.setdefault("flags", {})
+                item["file"] = name
+                item["ok"] = True
+                results.append(item)
 
         except Exception as e:
             logging.exception("cma_parse_listings failed for %s", name)
