@@ -1839,6 +1839,7 @@ async def cma_parse_listings(files: list[UploadFile] = File(...)):
     MAX_FILES = 12
     MAX_BYTES = 20 * 1024 * 1024
     MAX_LISTINGS_PER_FILE = 30
+    MLS_MARKERS = ("bright mls", "mls #", "mls#", "listing agrmnt", "agent full")
 
     if not files:
         raise HTTPException(status_code=400, detail="No files were uploaded.")
@@ -1889,6 +1890,19 @@ async def cma_parse_listings(files: list[UploadFile] = File(...)):
                     "file": name, "ok": False,
                     "error": "This PDF looks like a scan and has no readable text. "
                              "Print the MLS sheet to PDF again, or enter it by hand.",
+                })
+                continue
+
+            # Only read genuine MLS listing reports. Anything else (a seller's
+            # spreadsheet, an appraisal, a flyer) is refused outright rather
+            # than half-parsed, because a comp with a real price and missing
+            # beds looks correct and is not.
+            low = pdf_text.lower()
+            if not any(m in low for m in MLS_MARKERS):
+                results.append({
+                    "file": name, "ok": False,
+                    "error": "This does not look like an MLS listing report, so nothing "
+                             "was imported. Export the sheet from Bright MLS and try again.",
                 })
                 continue
 
