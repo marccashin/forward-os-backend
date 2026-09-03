@@ -29,7 +29,7 @@ from typing import Any, Optional
 import httpx
 from fastapi import FastAPI, HTTPException, Depends, Request, Header, BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -58,6 +58,10 @@ CFO_REPORTS_FOLDER_ID     = os.environ.get("CFO_REPORTS_FOLDER_ID", "")
 ALLOWED_ORIGINS           = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",")]
 ANTHROPIC_API_KEY         = os.environ.get("ANTHROPIC_API_KEY", "")
 NETLIFY_ACCESS_TOKEN      = os.environ.get("NETLIFY_ACCESS_TOKEN", "")
+# Origin the PDF renderer is allowed to load. Pinned server-side on purpose:
+# taking this from the request body would let any caller drive our headless
+# browser to an arbitrary URL.
+CAMPAIGN_PRINT_ORIGIN     = os.environ.get("CAMPAIGN_PRINT_ORIGIN", "https://forward-os.netlify.app")
 BMR_MODEL                 = "claude-sonnet-4-5"
 
 # ---------------------------------------------------------------------------
@@ -407,6 +411,102 @@ async def shutdown():
 @app.get("/health")
 async def health():
     return {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()}
+
+
+# ---------------------------------------------------------------------------
+# Campaign package PDF export
+#
+# Renders campaign-print.html in a headless Chromium here on the server rather
+# than in the agent's browser, so every agent on every device gets an identical
+# file. The package JSON is injected into sessionStorage before any page script
+# runs, which is exactly what campaign-print.html reads on load.
+#
+# Chromium is launched per request and closed in a finally block. It is heavy
+# (roughly 300-400MB resident while rendering) but a campaign export is rare and
+# a persistent browser leaks memory on Railway over days of uptime.
+# ---------------------------------------------------------------------------
+@app.get("/export-pdf/health")
+async def export_pdf_health():
+    """Confirms Chromium is actually installed in this image, not just imported."""
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as e:
+        return {"ok": False, "stage": "import", "error": str(e)}
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
+            ver = browser.version
+            await browser.close()
+        return {"ok": True, "chromium": ver, "print_origin": CAMPAIGN_PRINT_ORIGIN}
+    except Exception as e:
+        return {"ok": False, "stage": "launch", "error": str(e)}
+
+
+@app.post("/export-pdf")
+async def export_campaign_pdf(request: Request):
+    try:
+        pkg = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(pkg, dict):
+        raise HTTPException(status_code=400, detail="Expected a campaign package object")
+
+    # Never trust a client-supplied render target.
+    pkg.pop("_siteUrl", None)
+    print_url = CAMPAIGN_PRINT_ORIGIN.rstrip("/") + "/campaign-print.html"
+
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as e:
+        logger.error("export-pdf: playwright unavailable: %s", e)
+        raise HTTPException(status_code=503, detail="PDF renderer not installed on this server")
+
+    browser = None
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--font-render-hinting=none"]
+            )
+            page = await browser.new_page(viewport={"width": 1200, "height": 1600})
+
+            # Seed sessionStorage before any page script executes.
+            await page.add_init_script(
+                "try { sessionStorage.setItem('fos_campPkg', "
+                + json.dumps(json.dumps(pkg))
+                + "); } catch (e) {}"
+            )
+
+            await page.goto(print_url, wait_until="load", timeout=45000)
+            # Confirm Vue actually rendered rather than the empty state.
+            await page.wait_for_selector(".fwd-cover", timeout=15000)
+            await page.evaluate("() => document.fonts.ready.then(() => true).catch(() => true)")
+            await page.wait_for_timeout(250)
+
+            pdf_bytes = await page.pdf(
+                print_background=True,
+                prefer_css_page_size=True,
+                display_header_footer=False,
+            )
+            await browser.close()
+            browser = None
+    except Exception as e:
+        logger.exception("export-pdf failed")
+        raise HTTPException(status_code=502, detail="PDF render failed: %s" % e)
+    finally:
+        if browser is not None:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": 'attachment; filename="campaign-package.pdf"',
+            "Content-Length": str(len(pdf_bytes)),
+        },
+    )
 
 
 class AgentTaskSyncRequest(BaseModel):
