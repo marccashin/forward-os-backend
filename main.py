@@ -724,12 +724,42 @@ async def fub_deal_engaged(request: Request):
             if _dup_prop:
                 logger.info("Webhook duplicate skipped: property '%s' already exists for %s (id=%s)", address, os_agent, _dup_prop[0]["id"])
                 return {"received": True, "skipped": "duplicate", "existing_id": _dup_prop[0]["id"]}
+            # Resolve market from the FUB custom fields on the deal.
+            # FUB sends customFields as a list of {name, value} dicts.
+            # Values are free-text ("Virginia", "Maryland", "DC", etc.) so we
+            # normalise to the three OS tokens: "VA", "MD", "DC".
+            # Falls back to address-based detection, then "DC" as a last resort.
+            _fub_market_raw = ""
+            _cf_list = data.get("customFields") or data.get("custom_fields") or []
+            for _cf in (_cf_list if isinstance(_cf_list, list) else []):
+                if isinstance(_cf, dict) and _safe_str(_cf.get("name") or "").strip().lower() == "market":
+                    _fub_market_raw = _safe_str(_cf.get("value") or "").strip()
+                    break
+            _market_map = {
+                "virginia": "VA", "va": "VA", "northern virginia": "VA", "nova": "VA",
+                "maryland": "MD", "md": "MD",
+                "dc": "DC", "washington dc": "DC", "washington, dc": "DC",
+                "district of columbia": "DC",
+            }
+            _market = _market_map.get(_fub_market_raw.lower(), "")
+            if not _market:
+                # Address-based fallback — same logic as nsDetectJurisdiction in the frontend
+                _addr_lower = address.lower()
+                if any(k in _addr_lower for k in [" dc", "washington, d", "district of columbia"]):
+                    _market = "DC"
+                elif any(k in _addr_lower for k in ["arlington", "fairfax", "loudoun", "alexandria", " va", "virginia"]):
+                    _market = "VA"
+                elif any(k in _addr_lower for k in [" md", "maryland", "montgomery", "bethesda", "silver spring"]):
+                    _market = "MD"
+                else:
+                    _market = "DC"  # last resort
+            logger.info("FUB market field raw=%r normalised=%r address=%r", _fub_market_raw, _market, address)
             result = supabase.table("properties").insert({
                 "address":     address,
                 "agent_name":  os_agent,
                 "agent_email": agent_email,
                 "seller_name": contact_name,
-                "market":      "DC",
+                "market":      _market,
                 "status":      "draft",
             }).execute()
             logger.info("Created OS property: %s → %s", address, os_agent)
