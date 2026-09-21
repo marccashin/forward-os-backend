@@ -724,17 +724,31 @@ async def fub_deal_engaged(request: Request):
             if _dup_prop:
                 logger.info("Webhook duplicate skipped: property '%s' already exists for %s (id=%s)", address, os_agent, _dup_prop[0]["id"])
                 return {"received": True, "skipped": "duplicate", "existing_id": _dup_prop[0]["id"]}
-            # Resolve market from the FUB custom fields on the deal.
-            # FUB sends customFields as a list of {name, value} dicts.
-            # Values are free-text ("Virginia", "Maryland", "DC", etc.) so we
-            # normalise to the three OS tokens: "VA", "MD", "DC".
-            # Falls back to address-based detection, then "DC" as a last resort.
-            _fub_market_raw = ""
-            _cf_list = data.get("customFields") or data.get("custom_fields") or []
-            for _cf in (_cf_list if isinstance(_cf_list, list) else []):
-                if isinstance(_cf, dict) and _safe_str(_cf.get("name") or "").strip().lower() == "market":
-                    _fub_market_raw = _safe_str(_cf.get("value") or "").strip()
-                    break
+            # Resolve market from the FUB deal's Market custom field.
+            # Verified against a live FUB record (deal 906, Sept 21 2026): FUB
+            # stores deal custom fields as TOP-LEVEL keys named "custom<Label>",
+            # e.g. "customMarket": "Maryland". It is NOT a customFields list.
+            # The webhook body may omit custom fields depending on the sender,
+            # so if the key is absent we fetch the full deal by id.
+            def _market_from(obj):
+                if not isinstance(obj, dict):
+                    return ""
+                v = obj.get("customMarket")
+                if v:
+                    return _safe_str(v).strip()
+                for _cf in (obj.get("customFields") or []):  # tolerate list form
+                    if isinstance(_cf, dict) and _safe_str(_cf.get("name") or "").strip().lower() in ("market", "custommarket"):
+                        return _safe_str(_cf.get("value") or "").strip()
+                return ""
+            _fub_market_raw = _market_from(data)
+            _market_source = "webhook" if _fub_market_raw else ""
+            if not _fub_market_raw and fub_deal_id:
+                try:
+                    _full = await fub_get(f"/deals/{fub_deal_id}")
+                    _fub_market_raw = _market_from(_full)
+                    _market_source = "fub_api" if _fub_market_raw else ""
+                except Exception as _e:
+                    logger.warning("FUB deal %s fetch for market failed: %s", fub_deal_id, _e)
             _market_map = {
                 "virginia": "VA", "va": "VA", "northern virginia": "VA", "nova": "VA",
                 "maryland": "MD", "md": "MD",
@@ -753,7 +767,7 @@ async def fub_deal_engaged(request: Request):
                     _market = "MD"
                 else:
                     _market = "DC"  # last resort
-            logger.info("FUB market field raw=%r normalised=%r address=%r", _fub_market_raw, _market, address)
+            logger.info("FUB market raw=%r source=%r normalised=%r deal=%r address=%r", _fub_market_raw, _market_source or "fallback", _market, fub_deal_id, address)
             result = supabase.table("properties").insert({
                 "address":     address,
                 "agent_name":  os_agent,
