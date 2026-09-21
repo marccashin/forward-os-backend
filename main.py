@@ -2375,42 +2375,24 @@ class MarketReportLinksRequest(BaseModel):
 
 @app.post("/market-reports/update")
 async def update_market_report_links(payload: MarketReportLinksRequest):
-    """Called by the scheduled task after uploading PDFs to Drive.
-    Writes the new Drive links into property_notes so FORWARD OS picks them up."""
-    links = {
-        "dc":          payload.dc,
-        "nova":        payload.nova,
-        "montgomery":  payload.montgomery,
-        "loudoun":     payload.loudoun,
-        "countryside": payload.countryside,
-    }
-    content = json.dumps(links)
-
-    # Delete existing record
-    supabase.table("property_notes").delete().eq("property_id", "__market_reports__").eq("subfolder", "links").execute()
-
-    # Insert fresh record
-    supabase.table("property_notes").insert({
-        "property_id": "__market_reports__",
-        "subfolder":   "links",
-        "content":     content,
-        "updated_by":  "scheduled-task"
-    }).execute()
-
+    """Legacy: called by the old scheduled market-stats task after uploading PDFs.
+    Used to write property_notes with property_id "__market_reports__", which is
+    not a valid id for that table, so it failed every time and the OS never
+    received the links. Now writes os_settings, and only the regions it was
+    given: blank fields no longer erase links set by the monthly job or by hand."""
+    given = {k: v for k, v in {
+        "dc": payload.dc, "nova": payload.nova, "montgomery": payload.montgomery,
+        "loudoun": payload.loudoun, "countryside": payload.countryside}.items() if v}
+    links = dict(_mr.notes_read(supabase, _mr.LINKS_SUBFOLDER) or {})
+    links.update(given)
+    _mr.notes_write(supabase, _mr.LINKS_SUBFOLDER, links)
     return {"ok": True, "links": links}
 
 
 @app.get("/market-reports")
 async def get_market_report_links():
     """Returns the current market report Drive links."""
-    rows = supabase.table("property_notes").select("content").eq("property_id", "__market_reports__").eq("subfolder", "links").order("updated_at", desc=True).limit(1).execute()
-    if rows.data:
-        import json as _json
-        try:
-            return {"ok": True, "links": _json.loads(rows.data[0]["content"])}
-        except Exception:
-            pass
-    return {"ok": True, "links": {}}
+    return {"ok": True, "links": _mr.notes_read(supabase, _mr.LINKS_SUBFOLDER) or {}}
 
 
 # ── Property Management ──────────────────────────────────────────────────────

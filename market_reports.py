@@ -422,30 +422,24 @@ def drive_upload(drive, folder_id: str, name: str, data: bytes, mime: str) -> st
     return f.get("webViewLink") or ("https://drive.google.com/file/d/" + f["id"] + "/view")
 
 
+# Shared with the OS front end. These used to live in property_notes under a
+# placeholder property id, which that table's foreign key rejects, so no write
+# ever succeeded. os_settings holds one jsonb value per key.
+SETTINGS_KEYS = {LINKS_SUBFOLDER: "market_report_links", META_SUBFOLDER: "market_reports_meta"}
+
+
 def notes_read(supabase, subfolder: str) -> Optional[dict]:
-    r = (supabase.table("property_notes").select("id,content")
-         .eq("property_id", NOTE_PROPERTY_ID).eq("subfolder", subfolder)
-         .order("updated_at", desc=True).limit(1).execute())
-    if r.data and r.data[0].get("content"):
-        try:
-            return json.loads(r.data[0]["content"])
-        except Exception:
-            return None
-    return None
+    r = (supabase.table("os_settings").select("value")
+         .eq("key", SETTINGS_KEYS[subfolder]).limit(1).execute())
+    return r.data[0]["value"] if r.data else None
 
 
 def notes_write(supabase, subfolder: str, obj: dict) -> None:
-    """Insert the new row FIRST; only then delete older rows. A failed insert changes nothing."""
-    r = supabase.table("property_notes").insert({
-        "property_id": NOTE_PROPERTY_ID, "subfolder": subfolder,
-        "content": json.dumps(obj), "updated_by": "FORWARD OS (market reports)"}).execute()
-    new_id = r.data[0].get("id") if r.data else None
-    if new_id:
-        try:
-            (supabase.table("property_notes").delete()
-             .eq("property_id", NOTE_PROPERTY_ID).eq("subfolder", subfolder).neq("id", new_id).execute())
-        except Exception:
-            pass
+    """One atomic upsert. A failed write leaves the stored value exactly as it was."""
+    supabase.table("os_settings").upsert({
+        "key": SETTINGS_KEYS[subfolder], "value": obj,
+        "updated_by": "FORWARD OS (market reports)",
+        "updated_at": datetime.now(timezone.utc).isoformat()}, on_conflict="key").execute()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
