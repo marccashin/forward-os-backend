@@ -38,6 +38,7 @@ from jose import jwt, JWTError
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+import market_reports as _mr
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -559,19 +560,19 @@ async def _get_next_task(person_id: str) -> tuple[str, Optional[str]]:
 async def _check_drive_automations():
     now = datetime.now(timezone.utc)
 
-    # Check Market Stats (fires Wednesdays — flag if >8 days without update)
-    if MARKET_STATS_FOLDER_ID:
-        last_mod = get_folder_last_modified(MARKET_STATS_FOLDER_ID)
-        if last_mod:
-            days_old = (now - last_mod).days
-            status   = "ok" if days_old <= 8 else "late"
-        else:
-            status = "late"
-
+    # Market Stats: monthly FORWARD reports generated from McEnearney's StatPak
+    # (market_reports.py). Health comes from the run record, not folder mtime:
+    # the old ">8 days" check assumed a weekly cadence and could not tell a stale
+    # month from a fresh one. The row keeps its historical name.
+    try:
+        _meta = _mr.notes_read(supabase, _mr.META_SUBFOLDER)
+        _st, _detail = _mr.health_from_meta(_meta, now)
         supabase.table("automation_health").update({
-            "last_run": last_mod.isoformat() if last_mod else None,
-            "status":   status
+            "last_run": (_meta or {}).get("generated_at"),
+            "status":   _st,
         }).eq("automation_name", "Weekly Market Stats Post").execute()
+    except Exception as e:
+        logger.error("[market-reports] health update failed: %s", e)
 
     # Check CFO Report (fires 1st of month — look for file modified this month)
     if CFO_REPORTS_FOLDER_ID:
@@ -3322,6 +3323,15 @@ async def _run_os_audit() -> dict:
                             "detail": f"{len(errored)} automation(s) in error state: {names}"})
     except Exception as e:
         checks.append({"name": "automation_health errors", "status": "FAIL", "detail": str(e)})
+    # Market reports freshness (monthly, from McEnearney StatPak). A FAIL here is
+    # emailed by the existing nightly audit job.
+    try:
+        _st, _detail = _mr.health_from_meta(_mr.notes_read(supabase, _mr.META_SUBFOLDER), now_utc)
+        checks.append({"name": "FORWARD market reports",
+                       "status": {"ok": "PASS", "late": "WARN"}.get(_st, "FAIL"),
+                       "detail": _detail})
+    except Exception as e:
+        checks.append({"name": "FORWARD market reports", "status": "FAIL", "detail": str(e)})
     fails  = [c for c in checks if c["status"] == "FAIL"]
     warns  = [c for c in checks if c["status"] == "WARN"]
     passes = [c for c in checks if c["status"] == "PASS"]
@@ -3979,3 +3989,101 @@ async def trigger_audit(system: str = "os", background_tasks: BackgroundTasks = 
         "message": f"{system.upper()} audit running — email will arrive in about 60 seconds",
     }
 
+
+
+# ---------------------------------------------------------------------------
+# FORWARD monthly market reports (see market_reports.py for the accuracy rules)
+# ---------------------------------------------------------------------------
+MARKET_REPORTS_ADMIN_KEY = os.environ.get("MARKET_REPORTS_ADMIN_KEY", "")
+
+
+async def _mr_fetch_text(url: str) -> str:
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True,
+                                 headers={"User-Agent": "FORWARD-OS/1.0 (market reports)"}) as c:
+        r = await c.get(url)
+        r.raise_for_status()
+        return r.text
+
+
+async def _mr_http_post(url: str, headers: dict, body: dict) -> dict:
+    async with httpx.AsyncClient(timeout=90) as c:
+        r = await c.post(url, headers=headers, json=body)
+        r.raise_for_status()
+        return r.json()
+
+
+async def _mr_run(force: bool = False, dry_run: bool = False) -> dict:
+    return await _mr.run(
+        fetch_text=_mr_fetch_text, http_post=_mr_http_post, supabase=supabase,
+        drive_factory=get_drive_service_write, folder_id=MARKET_STATS_FOLDER_ID,
+        # Preview never calls Claude: it shows the verified numbers and the
+        # template wording, at no cost.
+        api_key="" if dry_run else ANTHROPIC_API_KEY,
+        logger=logger, force=force, dry_run=dry_run)
+
+
+async def job_market_reports():
+    """Daily check. Publishes only when McEnearney has posted a new month."""
+    try:
+        res = await _mr_run()
+        logger.info("[market-reports] %s", json.dumps({k: res.get(k) for k in ("skipped", "status", "statpak_month", "errors")}))
+    except Exception as e:
+        # Hub unreachable or its layout changed: record it so health checks see it.
+        logger.exception("[market-reports] run failed")
+        try:
+            _mr.notes_write(supabase, _mr.META_SUBFOLDER, {
+                "statpak_month": "", "status": "failed",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "regions": {}, "errors": {"_run": str(e)}, "source": _mr.HUB_URL})
+        except Exception:
+            logger.exception("[market-reports] could not record the failure")
+
+
+@app.on_event("startup")
+async def register_market_reports_job():
+    scheduler.add_job(job_market_reports,
+                      CronTrigger(hour=7, minute=20, timezone="America/New_York"),
+                      id="market_reports", replace_existing=True)
+    logger.info("[market-reports] daily 7:20am ET check registered")
+
+
+@app.get("/api/market-reports/status")
+async def market_reports_status():
+    meta = _mr.notes_read(supabase, _mr.META_SUBFOLDER)
+    st, detail = _mr.health_from_meta(meta)
+    return {"health": st, "detail": detail, "meta": meta}
+
+
+@app.get("/api/market-reports/preview")
+async def market_reports_preview():
+    """Read McEnearney's page and show what WOULD be published. Writes nothing."""
+    try:
+        return await _mr_run(dry_run=True)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/market-reports/drive-check")
+async def market_reports_drive_check():
+    """Can the service account write to the Market Stats folder? Creates and deletes a probe file."""
+    info = {}
+    try:
+        info["service_account"] = json.loads(GOOGLE_SA_JSON).get("client_email") if GOOGLE_SA_JSON else None
+    except Exception:
+        info["service_account"] = None
+    info["folder_id"] = MARKET_STATS_FOLDER_ID or None
+    try:
+        info.update(_mr.drive_probe(get_drive_service_write(), MARKET_STATS_FOLDER_ID))
+    except Exception as e:
+        info["can_write"] = False
+        info["error"] = str(e)
+    return info
+
+
+@app.post("/api/market-reports/run")
+async def market_reports_run(x_admin_key: Optional[str] = Header(None), force: bool = False):
+    if not MARKET_REPORTS_ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="Set MARKET_REPORTS_ADMIN_KEY in Railway to enable manual runs.")
+    if x_admin_key != MARKET_REPORTS_ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="Wrong admin key.")
+    return await _mr_run(force=force)
