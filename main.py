@@ -2138,6 +2138,37 @@ async def cma_parse_listings(files: list[UploadFile] = File(...)):
     return {"success": True, "results": results}
 
 
+# ── Offer Strategy Generator MLS readers ──────────────────────────────
+# Kept completely separate from the CMA builder's /api/cma/parse-listings
+# (Marc, Sept 21 2026). All logic, prompts and the model setting live in
+# osg_mls.py. These routes must not use CMA_PARSE_PROMPT, BMR_MODEL or
+# cma_parse_listings, and the CMA code must not use osg_mls.
+import osg_mls as _osg
+
+
+@app.post("/api/osg/parse-comps")
+async def osg_parse_comps(files: list[UploadFile] = File(...)):
+    """Offer Strategy Step 2 comp sheets. Per-file results, always HTTP 200."""
+    if not files:
+        raise HTTPException(status_code=400, detail="No files were uploaded.")
+    if len(files) > _osg.MAX_FILES:
+        raise HTTPException(status_code=400,
+                            detail=f"Too many files. Upload up to {_osg.MAX_FILES} at a time.")
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503,
+                            detail="Listing parsing is not configured on the server.")
+    return await _osg.parse_comps(files, ANTHROPIC_API_KEY)
+
+
+@app.post("/api/osg/parse-subject")
+async def osg_parse_subject(file: UploadFile = File(...)):
+    """Offer Strategy Step 1: the subject's own sheet, verified field by field."""
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503,
+                            detail="Listing parsing is not configured on the server.")
+    return await _osg.parse_subject(file, ANTHROPIC_API_KEY)
+
+
 class AnalyzeOffersRequest(BaseModel):
     offers: list[dict]
     property_address: str = ""
