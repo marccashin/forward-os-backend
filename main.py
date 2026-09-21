@@ -100,25 +100,52 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 # ---------------------------------------------------------------------------
 # Google Drive helper
 # ---------------------------------------------------------------------------
+# Drive credentials. Two sources, in order:
+#   1. GOOGLE_SERVICE_ACCOUNT_JSON (a service account), if set.
+#   2. GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN: the same
+#      OAuth login the OS front end already uses for every agent file save
+#      (netlify/functions/get-drive-token.js). Copy the three values from Netlify.
+# As of Sept 21 2026 NEITHER was set on Railway, so every Drive call here
+# (automation health checks included) was failing.
+GOOGLE_CLIENT_ID      = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET  = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REFRESH_TOKEN  = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+
+
+def drive_credential_mode() -> str:
+    if GOOGLE_SA_JSON:
+        return "service_account"
+    if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN:
+        return "oauth_refresh_token"
+    return "none"
+
+
+def _drive_creds(scope: str):
+    mode = drive_credential_mode()
+    if mode == "service_account":
+        return service_account.Credentials.from_service_account_info(
+            json.loads(GOOGLE_SA_JSON), scopes=[scope])
+    if mode == "oauth_refresh_token":
+        from google.oauth2.credentials import Credentials as _UserCreds
+        # No scopes passed: a refresh may only request what was originally
+        # granted, so let Google return the token's existing scopes.
+        return _UserCreds(None, refresh_token=GOOGLE_REFRESH_TOKEN,
+                          token_uri="https://oauth2.googleapis.com/token",
+                          client_id=GOOGLE_CLIENT_ID, client_secret=GOOGLE_CLIENT_SECRET)
+    raise RuntimeError("No Google Drive credentials on this server. Set GOOGLE_CLIENT_ID, "
+                       "GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN (copy them from Netlify), "
+                       "or GOOGLE_SERVICE_ACCOUNT_JSON.")
+
+
 def get_drive_service():
-    if not GOOGLE_SA_JSON:
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not set")
-    info = json.loads(GOOGLE_SA_JSON)
-    creds = service_account.Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/drive.readonly"]
-    )
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+    return build("drive", "v3", credentials=_drive_creds("https://www.googleapis.com/auth/drive.readonly"),
+                 cache_discovery=False)
 
 
 def get_drive_service_write():
     """Drive service with full write access (for uploads/deletes)."""
-    if not GOOGLE_SA_JSON:
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not set")
-    info = json.loads(GOOGLE_SA_JSON)
-    creds = service_account.Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/drive"]
-    )
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+    return build("drive", "v3", credentials=_drive_creds("https://www.googleapis.com/auth/drive"),
+                 cache_discovery=False)
 
 
 def get_folder_last_modified(folder_id: str) -> Optional[datetime]:
@@ -4066,14 +4093,21 @@ async def market_reports_preview():
 @app.get("/api/market-reports/drive-check")
 async def market_reports_drive_check():
     """Can the service account write to the Market Stats folder? Creates and deletes a probe file."""
-    info = {}
+    info = {"credential_mode": drive_credential_mode()}
     try:
         info["service_account"] = json.loads(GOOGLE_SA_JSON).get("client_email") if GOOGLE_SA_JSON else None
     except Exception:
         info["service_account"] = None
     info["folder_id"] = MARKET_STATS_FOLDER_ID or None
     try:
-        info.update(_mr.drive_probe(get_drive_service_write(), MARKET_STATS_FOLDER_ID))
+        drive = get_drive_service_write()
+        try:
+            info["google_account"] = drive.about().get(fields="user(emailAddress)").execute()["user"]["emailAddress"]
+        except Exception as e:
+            info["google_account_error"] = str(e)
+        if not MARKET_STATS_FOLDER_ID:
+            raise RuntimeError("MARKET_STATS_FOLDER_ID not set")
+        info.update(_mr.drive_probe(drive, MARKET_STATS_FOLDER_ID))
     except Exception as e:
         info["can_write"] = False
         info["error"] = str(e)
