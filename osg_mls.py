@@ -1,25 +1,38 @@
-"""Offer Strategy Generator: read the SUBJECT property's own MLS sheet.
+"""Offer Strategy Generator: every MLS sheet reader it uses.
 
-The comp importer (/api/cma/parse-listings) answers "what did similar homes
-sell for". This module answers a different question: "what does the listing
-sheet for the house we are writing an offer on tell us". Original price and
-reductions, DOM against CDOM, sale type, possession, financing limits in the
-remarks, a seller credit already on offer, private sewer or well, the tax
-assessment. Those move an offer strategy, and the agent should not have to
-retype them.
+SEPARATION RULE (Marc, Sept 21 2026): the Offer Strategy Generator and the CMA
+builder must stay completely separate, so a change to one can never change
+the other. This module is the Offer Strategy side and owns everything it
+needs: its own model setting, its own prompts, its own PDF reading and its
+own Claude call. It does not import main.py and main.py's CMA code does not
+import it. Do not "de-duplicate" this against the CMA reader.
 
-Two rules carried over from the CMA reader and the market reports module:
+Two readers live here:
 
-1. Claude reads, code verifies. Every figure and every quoted remark Claude
-   returns is checked against the PDF text. Anything that is not printed on
-   the sheet is blanked and reported, never passed on.
-2. Some of what a Bright Agent Full sheet prints must never reach a strategy:
-   lockbox type and location, showing service phone numbers, agent emails,
-   owner names, compensation. The prompt says so, and a deterministic scrub
-   enforces it, because a prompt instruction alone is not a guarantee.
+1. parse_comps: Step 2 comp sheets. OSG_COMP_PARSE_PROMPT started life as a
+   verbatim copy of main.CMA_PARSE_PROMPT on Sept 21 2026 (the two were
+   proven equal at the fork), so comps read exactly as they did the day
+   before. From here on they are free to diverge.
+2. parse_subject: the subject property's own sheet on Step 1. Claude reads,
+   code verifies (verify_subject). Lockbox, access codes, phones, emails,
+   owner names and compensation never leave the server.
 """
 
+import io
+import gc
+import json
+import logging
 import re
+
+import httpx
+
+# Owned by the Offer Strategy Generator. Changing BMR_MODEL in main.py (used
+# by the CMA reader and the Buyer Market Report) does not move this.
+OSG_MODEL = "claude-sonnet-4-5"
+MAX_BYTES = 20 * 1024 * 1024
+MLS_MARKERS = ("bright mls", "mls #", "mls#", "listing agrmnt", "agent full")
+
+OSG_COMP_PARSE_PROMPT = 'You are reading a real estate MLS report (usually a Bright MLS "Agent Full" export).\n\nIMPORTANT: One PDF often contains SEVERAL properties, one after another. Each new property begins with a header line holding an address, a status word, and a price. Find EVERY property in the document and return one entry for each. Do not stop after the first.\n\nExtract ONLY facts printed on the sheet. Never estimate, infer, or calculate a value that is not stated. If a field is absent, use an empty string "".\n\nReturn ONLY a valid JSON object of the form {"listings": [ ... ]}, where every element has exactly these keys:\n\n{\n  "status": "one of: active, pending, closed, off_market",\n  "status_raw": "the status word exactly as printed (Active, Under Contract, Closed, Canceled, Expired, Withdrawn, etc.)",\n  "mlsNumber": "MLS #",\n  "address": "street address only, no city/state/zip",\n  "city": "city name only",\n  "state": "2-letter state",\n  "zip": "5-digit zip",\n  "county": "county name if shown",\n  "propType": "one of: Single Family, Condo, Townhouse, Multi-Family, Land, Other",\n  "beds": "number of bedrooms, digits only",\n  "fullBaths": "number of full baths, digits only",\n  "halfBaths": "number of half baths, digits only",\n  "gla": "Above Grade Finished SQFT, digits only, no commas. This is the appraiser\'s gross living area. NEVER use Total SQFT or Tax Total Fin SQFT, which include below-grade space.",\n  "glaSource": "the label printed after the Above Grade Fin SQFT figure, exactly as shown: Assessor, Estimated, or blank",\n  "assessorGla": "the separate \'Assessor AbvGrd Fin SQFT\' figure if the sheet prints one, digits only",\n  "below": "Below Grade FINISHED SQFT, digits only. If the sheet gives only unfinished sqft, or gives a percentage instead of a number, leave this EMPTY and set flag below_grade_unclear.",\n  "lotSize": "lot size in SQUARE FEET, digits only. If given in acres, convert (1 acre = 43560 sqft).",\n  "yearBuilt": "4-digit year",\n  "garageSpaces": "number of GARAGE spaces, digits only. If the sheet says Garage: No, use 0. If total parking is listed as Unknown, leave EMPTY and set flag parking_unknown.",\n  "hoaMonthly": "HOA fee converted to a MONTHLY dollar amount, digits only",\n  "condoFee": "condo fee converted to a MONTHLY dollar amount, digits only",\n  "listPrice": "current or original list price, digits only",\n  "salePrice": "CLOSE/SOLD price, digits only. Only for closed sales. Empty otherwise.",\n  "soldDate": "close date as YYYY-MM-DD. Only for closed sales.",\n  "listDate": "listing entry date as YYYY-MM-DD",\n  "dom": "days on market, digits only",\n  "concessions": "the dollar figure from \'Total Amount Paid by Seller Towards Closing Costs\', digits only, no commas or dollar sign. Use 0 if that line prints $0.00. Leave EMPTY only if the line is absent from the sheet. IGNORE the yes/no \'Seller Concessions\' field entirely - it is often wrong. A sheet can say Seller Concessions: No and still show a dollar amount here; the dollar amount wins.",\n  "concessionsRaw": "the \'Seller Concessions\' yes/no field exactly as printed, for reference only",\n  "annualTax": "annual property tax amount, digits only",\n  "flags": {\n    "gla_needs_check": true/false,\n    "lot_estimated": true/false,\n    "parking_unknown": true/false,\n    "below_grade_unclear": true/false,\n    "price_is_list_not_sold": true/false\n  }\n}\n\nRules:\n- status: Active -> "active". Pending / Under Contract / Active Under Contract -> "pending". Closed / Sold -> "closed". Canceled / Expired / Withdrawn / Temporarily Off Market -> "off_market".\n- Set gla_needs_check true ONLY when the square footage is genuinely uncertain: the label reads "Estimated", OR the Above Grade Fin SQFT differs from the Assessor AbvGrd Fin SQFT printed on the same sheet. A plain "Assessor" label that matches is normal and must NOT be flagged.\n- Set lot_estimated true when the lot size is labelled "Estimated".\n- Set parking_unknown true when total parking spaces reads "Unknown".\n- Set price_is_list_not_sold true whenever salePrice is empty but listPrice is present.\n- Never output a condition, quality, or proximity rating. Those are the agent\'s call.\n- A closed sale\'s price is its Close Price, not its list price, and its soldDate is the Close Date.\n- Return one entry per property. A report holding 7 properties returns 7 entries.\n\nReturn ONLY the JSON object {"listings": [...]}. No explanation, no markdown, no code fences.'
 
 SUBJECT_PARSE_PROMPT = """You are reading the MLS listing sheet (usually a Bright MLS "Agent Full" export) for ONE property: the home a buyer is about to make an offer on.
 
@@ -354,3 +367,131 @@ def verify_subject(sub: dict, text: str) -> dict:
     clean["offerNotes"] = notes
 
     return {"subject": clean, "unverified": unverified, "dropped_notes": dropped}
+
+
+# ---------------------------------------------------------------------------
+# PDF reading and the Claude call (Offer Strategy only)
+# ---------------------------------------------------------------------------
+
+async def read_pdf(upload):
+    """Return (text, error). error is a plain-English reason or None."""
+    from pypdf import PdfReader
+    if upload.content_type not in ("application/pdf", "application/octet-stream"):
+        return "", "Not a PDF file."
+    pdf_bytes = await upload.read()
+    if len(pdf_bytes) > MAX_BYTES:
+        return "", "PDF is larger than 20 MB."
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        text = "\n".join(p.extract_text() or "" for p in reader.pages)
+    except Exception:
+        text = ""
+    finally:
+        del pdf_bytes
+        gc.collect()
+    if len(text.strip()) < 200:
+        return "", ("This PDF looks like a scan and has no readable text. "
+                    "Print the MLS sheet to PDF again, or enter it by hand.")
+    if not any(m in text.lower() for m in MLS_MARKERS):
+        return "", ("This does not look like an MLS listing report, so nothing "
+                    "was imported. Export the sheet from Bright MLS and try again.")
+    return text, None
+
+
+async def ask_claude(api_key: str, content: str, max_tokens: int, temperature=None):
+    payload = {"model": OSG_MODEL, "max_tokens": max_tokens,
+               "messages": [{"role": "user", "content": content}]}
+    if temperature is not None:
+        payload["temperature"] = temperature
+    headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
+               "content-type": "application/json"}
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post("https://api.anthropic.com/v1/messages",
+                                 headers=headers, json=payload)
+        resp.raise_for_status()
+    raw = resp.json()["content"][0]["text"].strip()
+    raw = re.sub(r"^```(?:json)?\n?", "", raw)
+    raw = re.sub(r"\n?```$", "", raw)
+    return json.loads(raw)
+
+
+# ---------------------------------------------------------------------------
+# Step 2: comp sheets. Same response shape the page already expects.
+# ---------------------------------------------------------------------------
+
+MAX_FILES = 12
+MAX_LISTINGS_PER_FILE = 30
+
+
+async def parse_comps(files, api_key: str) -> dict:
+    results = []
+    for f in files:
+        name = f.filename or "listing.pdf"
+        try:
+            text, err = await read_pdf(f)
+            if err:
+                results.append({"file": name, "ok": False, "error": err})
+                continue
+            data = await ask_claude(
+                api_key, f"MLS LISTING SHEET:\n\n{text}\n\n---\n\n{OSG_COMP_PARSE_PROMPT}", 16000)
+            del text
+            if isinstance(data, dict) and isinstance(data.get("listings"), list):
+                listings = data["listings"]
+            elif isinstance(data, dict):
+                listings = [data]
+            elif isinstance(data, list):
+                listings = data
+            else:
+                raise ValueError("unexpected shape")
+            if not listings:
+                results.append({"file": name, "ok": False,
+                                "error": "No properties were found in this sheet."})
+                continue
+            for item in listings[:MAX_LISTINGS_PER_FILE]:
+                if not isinstance(item, dict):
+                    continue
+                item.setdefault("flags", {})
+                item["file"] = name
+                item["ok"] = True
+                results.append(item)
+        except Exception:
+            logging.exception("osg parse_comps failed for %s", name)
+            results.append({"file": name, "ok": False,
+                            "error": "Could not read this sheet. Try re-downloading it from the MLS."})
+    return {"success": True, "results": results}
+
+
+# ---------------------------------------------------------------------------
+# Step 1: the subject property's own sheet
+# ---------------------------------------------------------------------------
+
+async def parse_subject(upload, api_key: str) -> dict:
+    name = upload.filename or "listing.pdf"
+
+    def fail(msg):
+        return {"success": True, "ok": False, "file": name, "error": msg}
+
+    try:
+        text, err = await read_pdf(upload)
+        if err:
+            return fail(err)
+        data = await ask_claude(
+            api_key, f"MLS LISTING SHEET:\n\n{text}\n\n---\n\n{SUBJECT_PARSE_PROMPT}", 4000, 0)
+        if not isinstance(data, dict):
+            raise ValueError("unexpected shape")
+        found = count_properties(text, data.get("propertiesFound"))
+        if found > 1:
+            return fail(f"This PDF holds {found} properties. Drop the sheet for the home "
+                        "you are writing the offer on here. Comps go in Step 2.")
+        checked = verify_subject(data.get("subject") or {}, text)
+        if not checked["subject"].get("address"):
+            return fail("Could not find the property address on this sheet, so nothing "
+                        "was filled in. Type the details in, or re-export the sheet.")
+        if checked["unverified"] or checked["dropped_notes"]:
+            logging.info("osg parse_subject %s: blanked %s, dropped %d notes",
+                         name, checked["unverified"], checked["dropped_notes"])
+        return {"success": True, "ok": True, "file": name,
+                "properties_found": found, **checked}
+    except Exception:
+        logging.exception("osg parse_subject failed for %s", name)
+        return fail("Could not read this sheet. Try re-downloading it from the MLS.")

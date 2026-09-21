@@ -2138,100 +2138,35 @@ async def cma_parse_listings(files: list[UploadFile] = File(...)):
     return {"success": True, "results": results}
 
 
-@app.post("/api/osg/parse-subject")
-async def osg_parse_subject(file: UploadFile = File(...)):
-    """Read the SUBJECT property's own MLS sheet for the Offer Strategy Generator.
+# ── Offer Strategy Generator MLS readers ──────────────────────────────
+# Kept completely separate from the CMA builder's /api/cma/parse-listings
+# (Marc, Sept 21 2026). All logic, prompts and the model setting live in
+# osg_mls.py. These routes must not use CMA_PARSE_PROMPT, BMR_MODEL or
+# cma_parse_listings, and the CMA code must not use osg_mls.
+import osg_mls as _osg
 
-    Separate from /api/cma/parse-listings on purpose: that endpoint and its
-    prompt are shared with the CMA builder and stay untouched. This one reads
-    one property and pulls the facts that move an offer (price history, DOM
-    vs CDOM, sale type, possession, remarks about financing, credits and
-    deadlines). Every value is verified against the PDF text in
-    osg_subject.verify_subject before it is returned.
 
-    Always HTTP 200 with ok true/false, like the comp importer, so the page
-    can show a plain-English reason instead of a network error.
-    """
-    import gc
-    import osg_subject as _osg
-    from pypdf import PdfReader
-
-    MAX_BYTES = 20 * 1024 * 1024
-    MLS_MARKERS = ("bright mls", "mls #", "mls#", "listing agrmnt", "agent full")
-    name = file.filename or "listing.pdf"
-
+@app.post("/api/osg/parse-comps")
+async def osg_parse_comps(files: list[UploadFile] = File(...)):
+    """Offer Strategy Step 2 comp sheets. Per-file results, always HTTP 200."""
+    if not files:
+        raise HTTPException(status_code=400, detail="No files were uploaded.")
+    if len(files) > _osg.MAX_FILES:
+        raise HTTPException(status_code=400,
+                            detail=f"Too many files. Upload up to {_osg.MAX_FILES} at a time.")
     if not ANTHROPIC_API_KEY:
         raise HTTPException(status_code=503,
                             detail="Listing parsing is not configured on the server.")
+    return await _osg.parse_comps(files, ANTHROPIC_API_KEY)
 
-    def fail(msg: str) -> dict:
-        return {"success": True, "ok": False, "file": name, "error": msg}
 
-    try:
-        if file.content_type not in ("application/pdf", "application/octet-stream"):
-            return fail("Not a PDF file.")
-        pdf_bytes = await file.read()
-        if len(pdf_bytes) > MAX_BYTES:
-            return fail("PDF is larger than 20 MB.")
-        try:
-            reader = PdfReader(io.BytesIO(pdf_bytes))
-            pdf_text = "\n".join(p.extract_text() or "" for p in reader.pages)
-        except Exception:
-            pdf_text = ""
-        finally:
-            del pdf_bytes
-            gc.collect()
-
-        if len(pdf_text.strip()) < 200:
-            return fail("This PDF looks like a scan and has no readable text. "
-                        "Print the MLS sheet to PDF again, or type the details in.")
-        if not any(m in pdf_text.lower() for m in MLS_MARKERS):
-            return fail("This does not look like an MLS listing sheet, so nothing was "
-                        "filled in. Export the listing from Bright MLS and try again.")
-
-        payload = {
-            "model": BMR_MODEL,
-            "max_tokens": 4000,
-            "temperature": 0,
-            "messages": [{
-                "role": "user",
-                "content": f"MLS LISTING SHEET:\n\n{pdf_text}\n\n---\n\n{_osg.SUBJECT_PARSE_PROMPT}",
-            }],
-        }
-        headers = {
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post("https://api.anthropic.com/v1/messages",
-                                     headers=headers, json=payload)
-            resp.raise_for_status()
-        raw = resp.json()["content"][0]["text"].strip()
-        raw = re.sub(r"^```(?:json)?\n?", "", raw)
-        raw = re.sub(r"\n?```$", "", raw)
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            raise ValueError("unexpected shape")
-
-        found = _osg.count_properties(pdf_text, data.get("propertiesFound"))
-        if found > 1:
-            return fail(f"This PDF holds {found} properties. Drop the sheet for the home "
-                        "you are writing the offer on here. Comps go in Step 2.")
-
-        checked = _osg.verify_subject(data.get("subject") or {}, pdf_text)
-        if not checked["subject"].get("address"):
-            return fail("Could not find the property address on this sheet, so nothing "
-                        "was filled in. Type the details in, or re-export the sheet.")
-        if checked["unverified"] or checked["dropped_notes"]:
-            logging.info("osg_parse_subject %s: blanked %s, dropped %d notes",
-                         name, checked["unverified"], checked["dropped_notes"])
-        return {"success": True, "ok": True, "file": name,
-                "properties_found": found, **checked}
-
-    except Exception:
-        logging.exception("osg_parse_subject failed for %s", name)
-        return fail("Could not read this sheet. Try re-downloading it from the MLS.")
+@app.post("/api/osg/parse-subject")
+async def osg_parse_subject(file: UploadFile = File(...)):
+    """Offer Strategy Step 1: the subject's own sheet, verified field by field."""
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503,
+                            detail="Listing parsing is not configured on the server.")
+    return await _osg.parse_subject(file, ANTHROPIC_API_KEY)
 
 
 class AnalyzeOffersRequest(BaseModel):
