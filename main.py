@@ -2719,6 +2719,115 @@ async def get_buyers(agent_name: str = None):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Fetch buyers failed: {e}")
 
+# ---------------------------------------------------------------------------
+# Open an OS buyer card from a FUB deal number (target of the Command Center's
+# "View buyer profile in OS" link, forward-os/?fub=<deal id>).
+#
+# The Command Center and the OS keep separate buyer lists (Sept 27 2026); the
+# FUB deal number is the only thing both know. OS buyer cards are created at
+# Buyer Engaged by an outside automation that does not record the deal id, so
+# the first lookup matches on the FUB deal itself (deal name or person name,
+# plus agent) and then stamps subfolder_drive_ids._fub_deal_id on the OS card,
+# the same key the Buyer Engaged webhook's duplicate guard already reads. The
+# top-level fub_deal_id column is left alone: it holds legacy Command Center ids.
+# Archived cards are never returned. Ambiguity is reported, never guessed.
+# ---------------------------------------------------------------------------
+def _fub_name_tokens(name: str) -> list[str]:
+    toks = re.split(r"[^a-z]+", (name or "").lower().replace("&", " "))
+    return [t for t in toks if t and t != "and"]
+
+
+def _buyer_agents(b: dict) -> set[str]:
+    agents = {AGENT_NAME_MAP.get(b.get("agent_name") or "", b.get("agent_name") or "")}
+    agents.update((b.get("subfolder_drive_ids") or {}).get("_co_agents", []) or [])
+    return agents
+
+
+def _match_buyers_for_fub_deal(rows: list[dict], deal_id: str, deal: dict | None) -> tuple[list[dict], str]:
+    """Return (candidates, how). Pure: no I/O, so it can be tested directly."""
+    live = [b for b in rows if b.get("archived") is not True]
+
+    stamped = [b for b in live if str(((b.get("subfolder_drive_ids") or {}).get("_fub_deal_id")) or "") == deal_id]
+    if stamped:
+        return stamped, "stamped"
+    legacy = [b for b in live if str(b.get("fub_deal_id") or "") == deal_id]
+    if legacy:
+        return legacy, "fub_deal_id"
+    if not deal:
+        return [], "no_deal"
+
+    names = [deal.get("name") or ""] + [p.get("name") or "" for p in (deal.get("people") or []) if isinstance(p, dict)]
+    names = [n for n in names if _fub_name_tokens(n)]
+    agent = ""
+    for u in deal.get("users") or []:
+        if isinstance(u, dict) and u.get("name"):
+            agent = AGENT_NAME_MAP.get(u["name"], u["name"])
+            break
+
+    def by_agent(cands):
+        if not agent:
+            return cands
+        mine = [b for b in cands if agent in _buyer_agents(b)]
+        return mine
+
+    wanted = {" ".join(_fub_name_tokens(n)) for n in names}
+    exact = by_agent([b for b in live if " ".join(_fub_name_tokens(b.get("buyer_name") or "")) in wanted])
+    if exact:
+        return exact, "name"
+
+    def loose_hit(b):
+        bt = _fub_name_tokens(b.get("buyer_name") or "")
+        if not bt:
+            return False
+        for n in names:
+            nt = _fub_name_tokens(n)
+            if nt[0] == bt[0] and nt[-1] == bt[-1]:
+                return True
+        return False
+    loose = by_agent([b for b in live if loose_hit(b)])
+    return loose, ("loose_name" if loose else "none")
+
+
+@app.get("/buyers/by-fub/{deal_id}")
+async def get_buyer_by_fub_deal(deal_id: str):
+    deal_id = (deal_id or "").strip()
+    if not deal_id.isdigit():
+        raise HTTPException(status_code=400, detail="FUB deal number must be digits only.")
+    try:
+        rows = supabase.table("buyers").select("*").execute().data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Buyer lookup failed: {e}")
+
+    cands, how = _match_buyers_for_fub_deal(rows, deal_id, None)
+    deal = None
+    if not cands:
+        try:
+            deal = await fub_get(f"/deals/{deal_id}")
+        except Exception as e:
+            logger.warning("by-fub: FUB deal %s fetch failed: %s", deal_id, e)
+            raise HTTPException(status_code=404, detail=f"Follow Up Boss has no deal {deal_id}, so there is no buyer card to open.")
+        cands, how = _match_buyers_for_fub_deal(rows, deal_id, deal)
+
+    label = (deal or {}).get("name") or f"FUB deal {deal_id}"
+    if not cands:
+        raise HTTPException(status_code=404, detail=f"No FORWARD OS buyer card matches {label}. It may be archived, or named differently in the OS.")
+    if len(cands) > 1:
+        who = "; ".join(f"{b.get('buyer_name')} ({b.get('agent_name')})" for b in cands[:5])
+        raise HTTPException(status_code=409, detail=f"More than one OS buyer card could be {label}: {who}. Open it from the Buyers list instead.")
+
+    buyer = cands[0]
+    if how in ("name", "loose_name", "fub_deal_id"):
+        sdi = dict(buyer.get("subfolder_drive_ids") or {})
+        if not sdi.get("_fub_deal_id"):
+            sdi["_fub_deal_id"] = deal_id
+            try:
+                supabase.table("buyers").update({"subfolder_drive_ids": sdi}).eq("id", buyer["id"]).execute()
+                buyer["subfolder_drive_ids"] = sdi
+            except Exception as e:
+                logger.warning("by-fub: could not stamp deal %s on buyer %s: %s", deal_id, buyer["id"], e)
+    logger.info("by-fub: deal %s -> buyer %s (%s) via %s", deal_id, buyer["id"], buyer.get("buyer_name"), how)
+    return {"buyer": buyer, "matched_by": how}
+
 class UpdateBuyerRequest(BaseModel):
     fields: dict
 
