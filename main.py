@@ -206,6 +206,97 @@ async def fub_get(path: str, params: dict | None = None) -> Any:
             raise ValueError(f"FUB returned unexpected type {type(data).__name__}: {str(data)[:200]}")
         return data
 
+def _fub_norm_name(v) -> str:
+    """Compare deal names loosely: case, repeated spaces and periods ignored."""
+    return " ".join(_safe_str(v).lower().replace(".", "").split())
+
+
+def _fub_market_field(obj) -> str:
+    """FUB stores deal custom fields as top-level keys named custom<Label>
+    (verified on live deals 906, 909, 911): the market is "customMarket".
+    A customFields list is tolerated in case a sender reshapes it."""
+    if not isinstance(obj, dict):
+        return ""
+    v = obj.get("customMarket")
+    if v:
+        return _safe_str(v).strip()
+    for _cf in (obj.get("customFields") or []):
+        if isinstance(_cf, dict) and _safe_str(_cf.get("name") or "").strip().lower() in ("market", "custommarket"):
+            return _safe_str(_cf.get("value") or "").strip()
+    return ""
+
+
+async def _fub_seller_market(data: dict, deal_name: str, fub_agent_name: str, fub_deal_id: str) -> tuple[str, str, str]:
+    """Find the FUB Market for a seller deal, whatever shape the sender used.
+
+    FUB does not call this endpoint directly: FUB deal webhooks go to Zapier Zaps
+    (FUB /v1/webhooks, Sept 29), and the Zap's POST decides which fields arrive.
+    Every seller since Sept 21 landed as DC because neither customMarket nor a
+    usable deal id reached us, and the address fallback then saw a person's name.
+
+    Order:
+      1. customMarket in the webhook body            -> source "webhook"
+      2. GET /deals/{id}, only if that deal's name matches the webhook's name
+         (a wrong id, e.g. a person id, must not borrow another deal's market)
+                                                     -> source "fub_api"
+      3. Look the deal up: Sellers pipeline, the stage named in the webhook
+         (Seller Engaged), same name, same assigned agent. Used only when every
+         match agrees on one market; ambiguous matches decide nothing.
+                                                     -> source "fub_lookup"
+    Returns (raw_market, source, deal_id_used). Empty raw_market = not found.
+    """
+    raw = _fub_market_field(data)
+    if raw:
+        return raw, "webhook", fub_deal_id
+    want = _fub_norm_name(deal_name)
+    if fub_deal_id:
+        try:
+            full = await fub_get(f"/deals/{fub_deal_id}")
+            if _fub_norm_name(full.get("name")) == want:
+                raw = _fub_market_field(full)
+                if raw:
+                    return raw, "fub_api", fub_deal_id
+            else:
+                logger.warning("FUB deal %s name %r does not match webhook name %r; not using its market",
+                               fub_deal_id, full.get("name"), deal_name)
+        except Exception as _e:
+            logger.warning("FUB deal %s fetch for market failed: %s", fub_deal_id, _e)
+    if not want:
+        return "", "", ""
+    try:
+        pipes = (await fub_get("/pipelines")).get("pipelines") or []
+        stage_name = _safe_str(data.get("stageName") or "Seller Engaged").strip().lower()
+        pipe_id = stage_id = None
+        for pl in pipes:
+            if _safe_str(pl.get("name")).strip().lower() == "sellers":
+                pipe_id = pl.get("id")
+                for st in (pl.get("stages") or []):
+                    if _safe_str(st.get("name")).strip().lower() == stage_name:
+                        stage_id = st.get("id")
+        if pipe_id is None or stage_id is None:
+            logger.warning("FUB lookup: Sellers pipeline or stage %r not found", stage_name)
+            return "", "", ""
+        deals = (await fub_get("/deals", {"pipelineId": pipe_id, "stageId": stage_id,
+                                          "sort": "-id", "limit": 100})).get("deals") or []
+        agent_l = _safe_str(fub_agent_name).strip().lower()
+        hits = []
+        for d in deals:
+            if _fub_norm_name(d.get("name")) != want:
+                continue
+            users = [_safe_str(u.get("name")).strip().lower() for u in (d.get("users") or []) if isinstance(u, dict)]
+            if agent_l and users and agent_l not in users:
+                continue
+            hits.append(d)
+        markets = {_fub_market_field(d) for d in hits} - {""}
+        if len(markets) == 1:
+            return markets.pop(), "fub_lookup", ",".join(str(d.get("id")) for d in hits)
+        if hits:
+            logger.warning("FUB lookup for %r: %d matching deals, markets %r; not choosing",
+                           deal_name, len(hits), sorted(markets))
+    except Exception as _e:
+        logger.warning("FUB lookup for %r failed: %s", deal_name, _e)
+    return "", "", ""
+
 # ---------------------------------------------------------------------------
 # Auth middleware — verify Supabase JWT
 # ---------------------------------------------------------------------------
@@ -761,25 +852,10 @@ async def fub_deal_engaged(request: Request):
             # e.g. "customMarket": "Maryland". It is NOT a customFields list.
             # The webhook body may omit custom fields depending on the sender,
             # so if the key is absent we fetch the full deal by id.
-            def _market_from(obj):
-                if not isinstance(obj, dict):
-                    return ""
-                v = obj.get("customMarket")
-                if v:
-                    return _safe_str(v).strip()
-                for _cf in (obj.get("customFields") or []):  # tolerate list form
-                    if isinstance(_cf, dict) and _safe_str(_cf.get("name") or "").strip().lower() in ("market", "custommarket"):
-                        return _safe_str(_cf.get("value") or "").strip()
-                return ""
-            _fub_market_raw = _market_from(data)
-            _market_source = "webhook" if _fub_market_raw else ""
-            if not _fub_market_raw and fub_deal_id:
-                try:
-                    _full = await fub_get(f"/deals/{fub_deal_id}")
-                    _fub_market_raw = _market_from(_full)
-                    _market_source = "fub_api" if _fub_market_raw else ""
-                except Exception as _e:
-                    logger.warning("FUB deal %s fetch for market failed: %s", fub_deal_id, _e)
+            # Webhook body, then the deal by id, then a lookup by name + stage + agent.
+            # See _fub_seller_market for why the lookup exists (Zapier sits in between).
+            _fub_market_raw, _market_source, _market_deal = await _fub_seller_market(
+                data, address, fub_agent_name, fub_deal_id)
             _market_map = {
                 "virginia": "VA", "va": "VA", "northern virginia": "VA", "nova": "VA",
                 "maryland": "MD", "md": "MD",
@@ -798,7 +874,7 @@ async def fub_deal_engaged(request: Request):
                     _market = "MD"
                 else:
                     _market = "DC"  # last resort
-            logger.info("FUB market raw=%r source=%r normalised=%r deal=%r address=%r", _fub_market_raw, _market_source or "fallback", _market, fub_deal_id, address)
+            logger.info("FUB market raw=%r source=%r normalised=%r deal=%r matched=%r address=%r keys=%s", _fub_market_raw, _market_source or "fallback", _market, fub_deal_id, _market_deal, address, sorted(data.keys()) if isinstance(data, dict) else type(data).__name__)
             result = supabase.table("properties").insert({
                 "address":     address,
                 "agent_name":  os_agent,
