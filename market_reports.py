@@ -251,7 +251,10 @@ async def claude_narrative(label: str, m: dict, summary: str, statpak_month: str
         "- Use ONLY these facts. Do not add any other number, percentage, date or statistic.\n"
         "- Never use an em dash or en dash. Use periods and commas.\n"
         "- Never use: " + ", ".join(BANNED_WORDS) + ".\n"
-        "- No emoji.\n\n"
+        "- No emoji.\n"
+        "- Days on market here is the AVERAGE for homes that went UNDER CONTRACT, not closed "
+        "sales. Any sentence that states the days figure must say it is for homes that went "
+        "under contract.\n\n"
         "FACTS (verified):\n" + json.dumps(facts, indent=2) + "\n\n"
         "Source sentence for context:\n" + summary + "\n\n"
         "Return ONLY JSON with keys: insight (one sentence), trend (one or two sentences), "
@@ -275,6 +278,22 @@ async def claude_narrative(label: str, m: dict, summary: str, statpak_month: str
         return None
 
 
+def dom_label_problems(text: str, m: dict) -> list:
+    """McEnearney's days figure is an average for homes that went under contract
+    ("The average number of days on the market for homes receiving contracts was
+    71 days in August 2026", verified Sept 29). The buyer packet prints Bright's
+    MEDIAN for CLOSED sales (53 for DC). Side by side, an unlabelled "71 days on
+    market" reads as a contradiction, so every sentence stating a days figure must
+    name contracts. Failing that, the template (which does) is used instead."""
+    probs = []
+    figs = {x for x in (m.get("dom"), m.get("dom_prior")) if x}
+    for sent in re.split(r"(?<=[.!?])\s+|\n+", text or ""):
+        low = sent.lower()
+        if any(re.search(r"\b" + re.escape(f) + r"\s*days?\b", low) for f in figs) and "contract" not in low:
+            probs.append("days figure without 'contract': " + sent.strip()[:80])
+    return probs
+
+
 def allowed_numbers_for(m: dict, summary: str, statpak_month: str) -> set:
     nums = set(re.findall(r"\d+(?:\.\d+)?", _norm(summary)))
     nums |= set(re.findall(r"\d+(?:\.\d+)?", statpak_month))
@@ -286,6 +305,7 @@ async def build_narrative(label, m, summary, statpak_month, api_key, http_post) 
     c = await claude_narrative(label, m, summary, statpak_month, api_key, http_post)
     if c:
         probs = narrative_problems(c["insight"] + " " + c["trend"] + " " + c["caption"], allowed)
+        probs += dom_label_problems(c["insight"] + " " + c["trend"] + " " + c["caption"], m)
         if not probs:
             return c
         t = template_narrative(label, m, statpak_month)
@@ -304,9 +324,9 @@ def _e(s: str) -> str:
 def _kpis(m: dict) -> list:
     k = [(signed(m["contract_dir"], m["contract_pct"]), "Contract activity, " + m["data_month"] + " vs a year earlier"),
          (signed(m["ytd_dir"], m["ytd_pct"]), "Year-to-date contract activity"),
-         (m["dom"] + " days", "Average days on market, " + m["data_month"])]
+         (m["dom"] + " days", "Average days on market, homes that went under contract in " + m["data_month"])]
     if m.get("dom_prior") and m["dom_prior"] != m["dom"]:
-        k.append((m["dom_prior"] + " days", "Average days on market a year earlier"))
+        k.append((m["dom_prior"] + " days", "Same measure, a year earlier"))
     elif m.get("price_categories"):
         k.append((m["price_categories"].split(" in ")[0].capitalize(),
                   "Price categories: " + m["price_categories"]))
