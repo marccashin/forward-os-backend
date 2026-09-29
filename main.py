@@ -63,7 +63,10 @@ NETLIFY_ACCESS_TOKEN      = os.environ.get("NETLIFY_ACCESS_TOKEN", "")
 # taking this from the request body would let any caller drive our headless
 # browser to an arbitrary URL.
 CAMPAIGN_PRINT_ORIGIN     = os.environ.get("CAMPAIGN_PRINT_ORIGIN", "https://forward-os.netlify.app")
-BMR_MODEL                 = "claude-sonnet-4-5"
+# Default for everything. FAST is used only for the two high-volume
+# parsers, where an agent reviews every extracted row on screen anyway.
+BMR_MODEL                 = "claude-opus-5"
+BMR_MODEL_FAST            = "claude-sonnet-5"
 
 # ---------------------------------------------------------------------------
 # Agent name mapping: FUB display name → FORWARD OS canonical agent name
@@ -1465,7 +1468,7 @@ Respond ONLY with a JSON array with one object per property, in order. Example:
 ]"""
 
     headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    body = {"model": "claude-haiku-4-5-20251001", "max_tokens": 1024, "messages": [{"role": "user", "content": prompt}]}
+    body = {"model": BMR_MODEL_FAST, "max_tokens": 1024, "messages": [{"role": "user", "content": prompt}]}
     try:
         async with httpx.AsyncClient(timeout=90) as client:
             resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
@@ -2079,7 +2082,7 @@ async def cma_parse_listings(files: list[UploadFile] = File(...)):
                 continue
 
             payload = {
-                "model": BMR_MODEL,
+                "model": BMR_MODEL_FAST,
                 "max_tokens": 16000,
                 "messages": [{
                     "role": "user",
@@ -2938,7 +2941,7 @@ async def meeting_prep_research(payload: MeetingPrepResearchRequest):
         "content-type": "application/json"
     }
     body = {
-        "model": "claude-sonnet-4-6",
+        "model": BMR_MODEL,
         "max_tokens": 1500,
         "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
         "system": system,
