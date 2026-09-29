@@ -2045,6 +2045,7 @@ Return ONLY a valid JSON object of the form {"listings": [ ... ]}, where every e
   "lotSize": "lot size in SQUARE FEET, digits only. If given in acres, convert (1 acre = 43560 sqft).",
   "yearBuilt": "4-digit year",
   "garageSpaces": "number of GARAGE spaces, digits only. If the sheet says Garage: No, use 0. If total parking is listed as Unknown, leave EMPTY and set flag parking_unknown.",
+  "drivewaySpaces": "the number printed on the 'Driveway - # of Spaces' line in the Parking section, digits only. If the Parking section has no Driveway line AND its Features do not mention Driveway or Off Street, use 0. If the Features mention Driveway or Off Street but no 'Driveway - # of Spaces' line is printed, leave EMPTY and set flag driveway_count_unknown. Never count garage or carport spaces here.",
   "hoaMonthly": "HOA fee converted to a MONTHLY dollar amount, digits only",
   "condoFee": "condo fee converted to a MONTHLY dollar amount, digits only",
   "listPrice": "current or original list price, digits only",
@@ -2059,6 +2060,7 @@ Return ONLY a valid JSON object of the form {"listings": [ ... ]}, where every e
     "gla_needs_check": true/false,
     "lot_estimated": true/false,
     "parking_unknown": true/false,
+    "driveway_count_unknown": true/false,
     "below_grade_unclear": true/false,
     "price_is_list_not_sold": true/false
   }
@@ -2069,6 +2071,7 @@ Rules:
 - Set gla_needs_check true ONLY when the square footage is genuinely uncertain: the label reads "Estimated", OR the Above Grade Fin SQFT differs from the Assessor AbvGrd Fin SQFT printed on the same sheet. A plain "Assessor" label that matches is normal and must NOT be flagged.
 - Set lot_estimated true when the lot size is labelled "Estimated".
 - Set parking_unknown true when total parking spaces reads "Unknown".
+- Set driveway_count_unknown true when the Parking features mention Driveway or Off Street but no "Driveway - # of Spaces" count is printed.
 - Set price_is_list_not_sold true whenever salePrice is empty but listPrice is present.
 - Never output a condition, quality, or proximity rating. Those are the agent's call.
 - A closed sale's price is its Close Price, not its list price, and its soldDate is the Close Date.
