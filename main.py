@@ -39,6 +39,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import market_reports as _mr
+from claude_reply import claude_text
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -1009,7 +1010,7 @@ Rules: include ALL comps shown (up to 12); sale_price empty if not sold; ls_rati
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
         resp.raise_for_status()
-    text = resp.json()["content"][0]["text"].strip()
+    text = claude_text(resp.json()).strip()
     text = re.sub(r"^```(?:json)?\s*", "", text); text = re.sub(r"\s*```$", "", text)
     try:
         analysis = BuyerReportAnalysis(**json.loads(text))
@@ -1549,7 +1550,7 @@ Respond ONLY with a JSON array with one object per property, in order. Example:
         async with httpx.AsyncClient(timeout=90) as client:
             resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
             resp.raise_for_status()
-            raw = resp.json()["content"][0]["text"].strip()
+            raw = claude_text(resp.json()).strip()
             logger.info("comparison claude raw: %s", raw[:300])
             # Extract JSON array
             m = re.search(r'\[.*\]', raw, re.DOTALL)
@@ -1814,7 +1815,7 @@ Return ONLY this JSON (no markdown):
         resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
         resp.raise_for_status()
 
-    text = resp.json()["content"][0]["text"].strip()
+    text = claude_text(resp.json()).strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
     try:
@@ -1998,7 +1999,7 @@ Return ONLY the JSON object. No explanation, no markdown, no code fences."""
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
             resp.raise_for_status()
-        raw = resp.json()["content"][0]["text"].strip()
+        raw = claude_text(resp.json()).strip()
     finally:
         del payload
         gc.collect()
@@ -2178,7 +2179,7 @@ async def cma_parse_listings(files: list[UploadFile] = File(...)):
                         headers=headers, json=payload,
                     )
                     resp.raise_for_status()
-                raw = resp.json()["content"][0]["text"].strip()
+                raw = claude_text(resp.json()).strip()
             finally:
                 del payload
                 gc.collect()
@@ -2214,7 +2215,9 @@ async def cma_parse_listings(files: list[UploadFile] = File(...)):
             logging.exception("cma_parse_listings failed for %s", name)
             results.append({
                 "file": name, "ok": False,
-                "error": "Could not read this sheet. Try re-downloading it from the MLS.",
+                "error": "FORWARD OS could not finish reading this sheet. The problem is on our "
+                         "side, not with your PDF. Try again in a minute, and tell Operations "
+                         "if it keeps happening.",
             })
 
     return {"success": True, "results": results}
@@ -2353,7 +2356,7 @@ Rules:
         resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
         resp.raise_for_status()
 
-    raw = resp.json()["content"][0]["text"].strip()
+    raw = claude_text(resp.json()).strip()
 
     # Parse into structured sections so frontend renders reliably
     def _parse_sections(txt):
@@ -2474,7 +2477,7 @@ Answer the agent's follow-up questions directly and specifically. Use actual num
         resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
         resp.raise_for_status()
 
-    return {"answer": resp.json()["content"][0]["text"].strip()}
+    return {"answer": claude_text(resp.json()).strip()}
 
 
 # ── Market Report Links ──────────────────────────────────────────────────────
