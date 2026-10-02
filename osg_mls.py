@@ -26,6 +26,8 @@ import re
 
 import httpx
 
+from claude_reply import claude_text
+
 # Owned by the Offer Strategy Generator. Changing BMR_MODEL in main.py (used
 # by the CMA reader and the Buyer Market Report) does not move this.
 OSG_MODEL = "claude-sonnet-4-5"
@@ -409,7 +411,7 @@ async def ask_claude(api_key: str, content: str, max_tokens: int, temperature=No
         resp = await client.post("https://api.anthropic.com/v1/messages",
                                  headers=headers, json=payload)
         resp.raise_for_status()
-    raw = resp.json()["content"][0]["text"].strip()
+    raw = claude_text(resp.json()).strip()
     raw = re.sub(r"^```(?:json)?\n?", "", raw)
     raw = re.sub(r"\n?```$", "", raw)
     return json.loads(raw)
