@@ -68,6 +68,12 @@ CAMPAIGN_PRINT_ORIGIN     = os.environ.get("CAMPAIGN_PRINT_ORIGIN", "https://for
 # parsers, where an agent reviews every extracted row on screen anyway.
 BMR_MODEL                 = "claude-opus-5"
 BMR_MODEL_FAST            = "claude-sonnet-5"
+# Reply limit for the three short-answer readers (buyer report comparison,
+# buyer report regenerate, offer chat). Was 1024. Opus 5 and Sonnet 5 can
+# spend output tokens on a thinking block before the answer, and that counts
+# against the limit, so 1024 could run out before any answer was written.
+# A limit only cuts a reply off; raising it does not change one that fit.
+SHORT_REPLY_MAX_TOKENS    = 4096
 
 # ---------------------------------------------------------------------------
 # Agent name mapping: FUB display name → FORWARD OS canonical agent name
@@ -1545,12 +1551,12 @@ Respond ONLY with a JSON array with one object per property, in order. Example:
 ]"""
 
     headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    body = {"model": BMR_MODEL_FAST, "max_tokens": 1024, "messages": [{"role": "user", "content": prompt}]}
+    body = {"model": BMR_MODEL_FAST, "max_tokens": SHORT_REPLY_MAX_TOKENS, "messages": [{"role": "user", "content": prompt}]}
     try:
         async with httpx.AsyncClient(timeout=90) as client:
             resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
             resp.raise_for_status()
-            raw = claude_text(resp.json()).strip()
+            raw = claude_text(resp.json(), "buyer-report-comparison").strip()
             logger.info("comparison claude raw: %s", raw[:300])
             # Extract JSON array
             m = re.search(r'\[.*\]', raw, re.DOTALL)
@@ -1809,13 +1815,13 @@ Return ONLY this JSON (no markdown):
 }}"""
 
     headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    body = {"model": BMR_MODEL, "max_tokens": 1024, "temperature": 0,
+    body = {"model": BMR_MODEL, "max_tokens": SHORT_REPLY_MAX_TOKENS, "temperature": 0,
             "messages": [{"role": "user", "content": prompt}]}
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
         resp.raise_for_status()
 
-    text = claude_text(resp.json()).strip()
+    text = claude_text(resp.json(), "buyer-report-regenerate").strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
     try:
@@ -2471,13 +2477,13 @@ Answer the agent's follow-up questions directly and specifically. Use actual num
     messages.append({"role": "user", "content": payload.question})
 
     headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    body = {"model": BMR_MODEL, "max_tokens": 1024, "temperature": 0, "system": system, "messages": messages}
+    body = {"model": BMR_MODEL, "max_tokens": SHORT_REPLY_MAX_TOKENS, "temperature": 0, "system": system, "messages": messages}
 
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
         resp.raise_for_status()
 
-    return {"answer": claude_text(resp.json()).strip()}
+    return {"answer": claude_text(resp.json(), "chat-offers").strip()}
 
 
 # ── Market Report Links ──────────────────────────────────────────────────────
