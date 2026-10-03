@@ -91,3 +91,41 @@ def raise_for_claude(resp, where: str = "") -> None:
         status_code=502,
         detail=f"The AI service returned an error ({status}): {msg[:300] or 'no detail given'}",
     )
+
+
+# Models that answer 400 to any non-default sampling parameter. Live evidence
+# for claude-opus-5 (Oct 3, 2026: /api/buyer-report/regenerate and
+# /api/chat-offers both got 400 with "temperature": 0); Anthropic's docs state
+# it for claude-sonnet-5.
+NO_SAMPLING_PARAMS_PREFIXES = ("claude-opus-5", "claude-sonnet-5")
+_SAMPLING_PARAMS = ("temperature", "top_p", "top_k")
+
+CLAUDE_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+
+
+async def claude_post(headers: dict, body: dict, timeout: float = 120, where: str = ""):
+    """THE one place this backend calls the Messages API.
+
+    Until Oct 3, 2026 there were nine hand-written copies of this request. A
+    change that had to reach all of them (the Opus 5 switch) reached some and
+    broke the rest, and nobody knew for days. Every reader now comes through
+    here, so the next such change is made once.
+
+    - Drops sampling parameters the model would reject, with a warning, so a
+      stray "temperature" can never take a tool down again.
+    - Logs and raises a readable error on a non-2xx answer (raise_for_claude).
+    - Returns the httpx response; callers keep using resp.json().
+    """
+    import httpx
+    model = str((body or {}).get("model") or "")
+    if model.startswith(NO_SAMPLING_PARAMS_PREFIXES):
+        dropped = [k for k in _SAMPLING_PARAMS if k in body]
+        if dropped:
+            body = {k: v for k, v in body.items() if k not in _SAMPLING_PARAMS}
+            _log.warning("claude_post where=%s dropped %s: %s rejects them",
+                         where or "-", dropped, model)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(CLAUDE_MESSAGES_URL, headers=headers, json=body)
+    raise_for_claude(resp, where)
+    return resp
+
