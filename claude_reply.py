@@ -13,12 +13,16 @@ The front end had the same bug and fixed it the same way (claudeText, PR
 """
 from __future__ import annotations
 
+import logging
+
+_log = logging.getLogger("forward-cc.claude")
+
 
 class ClaudeReplyError(ValueError):
     """The API answered, but the reply holds no text to use."""
 
 
-def claude_text(data) -> str:
+def claude_text(data, where: str = "") -> str:
     """Join every text block of a Messages API reply, in order.
 
     Raises ClaudeReplyError naming the stop_reason when there is no text at
@@ -26,6 +30,21 @@ def claude_text(data) -> str:
     instead of a bare KeyError.
     """
     blocks = data.get("content") if isinstance(data, dict) else None
+    # One line per reply, success or not, so the log shows how much of the
+    # reply limit was used. A reply cut off by the limit gets a warning: its
+    # text is incomplete even when some text came back.
+    try:
+        usage = data.get("usage") or {}
+        stop = data.get("stop_reason")
+        line = "claude reply where=%s model=%s stop=%s output_tokens=%s blocks=%s"
+        args = (where or "-", data.get("model"), stop, usage.get("output_tokens"),
+                [b.get("type") for b in blocks or [] if isinstance(b, dict)])
+        if stop == "max_tokens":
+            _log.warning(line + " REPLY CUT OFF BY max_tokens", *args)
+        else:
+            _log.info(line, *args)
+    except Exception:
+        pass
     parts = []
     for b in blocks or []:
         if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str):
