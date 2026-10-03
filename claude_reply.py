@@ -57,3 +57,37 @@ def claude_text(data, where: str = "") -> str:
             f"Claude returned no text (stop reason: {stop}, blocks: {kinds})"
         )
     return text
+
+
+def raise_for_claude(resp, where: str = "") -> None:
+    """Use in place of resp.raise_for_status() on a Messages API call.
+
+    On Oct 3, 2026 the API answered 400 to /api/buyer-report/regenerate and
+    /api/chat-offers. The code called raise_for_status(), which discards the
+    response body, so the log said only "400 Bad Request" and not why. The
+    unhandled error also became a bare 500 with no CORS headers, which the
+    browser reports as "Failed to fetch".
+
+    This logs the API's own error message and raises an HTTPException, which
+    FastAPI returns as JSON with CORS headers, so the agent sees a reason.
+    """
+    status = getattr(resp, "status_code", 200)
+    if not isinstance(status, int) or status < 400:
+        return
+    msg = ""
+    try:
+        body = resp.json()
+        msg = ((body.get("error") or {}).get("message") or "") if isinstance(body, dict) else ""
+    except Exception:
+        pass
+    if not msg:
+        try:
+            msg = (resp.text or "")[:300]
+        except Exception:
+            msg = ""
+    _log.error("claude api error where=%s status=%s message=%s", where or "-", status, msg[:600])
+    from fastapi import HTTPException
+    raise HTTPException(
+        status_code=502,
+        detail=f"The AI service returned an error ({status}): {msg[:300] or 'no detail given'}",
+    )
