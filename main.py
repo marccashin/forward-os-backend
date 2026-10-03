@@ -39,7 +39,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import market_reports as _mr
-from claude_reply import claude_text, raise_for_claude
+from claude_reply import claude_text, claude_post
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -1015,9 +1015,7 @@ Rules: include ALL comps shown (up to 12); sale_price empty if not sold; ls_rati
         {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64}},
         {"type": "text", "text": prompt}
     ]}]}
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
-        raise_for_claude(resp)
+    resp = await claude_post(headers, body, timeout=120, where="buyer-report-analyze")
     text = claude_text(resp.json()).strip()
     text = re.sub(r"^```(?:json)?\s*", "", text); text = re.sub(r"\s*```$", "", text)
     try:
@@ -1555,22 +1553,20 @@ Respond ONLY with a JSON array with one object per property, in order. Example:
     headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
     body = {"model": BMR_MODEL_FAST, "max_tokens": SHORT_REPLY_MAX_TOKENS, "messages": [{"role": "user", "content": prompt}]}
     try:
-        async with httpx.AsyncClient(timeout=90) as client:
-            resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
-            raise_for_claude(resp)
-            raw = claude_text(resp.json(), "buyer-report-comparison").strip()
-            logger.info("comparison claude raw: %s", raw[:300])
-            # Extract JSON array
-            m = re.search(r'\[.*\]', raw, re.DOTALL)
-            if m:
-                analyses = json.loads(m.group())
-                if (isinstance(analyses, list) and len(analyses) == len(req.candidates)
-                        and all(isinstance(a, dict) and a for a in analyses)):
-                    return analyses
-                logger.error("comparison claude returned %s analyses for %s properties",
-                             len(analyses) if isinstance(analyses, list) else "non-list", len(req.candidates))
-            else:
-                logger.error("no JSON array found in comparison claude response")
+        resp = await claude_post(headers, body, timeout=90, where="buyer-report-comparison")
+        raw = claude_text(resp.json(), "buyer-report-comparison").strip()
+        logger.info("comparison claude raw: %s", raw[:300])
+        # Extract JSON array
+        m = re.search(r'\[.*\]', raw, re.DOTALL)
+        if m:
+            analyses = json.loads(m.group())
+            if (isinstance(analyses, list) and len(analyses) == len(req.candidates)
+                    and all(isinstance(a, dict) and a for a in analyses)):
+                return analyses
+            logger.error("comparison claude returned %s analyses for %s properties",
+                         len(analyses) if isinstance(analyses, list) else "non-list", len(req.candidates))
+        else:
+            logger.error("no JSON array found in comparison claude response")
     except HTTPException:
         raise
     except Exception as e:
@@ -1834,9 +1830,7 @@ Return ONLY this JSON (no markdown):
     headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
     body = {"model": BMR_MODEL, "max_tokens": SHORT_REPLY_MAX_TOKENS,
             "messages": [{"role": "user", "content": prompt}]}
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
-        raise_for_claude(resp)
+    resp = await claude_post(headers, body, timeout=60, where="buyer-report-regenerate")
 
     text = claude_text(resp.json(), "buyer-report-regenerate").strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -2019,9 +2013,7 @@ Return ONLY the JSON object. No explanation, no markdown, no code fences."""
     gc.collect()
 
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
-            raise_for_claude(resp)
+        resp = await claude_post(headers, payload, timeout=120, where="parse-offer")
         raw = claude_text(resp.json()).strip()
     finally:
         del payload
@@ -2196,12 +2188,7 @@ async def cma_parse_listings(files: list[UploadFile] = File(...)):
             gc.collect()
 
             try:
-                async with httpx.AsyncClient(timeout=120) as client:
-                    resp = await client.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers=headers, json=payload,
-                    )
-                    raise_for_claude(resp)
+                resp = await claude_post(headers, payload, timeout=120, where="cma-import")
                 raw = claude_text(resp.json()).strip()
             finally:
                 del payload
@@ -2368,15 +2355,16 @@ Rules:
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
+    # Was 2500 / 90s. On Oct 3, 2026 a live run with TWO offers used about 1,920
+    # of the 2,500 tokens; this tool takes up to six. Raised so a full set of
+    # offers cannot be cut off mid-analysis.
     body = {
         "model": BMR_MODEL,
-        "max_tokens": 2500,
+        "max_tokens": 8000,
         "messages": [{"role": "user", "content": prompt}]
     }
 
-    async with httpx.AsyncClient(timeout=90) as client:
-        resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
-        raise_for_claude(resp)
+    resp = await claude_post(headers, body, timeout=170, where="analyze-offers")
 
     raw = claude_text(resp.json()).strip()
 
@@ -2495,9 +2483,7 @@ Answer the agent's follow-up questions directly and specifically. Use actual num
     headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
     body = {"model": BMR_MODEL, "max_tokens": SHORT_REPLY_MAX_TOKENS, "system": system, "messages": messages}
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
-        raise_for_claude(resp)
+    resp = await claude_post(headers, body, timeout=60, where="chat-offers")
 
     return {"answer": claude_text(resp.json(), "chat-offers").strip()}
 
@@ -3053,13 +3039,8 @@ async def meeting_prep_research(payload: MeetingPrepResearchRequest):
     }
 
     try:
-        async with httpx.AsyncClient(timeout=45) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers, json=body
-            )
-            raise_for_claude(resp)
-            data = resp.json()
+        resp = await claude_post(headers, body, timeout=45, where="meeting-prep-research")
+        data = resp.json()
 
         result_text = ""
         for block in data.get("content", []):
@@ -4350,3 +4331,150 @@ async def market_reports_run(x_admin_key: Optional[str] = Header(None), force: b
     if x_admin_key != MARKET_REPORTS_ADMIN_KEY:
         raise HTTPException(status_code=403, detail="Wrong admin key.")
     return await _mr_run(force=force)
+
+
+# ---------------------------------------------------------------------------
+# Whole-system smoke test (see smoke.py for why this exists)
+# ---------------------------------------------------------------------------
+# Runs every AI-backed tool with made-up data:
+#   - at boot; /health/deploy reports the result and railway.json points
+#     Railway's deploy healthcheck at it, so a build whose tools are broken
+#     is not switched into production (the previous deployment keeps serving);
+#   - every morning at 6:45am ET, with an email to Marc on failure;
+#   - on demand: POST /api/smoke-test/run, GET /api/smoke-test/status.
+# Escape hatches (Railway variables): SMOKE_GATE=off makes /health/deploy
+# answer 200 without waiting; SMOKE_ON_BOOT=off skips the boot run.
+import sys as _sys
+import time as _time
+import smoke as _smoke
+
+_SMOKE_STATE: dict = {"boot": None, "last": None, "running": False, "last_manual_at": 0.0}
+
+
+def _smoke_record(result: dict) -> None:
+    """Keep the latest result in os_settings so it survives a restart."""
+    try:
+        supabase.table("os_settings").upsert({
+            "key": "smoke_test_last", "value": result,
+            "updated_by": "FORWARD OS (smoke test)",
+            "updated_at": datetime.now(timezone.utc).isoformat()}, on_conflict="key").execute()
+    except Exception as e:
+        logger.error("[smoke] could not save the result to os_settings: %s", e)
+
+
+def _smoke_email(result: dict) -> None:
+    """Tell Marc when a tool is down. Only sent on failure."""
+    try:
+        import resend as resend_sdk
+        key = os.environ.get("RESEND_API_KEY", "")
+        if not key:
+            logger.error("[smoke] RESEND_API_KEY not set, cannot email the failure")
+            return
+        rows = "".join(
+            "<tr><td style='padding:4px 10px'>{}</td><td style='padding:4px 10px'>{}</td>"
+            "<td style='padding:4px 10px'>{}</td></tr>".format(
+                "FAILED" if not c["ok"] else "ok",
+                c["name"],
+                str(c["detail"]).replace("<", "&lt;"))
+            for c in sorted(result.get("checks", []), key=lambda c: c["ok"]))
+        html = (
+            "<p>The FORWARD OS system check ran ({}) and {} of {} tools failed.</p>"
+            "<table style='border-collapse:collapse;font-family:monospace;font-size:13px'>{}</table>"
+            "<p>Each tool was called with made-up test data, the way the app calls it. "
+            "A failed tool is failing for agents too.</p>"
+        ).format(result.get("trigger"), result.get("failed"),
+                 len(result.get("checks", [])), rows)
+        resend_sdk.api_key = key
+        resend_sdk.Emails.send({
+            "from": "Forward OS Audit <audit@marccashin.com>",
+            "to": ["marc@marccashin.com"],
+            "subject": "FORWARD OS system check FAILED: {} of {} tools ({})".format(
+                result.get("failed"), len(result.get("checks", [])), result.get("trigger")),
+            "html": html,
+        })
+        logger.info("[smoke] failure email sent")
+    except Exception as e:
+        logger.error("[smoke] failure email could not be sent: %s", e)
+
+
+async def _smoke_run(trigger: str) -> dict:
+    if _SMOKE_STATE["running"]:
+        return {"ok": None, "status": "already running", "trigger": trigger}
+    _SMOKE_STATE["running"] = True
+    try:
+        result = await _smoke.run_smoke(_sys.modules[__name__], trigger)
+    except Exception as e:
+        logger.exception("[smoke] the smoke test itself crashed")
+        result = {"ok": False, "trigger": trigger, "failed": 1, "passed": 0,
+                  "started_at": datetime.now(timezone.utc).isoformat(),
+                  "checks": [{"name": "smoke test runner", "ok": False,
+                              "detail": f"{type(e).__name__}: {e}"[:400], "seconds": 0}]}
+    finally:
+        _SMOKE_STATE["running"] = False
+    _SMOKE_STATE["last"] = result
+    if trigger == "boot":
+        _SMOKE_STATE["boot"] = result
+    _smoke_record(result)
+    if not result.get("ok"):
+        _smoke_email(result)
+    return result
+
+
+async def job_morning_smoke_test():
+    await _smoke_run("morning")
+
+
+@app.on_event("startup")
+async def register_smoke_test():
+    scheduler.add_job(
+        job_morning_smoke_test,
+        CronTrigger(hour=6, minute=45, timezone="America/New_York"),
+        id="morning_smoke_test",
+        replace_existing=True,
+    )
+    if os.environ.get("SMOKE_ON_BOOT", "on").strip().lower() == "off":
+        logger.info("[smoke] SMOKE_ON_BOOT=off, boot run skipped")
+        return
+
+    async def _boot():
+        await asyncio.sleep(3)   # let the server start answering first
+        await _smoke_run("boot")
+    asyncio.create_task(_boot())
+    logger.info("[smoke] boot run started; morning run registered for 6:45am ET")
+
+
+@app.get("/health/deploy")
+async def health_deploy():
+    """Railway's deploy healthcheck. 200 only once the boot smoke test passed."""
+    if os.environ.get("SMOKE_GATE", "on").strip().lower() == "off":
+        return {"status": "ok", "gate": "off"}
+    if os.environ.get("SMOKE_ON_BOOT", "on").strip().lower() == "off":
+        return {"status": "ok", "gate": "boot run disabled"}
+    boot = _SMOKE_STATE["boot"]
+    if boot is None:
+        return JSONResponse(status_code=503, content={"status": "checking"})
+    if boot.get("ok"):
+        return {"status": "ok", "passed": boot.get("passed"), "seconds": boot.get("seconds")}
+    return JSONResponse(status_code=503, content={
+        "status": "failed",
+        "failed": [{"name": c["name"], "detail": c["detail"]}
+                   for c in boot.get("checks", []) if not c["ok"]]})
+
+
+@app.get("/api/smoke-test/status")
+async def smoke_test_status():
+    return {"running": _SMOKE_STATE["running"], "boot": _SMOKE_STATE["boot"],
+            "last": _SMOKE_STATE["last"]}
+
+
+@app.post("/api/smoke-test/run")
+async def smoke_test_run():
+    """Run the check now. Limited to once every 5 minutes: each run calls the AI
+    service nine times, and this route has no login."""
+    now = _time.time()
+    wait = 300 - (now - _SMOKE_STATE["last_manual_at"])
+    if wait > 0:
+        raise HTTPException(status_code=429,
+                            detail=f"A run was started recently. Try again in {int(wait)} seconds.")
+    _SMOKE_STATE["last_manual_at"] = now
+    return await _smoke_run("manual")

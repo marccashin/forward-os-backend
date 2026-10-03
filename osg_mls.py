@@ -26,7 +26,7 @@ import re
 
 import httpx
 
-from claude_reply import claude_text, raise_for_claude
+from claude_reply import claude_text, claude_post
 
 # Owned by the Offer Strategy Generator. Changing BMR_MODEL in main.py (used
 # by the CMA reader and the Buyer Market Report) does not move this.
@@ -407,10 +407,7 @@ async def ask_claude(api_key: str, content: str, max_tokens: int, temperature=No
         payload["temperature"] = temperature
     headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
                "content-type": "application/json"}
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post("https://api.anthropic.com/v1/messages",
-                                 headers=headers, json=payload)
-        raise_for_claude(resp)
+    resp = await claude_post(headers, payload, timeout=120, where="offer-strategy-mls")
     raw = claude_text(resp.json()).strip()
     raw = re.sub(r"^```(?:json)?\n?", "", raw)
     raw = re.sub(r"\n?```$", "", raw)
