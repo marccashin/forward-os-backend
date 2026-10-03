@@ -39,7 +39,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import market_reports as _mr
-from claude_reply import claude_text
+from claude_reply import claude_text, raise_for_claude
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -66,6 +66,8 @@ NETLIFY_ACCESS_TOKEN      = os.environ.get("NETLIFY_ACCESS_TOKEN", "")
 CAMPAIGN_PRINT_ORIGIN     = os.environ.get("CAMPAIGN_PRINT_ORIGIN", "https://forward-os.netlify.app")
 # Default for everything. FAST is used only for the two high-volume
 # parsers, where an agent reviews every extracted row on screen anyway.
+# claude-opus-5 and claude-sonnet-5 answer 400 to any non-default temperature,
+# top_p or top_k. Do not send those parameters to BMR_MODEL or BMR_MODEL_FAST.
 BMR_MODEL                 = "claude-opus-5"
 BMR_MODEL_FAST            = "claude-sonnet-5"
 # Reply limit for the three short-answer readers (buyer report comparison,
@@ -1009,13 +1011,13 @@ async def _bmr_claude(pdf_bytes: bytes) -> BuyerReportAnalysis:
 }
 Rules: include ALL comps shown (up to 12); sale_price empty if not sold; ls_ratio = sale_price/list_price as "98.5%" (empty if not sold); sqft and beds/baths as plain numbers (e.g. "1248", "4", "2.0"); prices with $ and commas. Return ONLY the JSON — the offer math is calculated separately."""
     headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    body = {"model": BMR_MODEL, "max_tokens": 4096, "temperature": 0, "messages": [{"role": "user", "content": [
+    body = {"model": BMR_MODEL, "max_tokens": 4096, "messages": [{"role": "user", "content": [
         {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64}},
         {"type": "text", "text": prompt}
     ]}]}
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
-        resp.raise_for_status()
+        raise_for_claude(resp)
     text = claude_text(resp.json()).strip()
     text = re.sub(r"^```(?:json)?\s*", "", text); text = re.sub(r"\s*```$", "", text)
     try:
@@ -1555,17 +1557,32 @@ Respond ONLY with a JSON array with one object per property, in order. Example:
     try:
         async with httpx.AsyncClient(timeout=90) as client:
             resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
-            resp.raise_for_status()
+            raise_for_claude(resp)
             raw = claude_text(resp.json(), "buyer-report-comparison").strip()
             logger.info("comparison claude raw: %s", raw[:300])
             # Extract JSON array
             m = re.search(r'\[.*\]', raw, re.DOTALL)
             if m:
-                return json.loads(m.group())
-            logger.warning("no JSON array found in comparison claude response")
+                analyses = json.loads(m.group())
+                if (isinstance(analyses, list) and len(analyses) == len(req.candidates)
+                        and all(isinstance(a, dict) and a for a in analyses)):
+                    return analyses
+                logger.error("comparison claude returned %s analyses for %s properties",
+                             len(analyses) if isinstance(analyses, list) else "non-list", len(req.candidates))
+            else:
+                logger.error("no JSON array found in comparison claude response")
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.warning("comparison claude call failed: %s", e)
-    return [{} for _ in req.candidates]
+        logger.error("comparison claude call failed: %s", e)
+    # Never publish a client report with the offer analysis missing. This used
+    # to return empty analyses, so the page went live with blank offer cards
+    # and the agent saw no error.
+    raise HTTPException(
+        status_code=502,
+        detail="The offer analysis could not be generated, so the report was NOT published. "
+               "Nothing was sent to your client. Try Deploy again in a minute.",
+    )
 
 
 def _bmr_build_comparison_html(req: BuyerReportComparisonRequest, analyses: list = None) -> str:
@@ -1815,11 +1832,11 @@ Return ONLY this JSON (no markdown):
 }}"""
 
     headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    body = {"model": BMR_MODEL, "max_tokens": SHORT_REPLY_MAX_TOKENS, "temperature": 0,
+    body = {"model": BMR_MODEL, "max_tokens": SHORT_REPLY_MAX_TOKENS,
             "messages": [{"role": "user", "content": prompt}]}
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
-        resp.raise_for_status()
+        raise_for_claude(resp)
 
     text = claude_text(resp.json(), "buyer-report-regenerate").strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -2004,7 +2021,7 @@ Return ONLY the JSON object. No explanation, no markdown, no code fences."""
     try:
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
-            resp.raise_for_status()
+            raise_for_claude(resp)
         raw = claude_text(resp.json()).strip()
     finally:
         del payload
@@ -2184,7 +2201,7 @@ async def cma_parse_listings(files: list[UploadFile] = File(...)):
                         "https://api.anthropic.com/v1/messages",
                         headers=headers, json=payload,
                     )
-                    resp.raise_for_status()
+                    raise_for_claude(resp)
                 raw = claude_text(resp.json()).strip()
             finally:
                 del payload
@@ -2354,13 +2371,12 @@ Rules:
     body = {
         "model": BMR_MODEL,
         "max_tokens": 2500,
-        "temperature": 0,
         "messages": [{"role": "user", "content": prompt}]
     }
 
     async with httpx.AsyncClient(timeout=90) as client:
         resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
-        resp.raise_for_status()
+        raise_for_claude(resp)
 
     raw = claude_text(resp.json()).strip()
 
@@ -2477,11 +2493,11 @@ Answer the agent's follow-up questions directly and specifically. Use actual num
     messages.append({"role": "user", "content": payload.question})
 
     headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    body = {"model": BMR_MODEL, "max_tokens": SHORT_REPLY_MAX_TOKENS, "temperature": 0, "system": system, "messages": messages}
+    body = {"model": BMR_MODEL, "max_tokens": SHORT_REPLY_MAX_TOKENS, "system": system, "messages": messages}
 
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
-        resp.raise_for_status()
+        raise_for_claude(resp)
 
     return {"answer": claude_text(resp.json(), "chat-offers").strip()}
 
@@ -3042,7 +3058,7 @@ async def meeting_prep_research(payload: MeetingPrepResearchRequest):
                 "https://api.anthropic.com/v1/messages",
                 headers=headers, json=body
             )
-            resp.raise_for_status()
+            raise_for_claude(resp)
             data = resp.json()
 
         result_text = ""
