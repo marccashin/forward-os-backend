@@ -2568,28 +2568,12 @@ async def create_property(payload: CreatePropertyRequest):
         raise HTTPException(status_code=500, detail=f"Database insert failed: {e}")
 
 
-class SavePropertyNoteRequest(BaseModel):
-    property_id: str
-    subfolder: str
-    content: str
-
-@app.post("/save-property-note")
-async def save_property_note(payload: SavePropertyNoteRequest):
-    """Upsert a property note via service role key — bypasses RLS."""
-    try:
-        supabase.table("property_notes") \
-            .delete() \
-            .eq("property_id", payload.property_id) \
-            .eq("subfolder", payload.subfolder) \
-            .execute()
-        result = supabase.table("property_notes").insert({
-            "property_id": payload.property_id,
-            "subfolder":   payload.subfolder,
-            "content":     payload.content,
-        }).execute()
-        return result.data[0] if result.data else {"ok": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Save note failed: {e}")
+# /save-property-note was removed on Oct 6, 2026. It saved a listing note in two
+# steps (delete, then insert), so a failed insert lost the note. The OS app stopped
+# calling it on Oct 3 (forward-os #173) and now saves through the database function
+# save_property_note_by, which replaces the note in one step and keeps every version.
+# Checked before removal: no caller in forward-os, forward-command-center or
+# forward-marketing-pipeline; the last request in the Railway log was Oct 3, 2026.
 
 
 # ---------------------------------------------------------------------------
