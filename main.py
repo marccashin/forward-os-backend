@@ -2096,6 +2096,9 @@ Rules:
 Return ONLY the JSON object {"listings": [...]}. No explanation, no markdown, no code fences."""
 
 
+import cma_split as _cma_split
+
+
 @app.post("/api/cma/parse-listings")
 async def cma_parse_listings(files: list[UploadFile] = File(...)):
     """Parse one or more MLS listing PDFs into CMA-ready objective fields.
@@ -2148,12 +2151,13 @@ async def cma_parse_listings(files: list[UploadFile] = File(...)):
 
             try:
                 reader = PdfReader(io.BytesIO(pdf_bytes))
-                pdf_text = "\n".join(p.extract_text() or "" for p in reader.pages)
+                page_texts = [p.extract_text() or "" for p in reader.pages]
             except Exception:
-                pdf_text = ""
+                page_texts = []
             finally:
                 del pdf_bytes
                 gc.collect()
+            pdf_text = "\n".join(page_texts)
 
             if len(pdf_text.strip()) < 200:
                 results.append({
@@ -2175,60 +2179,130 @@ async def cma_parse_listings(files: list[UploadFile] = File(...)):
                              "was imported. Export the sheet from Bright MLS and try again.",
                 })
                 continue
+            del low
 
-            payload = {
-                "model": BMR_MODEL_FAST,
-                "max_tokens": 16000,
-                "messages": [{
-                    "role": "user",
-                    "content": f"MLS LISTING SHEET:\n\n{pdf_text}\n\n---\n\n{CMA_PARSE_PROMPT}",
-                }],
-            }
-            del pdf_text
-            gc.collect()
-
-            try:
-                resp = await claude_post(headers, payload, timeout=120, where="cma-import")
-                raw = claude_text(resp.json()).strip()
-            finally:
-                del payload
-                gc.collect()
-
-            raw = re.sub(r"^```(?:json)?\n?", "", raw)
-            raw = re.sub(r"\n?```$", "", raw)
-            data = json.loads(raw)
-
-            # One PDF may hold many properties. Accept either shape.
-            if isinstance(data, dict) and isinstance(data.get("listings"), list):
-                listings = data["listings"]
-            elif isinstance(data, dict):
-                listings = [data]
-            elif isinstance(data, list):
-                listings = data
+            # A file holding many properties is read a few properties at a time
+            # (see cma_split.py: one request for 16 properties ran past the 120
+            # second limit on Oct 6, 2026). A file that cannot be split, or that
+            # fits in one request, goes as one request with the same text as before.
+            listings_in_file = _cma_split.split_listings(page_texts)
+            del page_texts
+            over_limit = 0
+            if listings_in_file and len(listings_in_file) > MAX_LISTINGS_PER_FILE:
+                over_limit = len(listings_in_file) - MAX_LISTINGS_PER_FILE
+                listings_in_file = listings_in_file[:MAX_LISTINGS_PER_FILE]
+            if listings_in_file and len(listings_in_file) > _cma_split.PER_REQUEST:
+                parts = _cma_split.chunk(listings_in_file)
             else:
+                parts = None
+                if over_limit:
+                    pdf_text = "\n".join(l["text"] for l in listings_in_file)
+            expected = len(listings_in_file) if listings_in_file else None
+            del listings_in_file
+
+            async def read_text(text):
+                """One request to the AI service: sheet text in, list of properties out."""
+                payload = {
+                    "model": BMR_MODEL_FAST,
+                    "max_tokens": 16000,
+                    "messages": [{
+                        "role": "user",
+                        "content": f"MLS LISTING SHEET:\n\n{text}\n\n---\n\n{CMA_PARSE_PROMPT}",
+                    }],
+                }
+                try:
+                    resp = await claude_post(headers, payload, timeout=120, where="cma-import")
+                    raw = claude_text(resp.json(), "cma-import").strip()
+                finally:
+                    del payload
+                    gc.collect()
+                raw = re.sub(r"^```(?:json)?\n?", "", raw)
+                raw = re.sub(r"\n?```$", "", raw)
+                data = json.loads(raw)
+                # One PDF may hold many properties. Accept either shape.
+                if isinstance(data, dict) and isinstance(data.get("listings"), list):
+                    return data["listings"]
+                if isinstance(data, dict):
+                    return [data]
+                if isinstance(data, list):
+                    return data
                 raise ValueError("unexpected shape")
 
-            if not listings:
-                results.append({"file": name, "ok": False,
-                                "error": "No properties were found in this sheet."})
-                continue
+            listings = []
+            unread = []   # labels of properties in a part that could not be read
+            if parts is None:
+                listings = await read_text(pdf_text)
+                del pdf_text
+                gc.collect()
+            else:
+                del pdf_text
+                gc.collect()
+                gate = asyncio.Semaphore(_cma_split.CONCURRENCY)
 
-            for item in listings[:MAX_LISTINGS_PER_FILE]:
-                if not isinstance(item, dict):
-                    continue
+                async def read_part(part):
+                    async with gate:
+                        try:
+                            return await read_text("\n".join(l["text"] for l in part))
+                        except Exception:
+                            logging.exception("cma_parse_listings failed for part of %s (%s properties)", name, len(part))
+                            return None
+
+                answers = await asyncio.gather(*[read_part(p) for p in parts])
+                for part, answer in zip(parts, answers):
+                    if answer is None:
+                        unread.extend(l["label"] or "a property" for l in part)
+                    else:
+                        listings.extend(answer)
+                del parts, answers
+
+            good = [item for item in listings if isinstance(item, dict)][:MAX_LISTINGS_PER_FILE]
+            for item in good:
                 item.setdefault("flags", {})
                 item["file"] = name
                 item["ok"] = True
                 results.append(item)
 
+            # Say what was NOT read. A partly read file must never look complete.
+            if unread:
+                results.append({
+                    "file": name, "ok": False,
+                    "error": f"{len(unread)} of the {expected} properties in this file could not be read: "
+                             + "; ".join(unread) + ". The rest are listed. "
+                             "Upload those sheets again in a file of their own.",
+                })
+            elif expected is not None and len(good) < expected:
+                results.append({
+                    "file": name, "ok": False,
+                    "error": f"This file holds {expected} properties but only {len(good)} were read. "
+                             "Check the list against your sheets and upload any missing one in a file of its own.",
+                })
+            elif not good:
+                results.append({"file": name, "ok": False,
+                                "error": "No properties were found in this sheet."})
+            if over_limit:
+                results.append({
+                    "file": name, "ok": False,
+                    "error": f"This file holds more than {MAX_LISTINGS_PER_FILE} properties. The first "
+                             f"{MAX_LISTINGS_PER_FILE} were read and the last {over_limit} were not. "
+                             "Upload those in a second file.",
+                })
+
         except Exception as e:
             logging.exception("cma_parse_listings failed for %s", name)
-            results.append({
-                "file": name, "ok": False,
-                "error": "FORWARD OS could not finish reading this sheet. The problem is on our "
-                         "side, not with your PDF. Try again in a minute, and tell Operations "
-                         "if it keeps happening.",
-            })
+            if isinstance(e, httpx.TimeoutException):
+                results.append({
+                    "file": name, "ok": False,
+                    "error": "This file took too long to read, so nothing was imported from it. "
+                             "If it holds several properties, export them in smaller files and try again. "
+                             "If it is a single sheet, try again in a minute and tell Operations if it keeps happening.",
+                })
+            else:
+                results.append({
+                    "file": name, "ok": False,
+                    "error": "FORWARD OS could not finish reading this sheet. The problem is on our "
+                             "side, not with your PDF. Try again in a minute, and tell Operations "
+                             "if it keeps happening.",
+                })
 
     return {"success": True, "results": results}
 
