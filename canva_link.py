@@ -46,10 +46,11 @@ API_BASE = "https://api.canva.com/rest/v1"
 TOKEN_URL = API_BASE + "/oauth/token"
 SCOPES = "design:meta:read design:content:read"
 
-# The team that owns all five decks (read from Canva on Oct 12, 2026: every
-# deck's owner.team_id). A connection that cannot see these decks as this
-# team's is refused and nothing is saved.
-FORWARD_TEAM_ID = "oBXdxZtv1SuqMjcj59OGxE"
+# Which team owns the decks is checked against the CONNECTED ACCOUNT'S OWN
+# team (GET /v1/users/me), never a fixed id. Canva gives each app its own ids:
+# on Oct 12, 2026 the same FORWARD team read as oBXdxZtv1SuqMjcj59OGxE through
+# the Canva connector and as oBZT6QMQrCaCdayC2NYxSQ through this app. A fixed
+# id copied from one app refused every deck in the other.
 
 # Login name -> Canva design id. The ONE list. The browser never chooses a
 # design: it only says who is signed in. Ids are the ones the OS linked to
@@ -267,12 +268,24 @@ class CanvaLink:
             # would only replace a good one with a useless one.
             return report
         row = self._row(tok)
-        row.update({"canva_team_id": FORWARD_TEAM_ID, "connected_at": self.now().isoformat()})
+        row.update({"canva_user_id": report.get("user_id"), "canva_team_id": report.get("team_id"),
+                    "connected_at": self.now().isoformat()})
         self.store.put(row)
         report["saved"] = True
         return report
 
     async def check_decks(self, access_token: str) -> dict:
+        """All five decks must read, carry their exact titles, and be owned by
+        the connected account's own team (as this app sees team ids)."""
+        auth = {"Authorization": f"Bearer {access_token}"}
+        status, body = await self.http("GET", f"{API_BASE}/users/me", headers=auth)
+        tu = (body or {}).get("team_user") if isinstance(body, dict) else None
+        my_team = (tu or {}).get("team_id")
+        if status != 200 or not my_team:
+            return {"ok": False, "saved": False, "team_id": None, "user_id": None,
+                    "decks": [{"agent": a, "ok": False, "pages": None,
+                               "reason": "could not read the connected account's team (" + _err(status, body) + ")"}
+                              for a in PRESENTATIONS]}
         decks = []
         for agent, design_id in PRESENTATIONS.items():
             status, body = await self.http(
@@ -286,12 +299,13 @@ class CanvaLink:
             if d.get("title") != expected_title(agent):
                 problems.append(f"title is '{d.get('title')}'")
             team = (d.get("owner") or {}).get("team_id")
-            if team != FORWARD_TEAM_ID:
-                problems.append(f"owned by team {team}, not FORWARD's")
+            if team != my_team:
+                problems.append(f"owned by team {team}, not the signed-in account's team {my_team}")
             decks.append({"agent": agent, "ok": not problems, "pages": d.get("page_count"),
                           "updated_at": d.get("updated_at"),
                           "reason": "; ".join(problems) or "ok"})
-        return {"ok": all(x["ok"] for x in decks), "decks": decks, "saved": False}
+        return {"ok": all(x["ok"] for x in decks), "decks": decks, "saved": False,
+                "team_id": my_team, "user_id": (tu or {}).get("user_id")}
 
     # ── tokens ──
     async def access_token(self) -> str:
