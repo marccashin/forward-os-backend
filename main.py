@@ -4522,3 +4522,161 @@ async def smoke_test_run():
                             detail=f"A run was started recently. Try again in {int(wait)} seconds.")
     _SMOKE_STATE["last_manual_at"] = now
     return await _smoke_run("manual")
+
+
+# ---------------------------------------------------------------------------
+# Canva connection for the agents' listing presentations (see canva_link.py)
+# ---------------------------------------------------------------------------
+# Step 1 of 2 (Oct 12, 2026): connect once and run a test export. Nothing here
+# stores or serves a PDF yet, and nothing here is part of the deploy gate: an
+# unconnected or broken Canva must never stop a deploy.
+#
+# Railway variables: CANVA_CLIENT_ID, CANVA_CLIENT_SECRET (from the Canva app
+# Marc creates). CANVA_REDIRECT_URI is optional; the default is this service's
+# public address, and it must equal the redirect URL set in the Canva app.
+# Routes have no login (like the rest of this API), so each is built to be
+# harmless if anyone calls it: connecting a Canva account that cannot read the
+# FORWARD team's five decks is refused and saves nothing, and the test export
+# is limited to one run a minute and stores nothing.
+from fastapi.responses import HTMLResponse, RedirectResponse
+import canva_link as _canva
+
+CANVA_REDIRECT_URI = os.environ.get(
+    "CANVA_REDIRECT_URI",
+    "https://forward-command-center-production.up.railway.app/api/canva/callback")
+
+
+async def _canva_http(method: str, url: str, headers: dict | None = None,
+                      data: dict | None = None, json: dict | None = None):
+    async with httpx.AsyncClient(timeout=60) as c:
+        r = await c.request(method, url, headers=headers, data=data, json=json)
+    try:
+        body = r.json()
+    except Exception:
+        body = {}
+    return r.status_code, body
+
+
+async def _canva_fetch_bytes(url: str, max_bytes: int) -> bytes:
+    buf = bytearray()
+    async with httpx.AsyncClient(timeout=180, follow_redirects=True) as c:
+        async with c.stream("GET", url) as r:
+            r.raise_for_status()
+            async for chunk in r.aiter_bytes():
+                buf.extend(chunk)
+                if len(buf) > max_bytes:
+                    raise _canva.CanvaError(f"The PDF is larger than {max_bytes // (1024 * 1024)} MB")
+    return bytes(buf)
+
+
+CANVA = _canva.CanvaLink(
+    client_id=os.environ.get("CANVA_CLIENT_ID", ""),
+    client_secret=os.environ.get("CANVA_CLIENT_SECRET", ""),
+    redirect_uri=CANVA_REDIRECT_URI,
+    store=_canva.SupabaseStore(supabase),
+    http=_canva_http, fetch_bytes=_canva_fetch_bytes, logger=logger)
+
+_CANVA_STATE: dict = {"last_test_at": 0.0, "last_test": None}
+
+
+def _canva_page(title: str, body_html: str, ok: bool) -> HTMLResponse:
+    color = "#1f7a3a" if ok else "#a12a2a"
+    return HTMLResponse(
+        "<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
+        "<title>FORWARD OS: Canva</title>"
+        "<body style='font-family:-apple-system,Helvetica,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;color:#0A2342'>"
+        f"<h2 style='color:{color}'>{title}</h2>{body_html}</body>")
+
+
+def _esc(s) -> str:
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+@app.get("/api/canva/connect")
+async def canva_connect():
+    """Marc opens this once, signed in to Canva with the FORWARD team account."""
+    try:
+        return RedirectResponse(CANVA.start(), status_code=302)
+    except _canva.CanvaError as e:
+        return _canva_page("Canva cannot be connected yet", f"<p>{_esc(e)}</p>", False)
+    except Exception as e:
+        logger.exception("[canva] connect start failed")
+        return _canva_page("Canva cannot be connected yet",
+                           f"<p>The backend could not start the connection: {_esc(e)}</p>"
+                           "<p>If this mentions canva_oauth_pending, the one-time SQL has not been run.</p>", False)
+
+
+@app.get("/api/canva/callback")
+async def canva_callback(code: str = "", state: str = "", error: str = "", error_description: str = ""):
+    if error:
+        return _canva_page("Canva did not connect",
+                           f"<p>Canva answered: {_esc(error)} {_esc(error_description)}</p>", False)
+    try:
+        report = await CANVA.finish(code, state)
+    except _canva.CanvaError as e:
+        return _canva_page("Canva did not connect", f"<p>{_esc(e)}</p>", False)
+    except Exception as e:
+        logger.exception("[canva] callback failed")
+        return _canva_page("Canva did not connect", f"<p>Unexpected error: {_esc(e)}</p>", False)
+    rows = "".join(
+        f"<tr><td style='padding:4px 10px'>{'OK' if d['ok'] else 'NO'}</td>"
+        f"<td style='padding:4px 10px'>{_esc(d['agent'])}</td>"
+        f"<td style='padding:4px 10px'>{_esc(d.get('pages') or '')} pages</td>"
+        f"<td style='padding:4px 10px'>{_esc(d['reason'])}</td></tr>" for d in report["decks"])
+    table = f"<table style='border-collapse:collapse;font-size:14px'>{rows}</table>"
+    logger.info("[canva] connect result ok=%s saved=%s", report["ok"], report.get("saved"))
+    if report.get("saved"):
+        return _canva_page("Canva is connected",
+                           "<p>The backend can read all five listing presentations.</p>" + table +
+                           "<p>You can close this tab.</p>", True)
+    return _canva_page("Canva did not connect",
+                       "<p>The account you signed in with cannot read all five decks as the FORWARD team's, "
+                       "so nothing was saved. Sign in to Canva with the FORWARD team account and try again.</p>"
+                       + table, False)
+
+
+@app.get("/api/canva/status")
+async def canva_status(check: bool = False):
+    out: dict = {"configured": CANVA.configured(), "redirect_uri": CANVA_REDIRECT_URI,
+                 "last_test": _CANVA_STATE["last_test"]}
+    try:
+        row = CANVA.store.get()
+    except Exception as e:
+        out.update(connected=False, error=f"could not read canva_connection: {e}")
+        return out
+    out["connected"] = bool(row)
+    if row:
+        out["connected_at"] = row.get("connected_at")
+        out["token_updated_at"] = row.get("updated_at")
+    if check and row:
+        try:
+            out["decks"] = await CANVA.check_decks(await CANVA.access_token())
+        except Exception as e:
+            out["decks_error"] = str(e)
+    return out
+
+
+@app.post("/api/canva/test-export")
+async def canva_test_export(agent: str = "Marc Cashin"):
+    """Export one deck, measure it and run the ownership check. Stores nothing."""
+    agent = AGENT_NAME_MAP.get(agent, agent)
+    if agent not in _canva.PRESENTATIONS:
+        raise HTTPException(status_code=400, detail="No listing presentation for that name.")
+    now = _time.time()
+    wait = 60 - (now - _CANVA_STATE["last_test_at"])
+    if wait > 0:
+        raise HTTPException(status_code=429, detail=f"Try again in {int(wait)} seconds.")
+    _CANVA_STATE["last_test_at"] = now
+    try:
+        res = await _canva.test_export(CANVA, agent)
+    except _canva.CanvaError as e:
+        res = {"agent": agent, "ok": False, "error": str(e)}
+    except Exception as e:
+        logger.exception("[canva] test export crashed")
+        res = {"agent": agent, "ok": False, "error": f"{type(e).__name__}: {e}"}
+    else:
+        res["ok"] = res["owner_check"]["ok"]
+    res["at"] = datetime.now(timezone.utc).isoformat()
+    _CANVA_STATE["last_test"] = res
+    logger.info("[canva] test export %s", json.dumps({k: res.get(k) for k in ("agent", "ok", "megabytes", "pages", "seconds", "error")}))
+    return res
