@@ -40,6 +40,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import market_reports as _mr
 from claude_reply import claude_text, claude_post
+import fub_market as _fub_market
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -865,24 +866,9 @@ async def fub_deal_engaged(request: Request):
             # See _fub_seller_market for why the lookup exists (Zapier sits in between).
             _fub_market_raw, _market_source, _market_deal = await _fub_seller_market(
                 data, address, fub_agent_name, fub_deal_id)
-            _market_map = {
-                "virginia": "VA", "va": "VA", "northern virginia": "VA", "nova": "VA",
-                "maryland": "MD", "md": "MD",
-                "dc": "DC", "washington dc": "DC", "washington, dc": "DC",
-                "district of columbia": "DC",
-            }
-            _market = _market_map.get(_fub_market_raw.lower(), "")
-            if not _market:
-                # Address-based fallback — same logic as nsDetectJurisdiction in the frontend
-                _addr_lower = address.lower()
-                if any(k in _addr_lower for k in [" dc", "washington, d", "district of columbia"]):
-                    _market = "DC"
-                elif any(k in _addr_lower for k in ["arlington", "fairfax", "loudoun", "alexandria", " va", "virginia"]):
-                    _market = "VA"
-                elif any(k in _addr_lower for k in [" md", "maryland", "montgomery", "bethesda", "silver spring"]):
-                    _market = "MD"
-                else:
-                    _market = "DC"  # last resort
+            # FUB's Market, else the state the address names as a whole word, else NO state.
+            # Never "DC" by default (Marc, Oct 12, 2026). See fub_market.py.
+            _market = _fub_market.listing_market(_fub_market_raw, address)
             logger.info("FUB market raw=%r source=%r normalised=%r deal=%r matched=%r address=%r keys=%s", _fub_market_raw, _market_source or "fallback", _market, fub_deal_id, _market_deal, address, sorted(data.keys()) if isinstance(data, dict) else type(data).__name__)
             result = supabase.table("properties").insert({
                 "address":     address,
@@ -2600,7 +2586,7 @@ class CreatePropertyRequest(BaseModel):
     agent_name: str = ""
     agent_email: str = ""
     seller_name: str = ""
-    market: str = "DC"
+    market: str = ""   # no default state (Marc, Oct 12, 2026): a caller that does not say gets none
     status: str = "draft"
     # co_seller stored in subfolder_drive_ids JSONB — no dedicated column
     co_seller: str = ""
