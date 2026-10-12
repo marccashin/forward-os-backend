@@ -18,6 +18,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import canva_link as cl
 
+# The FORWARD team as THIS app sees it (Canva ids differ per app; Oct 12, 2026).
+APP_TEAM = "oBZT6QMQrCaCdayC2NYxSQ"
 AGENTS = ["Marc Cashin", "Ashling McGowan", "Niki Lang", "Cesar Rivera", "Charlotte Lee"]
 PRINTED = {  # exactly as printed in each deck
     "Marc Cashin": "Marc.Cashin@CorcoranMCE.com",
@@ -127,13 +129,14 @@ class FakeCanva:
 
     def __init__(self):
         self.designs = {d: {"id": d, "title": f"{a} - Listing Presentation", "page_count": 33,
-                            "owner": {"user_id": "u", "team_id": cl.FORWARD_TEAM_ID}, "updated_at": 1}
+                            "owner": {"user_id": "u", "team_id": APP_TEAM}, "updated_at": 1}
                         for a, d in cl.PRESENTATIONS.items()}
         self.live_refresh = {"R0"}
         self.n = 0
         self.calls = []
         self.job_polls = 2
         self.job_result = {"status": "success", "urls": ["https://export/x.pdf"]}
+        self.me = (200, {"team_user": {"user_id": "ops-user", "team_id": APP_TEAM}})
 
     async def http(self, method, url, headers=None, data=None, json=None):
         self.calls.append((method, url, data, json))
@@ -150,6 +153,8 @@ class FakeCanva:
             self.live_refresh.add(f"R{self.n}")
             return 200, {"access_token": f"A{self.n}", "refresh_token": f"R{self.n}",
                          "expires_in": 14400, "token_type": "Bearer"}
+        if url.endswith("/users/me"):
+            return self.me
         if "/designs/" in url:
             d = self.designs.get(url.rsplit("/", 1)[1])
             return (200, {"design": d}) if d else (403, {"code": "permission_denied", "message": "no"})
@@ -186,7 +191,31 @@ def test_connect_saves_only_after_all_five_decks_check_out():
     store, canva = Store(), FakeCanva()
     _, rep = connect(store, canva)
     assert rep["ok"] and rep["saved"] and len(rep["decks"]) == 5
-    assert store.row["refresh_token"] == "R1" and store.row["canva_team_id"] == cl.FORWARD_TEAM_ID
+    assert store.row["refresh_token"] == "R1" and store.row["canva_team_id"] == APP_TEAM
+    assert store.row["canva_user_id"] == "ops-user"
+
+
+def test_team_is_compared_within_this_app_never_to_a_copied_id():
+    # The id the Canva connector showed for FORWARD must play no part.
+    assert not hasattr(cl, "FORWARD_TEAM_ID")
+    code_lines = [l for l in open(cl.__file__).read().splitlines() if not l.lstrip().startswith("#")]
+    assert not any("oBXdxZtv1SuqMjcj59OGxE" in l or "oBZT6QMQrCaCdayC2NYxSQ" in l for l in code_lines)
+
+
+def test_an_account_from_another_team_that_can_see_the_decks_saves_nothing():
+    # e.g. a deck shared outside the team: readable, but not this account's team's
+    store, canva = Store(), FakeCanva()
+    canva.me = (200, {"team_user": {"user_id": "x", "team_id": "some-other-team"}})
+    _, rep = connect(store, canva)
+    assert not rep["ok"] and store.row is None
+    assert all("not the signed-in account's team" in d["reason"] for d in rep["decks"])
+
+
+def test_when_the_account_team_cannot_be_read_nothing_is_saved():
+    store, canva = Store(), FakeCanva()
+    canva.me = (401, {"message": "bad token"})
+    _, rep = connect(store, canva)
+    assert not rep["ok"] and store.row is None and len(rep["decks"]) == 5
 
 
 @pytest.mark.parametrize("breakage", ["other_team", "renamed", "cannot_read"])
