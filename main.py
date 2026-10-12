@@ -4680,3 +4680,127 @@ async def canva_test_export(agent: str = "Marc Cashin"):
     _CANVA_STATE["last_test"] = res
     logger.info("[canva] test export %s", json.dumps({k: res.get(k) for k in ("agent", "ok", "megabytes", "pages", "seconds", "error")}))
     return res
+
+
+# ---------------------------------------------------------------------------
+# Listing presentations: hourly export from Canva, download from the OS
+# (see listing_presentations.py; step 2 of 2, Oct 12, 2026)
+# ---------------------------------------------------------------------------
+import listing_presentations as _lp
+
+
+async def _lp_http(method: str, url: str, headers: dict | None = None,
+                   content: bytes | None = None, json: dict | None = None):
+    async with httpx.AsyncClient(timeout=120) as c:
+        r = await c.request(method, url, headers=headers, content=content, json=json)
+    return r.status_code, r.content
+
+
+LP_STORE = _lp.SupabaseStorage(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, _lp_http)
+_LP_STATE: dict = {"running": False, "last_run": None, "last_manual_at": 0.0, "last_email_at": 0.0}
+
+
+def _lp_email(run: dict) -> None:
+    """Tell Marc when a deck could not be refreshed. At most one a day."""
+    now = _time.time()
+    if now - _LP_STATE["last_email_at"] < 20 * 3600:
+        return
+    try:
+        import resend as resend_sdk
+        key = os.environ.get("RESEND_API_KEY", "")
+        if not key:
+            logger.error("[presentations] RESEND_API_KEY not set, cannot email the failure")
+            return
+        rows = "".join(
+            "<li><b>{}</b>: {}. Agents still get the copy from {}.</li>".format(
+                _esc(r["agent"]), _esc(r.get("reason", "")), _esc(r.get("serving") or "nowhere (none stored yet)"))
+            for r in run["results"] if r["result"] == "failed")
+        resend_sdk.api_key = key
+        resend_sdk.Emails.send({
+            "from": "Forward OS Audit <audit@marccashin.com>",
+            "to": ["marc@marccashin.com"],
+            "subject": "FORWARD OS: listing presentations could not be refreshed from Canva",
+            "html": "<p>The hourly Canva export could not refresh these decks:</p><ul>" + rows + "</ul>"
+                    "<p>If it says the connection has lapsed, open "
+                    "https://forward-command-center-production.up.railway.app/api/canva/connect "
+                    "signed in to Canva as operations@fwrdrealestate.com.</p>",
+        })
+        _LP_STATE["last_email_at"] = now
+    except Exception as e:
+        logger.error("[presentations] failure email could not be sent: %s", e)
+
+
+async def _lp_run(force: bool, trigger: str) -> dict:
+    if _LP_STATE["running"]:
+        return {"ok": None, "status": "already running"}
+    _LP_STATE["running"] = True
+    try:
+        run = await _lp.sync_all(CANVA, LP_STORE, force=force)
+    except Exception as e:
+        logger.exception("[presentations] run crashed")
+        run = {"ok": False, "at": datetime.now(timezone.utc).isoformat(),
+               "results": [{"agent": "all", "result": "failed", "reason": f"{type(e).__name__}: {e}"}]}
+    finally:
+        _LP_STATE["running"] = False
+    run["trigger"] = trigger
+    _LP_STATE["last_run"] = run
+    logger.info("[presentations] %s %s", trigger, json.dumps([(r["agent"], r["result"], r.get("reason")) for r in run["results"]]))
+    if not run.get("ok"):
+        _lp_email(run)
+    return run
+
+
+async def job_listing_presentations():
+    try:
+        if not CANVA.store.get():
+            return   # not connected yet: nothing to do, nothing to email
+    except Exception:
+        return
+    await _lp_run(False, "hourly")
+
+
+@app.on_event("startup")
+async def register_listing_presentations_job():
+    scheduler.add_job(job_listing_presentations, CronTrigger(minute=7, timezone="America/New_York"),
+                      id="listing_presentations", replace_existing=True)
+    logger.info("[presentations] hourly Canva export registered (minute 7)")
+
+
+def _lp_guard(request: Request) -> None:
+    if not _lp.origin_allowed(request.headers.get("origin")):
+        raise HTTPException(status_code=403, detail="Listing presentations open only from FORWARD OS.")
+
+
+@app.get("/api/listing-presentation")
+async def listing_presentation(request: Request, agent: str = ""):
+    """The signed-in agent's own deck: a link to that one PDF, good for 5 minutes."""
+    _lp_guard(request)
+    name = AGENT_NAME_MAP.get(agent, agent)
+    try:
+        return await _lp.download_link(LP_STORE, name)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except _lp.StorageError as e:
+        logger.error("[presentations] download for %s failed: %s", name, e)
+        raise HTTPException(status_code=502, detail=f"The presentation could not be fetched: {e}")
+
+
+@app.get("/api/listing-presentations/status")
+async def listing_presentations_status():
+    return {"running": _LP_STATE["running"], "last_run": _LP_STATE["last_run"],
+            "agents": await _lp.status(LP_STORE)}
+
+
+@app.post("/api/listing-presentations/refresh")
+async def listing_presentations_refresh(request: Request, background_tasks: BackgroundTasks):
+    """Marc's Refresh from Canva. Exports all five now, in the background."""
+    _lp_guard(request)
+    now = _time.time()
+    wait = 120 - (now - _LP_STATE["last_manual_at"])
+    if wait > 0:
+        raise HTTPException(status_code=429, detail=f"A refresh was started recently. Try again in {int(wait)} seconds.")
+    if _LP_STATE["running"]:
+        return {"status": "already running"}
+    _LP_STATE["last_manual_at"] = now
+    background_tasks.add_task(_lp_run, True, "manual")
+    return {"status": "started"}
