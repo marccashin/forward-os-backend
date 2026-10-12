@@ -335,6 +335,27 @@ class CanvaLink:
                     self.log.error("[canva] refreshed, but the stored token had already moved")
             return tok["access_token"]
 
+    # ── one deck, for the scheduled export ──
+    async def deck_check(self, agent: str) -> dict:
+        """Read one deck's metadata and confirm it is still that agent's deck:
+        exact title, owned by the connected account's own team. Raises
+        CanvaError with the reason otherwise."""
+        token = await self.access_token()
+        auth = {"Authorization": f"Bearer {token}"}
+        status, body = await self.http("GET", f"{API_BASE}/users/me", headers=auth)
+        my_team = (((body or {}).get("team_user") or {}).get("team_id")) if isinstance(body, dict) else None
+        if status != 200 or not my_team:
+            raise CanvaError("could not read the connected account's team (" + _err(status, body) + ")")
+        status, body = await self.http("GET", f"{API_BASE}/designs/{PRESENTATIONS[agent]}", headers=auth)
+        d = body.get("design") if isinstance(body, dict) else None
+        if status != 200 or not d:
+            raise CanvaError("cannot read the deck (" + _err(status, body) + ")")
+        if d.get("title") != expected_title(agent):
+            raise CanvaError(f"the deck's title is now '{d.get('title')}', not '{expected_title(agent)}'")
+        if (d.get("owner") or {}).get("team_id") != my_team:
+            raise CanvaError("the deck is no longer owned by the connected account's team")
+        return d
+
     # ── export ──
     async def export_pdf(self, design_id: str, *, timeout_s: float = 180, poll_s: float = 2.0,
                          max_bytes: int = 200 * 1024 * 1024) -> bytes:
