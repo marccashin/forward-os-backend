@@ -316,7 +316,7 @@ def test_export_waits_for_the_job_and_returns_the_pdf():
     data = run(lk_fast.export_pdf(cl.PRESENTATIONS["Niki Lang"], poll_s=0))
     assert data.startswith(b"%PDF-")
     post = [c for c in canva.calls if c[0] == "POST" and c[1].endswith("/exports")][0]
-    assert post[3] == {"design_id": "DAHEC2uBYwc", "format": {"type": "pdf", "export_quality": "regular"}}
+    assert post[3] == {"design_id": "DAHEC2uBYwc", "format": {"type": "pdf", "export_quality": "pro"}}
 
 
 @pytest.mark.parametrize("result,msg", [

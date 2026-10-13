@@ -357,13 +357,20 @@ class CanvaLink:
         return d
 
     # ── export ──
-    async def export_pdf(self, design_id: str, *, timeout_s: float = 180, poll_s: float = 2.0,
-                         max_bytes: int = 200 * 1024 * 1024) -> bytes:
+    async def export_pdf(self, design_id: str, *, quality: str = "pro", timeout_s: float = 180,
+                         poll_s: float = 2.0, max_bytes: int = 200 * 1024 * 1024) -> bytes:
+        """quality "pro" keeps the deck's images at full resolution (Canva's PDF
+        Print). "regular" (PDF Standard) caps every image at 800 px on its long
+        side: the Oct 12, 2026 PDFs were pixelated for exactly that reason. A pro
+        export can fail with license_required when the deck uses premium
+        elements the plan has not licensed (canva.dev, create-design-export-job)."""
+        if quality not in ("pro", "regular"):
+            raise ValueError("quality must be pro or regular")
         token = await self.access_token()
         auth = {"Authorization": f"Bearer {token}"}
         status, body = await self.http(
             "POST", f"{API_BASE}/exports", headers={**auth, "Content-Type": "application/json"},
-            json={"design_id": design_id, "format": {"type": "pdf", "export_quality": "regular"}})
+            json={"design_id": design_id, "format": {"type": "pdf", "export_quality": quality}})
         job = body.get("job") if isinstance(body, dict) else None
         if status != 200 or not job:
             raise CanvaError("Canva would not start the export (" + _err(status, body) + ")")
@@ -402,15 +409,26 @@ def pdf_facts(data: bytes) -> dict:
             "chars": sum(len(t) for t in texts)}
 
 
-async def test_export(link: CanvaLink, agent: str) -> dict:
+async def test_export(link: CanvaLink, agent: str, quality: str = "pro") -> dict:
     """Export one deck and report what came back. Stores nothing."""
     design_id = PRESENTATIONS[agent]
     t0 = time.monotonic()
-    data = await link.export_pdf(design_id)
+    data = await link.export_pdf(design_id, quality=quality)
     secs = round(time.monotonic() - t0, 1)
     facts = await asyncio.to_thread(pdf_facts, data)
     ok, why = check_owner(agent, facts["text"])
-    return {"agent": agent, "design_id": design_id, "bytes": len(data),
+    slimmed = None
+    if quality == "pro":
+        import pdf_slim
+        t1 = time.monotonic()
+        out, rep = await asyncio.to_thread(pdf_slim.slim_to_fit, data, 45 * 1024 * 1024)
+        sf = await asyncio.to_thread(pdf_facts, out) if not rep.get("error") else None
+        slimmed = {"megabytes": round(len(out) / 1024 / 1024, 1), "seconds": round(time.monotonic() - t1, 1),
+                   "fits": rep.get("fits"), "photo_side_cap": rep.get("max_side"),
+                   "images_resaved": rep.get("images_resaved"), "skipped": rep.get("skipped"),
+                   "error": rep.get("error"),
+                   "same_pages_and_text": bool(sf and sf["pages"] == facts["pages"] and sf["text"] == facts["text"])}
+    return {"agent": agent, "design_id": design_id, "quality": quality, "slimmed": slimmed, "bytes": len(data),
             "megabytes": round(len(data) / 1024 / 1024, 1), "pages": facts["pages"],
             "text_chars": facts["chars"], "seconds": secs,
             "sha256": hashlib.sha256(data).hexdigest(),
