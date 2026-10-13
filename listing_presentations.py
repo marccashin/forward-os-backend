@@ -37,10 +37,13 @@ from typing import Any, Callable, Optional
 from urllib.parse import quote
 
 import canva_link as cl
+import pdf_slim
 
 BUCKET = "listing-presentations"
 LINK_SECONDS = 300
 REEXPORT_AFTER = timedelta(hours=24)
+# The bucket refuses files over 50 MB; leave room so a deck never sits at the edge.
+MAX_STORE_BYTES = 45 * 1024 * 1024
 
 # Folder per agent. Fixed text, never built from a request.
 FOLDER: dict[str, str] = {a: a.replace(" ", "_") for a in cl.PRESENTATIONS}
@@ -156,7 +159,8 @@ def _now() -> datetime:
 
 
 async def sync_one(link: cl.CanvaLink, store, agent: str, *, force: bool = False,
-                   now: Callable[[], datetime] = _now, pdf_facts=cl.pdf_facts) -> dict:
+                   now: Callable[[], datetime] = _now, pdf_facts=cl.pdf_facts,
+                   slim=pdf_slim.slim_to_fit, max_bytes: int = MAX_STORE_BYTES) -> dict:
     """Bring one agent's stored PDF up to date. Never removes the last good
     PDF unless a new one passed every check and is stored."""
     folder = FOLDER[agent]
@@ -178,16 +182,53 @@ async def sync_one(link: cl.CanvaLink, store, agent: str, *, force: bool = False
     except cl.CanvaError as e:
         return await record_failure(str(e))
 
-    if not force and cur and cur.get("path") and not cur.get("last_error"):
+    # A copy made before Oct 13, 2026 (no "quality") or at regular quality is
+    # re-exported: regular caps every image at 800 px. If Canva refuses pro
+    # again, the regular copy is kept and the run says so (see below).
+    if not force and cur and cur.get("path") and not cur.get("last_error") and cur.get("quality") == "pro":
         fresh = now() - datetime.fromisoformat(cur["exported_at"]) < REEXPORT_AFTER
         if fresh and str(cur.get("design_updated_at")) == str(d.get("updated_at")):
             return {"agent": agent, "result": "unchanged", "serving": cur.get("exported_at")}
 
+    quality, warning = "pro", None
     try:
-        data = await link.export_pdf(cl.PRESENTATIONS[agent])
+        data = await link.export_pdf(cl.PRESENTATIONS[agent], quality="pro")
     except cl.CanvaError as e:
-        return await record_failure(str(e))
-    facts = await asyncio.to_thread(pdf_facts, data)
+        if "license_required" not in str(e):
+            return await record_failure(str(e))
+        # Canva refused full resolution (premium elements not licensed). A
+        # lower-resolution deck is better than none, but it is never silent.
+        quality = "regular"
+        warning = ("Canva refused a full-resolution export (license_required), so this deck is "
+                   "stored at standard quality and its photos are lower resolution. Remove or "
+                   "license the premium elements in Canva, then press Refresh from Canva.")
+        try:
+            data = await link.export_pdf(cl.PRESENTATIONS[agent], quality="regular")
+        except cl.CanvaError as e2:
+            return await record_failure(str(e2))
+    # Full resolution is 96 to 113 MB a deck (Oct 13, 2026): too big for the
+    # bucket and for a phone. Re-save the photos the way Marc's own Canva
+    # download is (pdf_slim). The slimmed file must have the same pages and the
+    # same text as what Canva sent, or nothing is stored.
+    slim_report = None
+    if quality == "pro":
+        original = await asyncio.to_thread(pdf_facts, data)
+        try:
+            slimmed, slim_report = await asyncio.to_thread(slim, data, max_bytes)
+        except Exception as e:
+            return await record_failure(f"could not reduce the full-resolution PDF: {type(e).__name__}: {e}")
+        if slim_report.get("error"):
+            return await record_failure("could not reduce the full-resolution PDF: " + slim_report["error"])
+        facts = await asyncio.to_thread(pdf_facts, slimmed)
+        if facts["pages"] != original["pages"] or facts["text"] != original["text"]:
+            return await record_failure("the reduced PDF did not match Canva's export (pages or text differ)")
+        data = slimmed
+    else:
+        facts = await asyncio.to_thread(pdf_facts, data)
+    if len(data) > max_bytes:
+        return await record_failure(
+            f"the PDF is {len(data) / 1048576:.1f} MB, over the {max_bytes / 1048576:.0f} MB the store "
+            "takes, even with photos reduced; the last good copy is still served")
     ok, why = cl.check_owner(agent, facts["text"])
     if not ok:
         return await record_failure("the exported PDF failed the ownership check: " + why)
@@ -206,7 +247,10 @@ async def sync_one(link: cl.CanvaLink, store, agent: str, *, force: bool = False
         rec = {"agent": agent, "design_id": cl.PRESENTATIONS[agent], "path": path,
                "sha256": sha, "bytes": len(data), "pages": facts["pages"],
                "exported_at": now().isoformat(), "design_updated_at": after.get("updated_at"),
-               "owner_check": why, "last_error": None, "last_attempt_at": attempt}
+               "owner_check": why, "last_error": None, "last_attempt_at": attempt,
+               "quality": quality, "quality_warning": warning,
+               "photo_side_cap": (slim_report or {}).get("max_side"),
+               "bytes_from_canva": (slim_report or {}).get("bytes_in")}
         await write_pointer(store, agent, rec)
     except cl.CanvaError as e:
         return await record_failure(str(e))
@@ -220,8 +264,14 @@ async def sync_one(link: cl.CanvaLink, store, agent: str, *, force: bool = False
         await store.remove(old)
     except Exception:
         pass
-    return {"agent": agent, "result": "updated", "pages": facts["pages"],
-            "megabytes": round(len(data) / 1048576, 1), "serving": rec["exported_at"]}
+    out = {"agent": agent, "result": "updated", "pages": facts["pages"], "quality": quality,
+           "megabytes": round(len(data) / 1048576, 1), "serving": rec["exported_at"]}
+    if slim_report:
+        out["megabytes_from_canva"] = round(slim_report["bytes_in"] / 1048576, 1)
+        out["photo_side_cap"] = slim_report["max_side"]
+    if warning:
+        out["warning"] = warning
+    return out
 
 
 async def sync_all(link, store, *, force: bool = False, **kw) -> dict:
@@ -231,7 +281,7 @@ async def sync_all(link, store, *, force: bool = False, **kw) -> dict:
             results.append(await sync_one(link, store, agent, force=force, **kw))
         except Exception as e:   # one agent never stops the others
             results.append({"agent": agent, "result": "failed", "reason": f"{type(e).__name__}: {e}"})
-    failed = [r for r in results if r["result"] == "failed"]
+    failed = [r for r in results if r["result"] == "failed" or r.get("warning")]
     return {"ok": not failed, "at": _now().isoformat(), "results": results}
 
 
@@ -259,7 +309,10 @@ async def status(store) -> dict:
             rec = {"last_error": f"could not read: {e}"}
         out[agent] = {"pages": rec.get("pages"), "exported_at": rec.get("exported_at"),
                       "last_attempt_at": rec.get("last_attempt_at"), "last_error": rec.get("last_error"),
-                      "has_file": bool(rec.get("path"))}
+                      "has_file": bool(rec.get("path")), "quality": rec.get("quality"),
+                      "megabytes": round(rec["bytes"] / 1048576, 1) if rec.get("bytes") else None,
+                      "photo_side_cap": rec.get("photo_side_cap"),
+                      "quality_warning": rec.get("quality_warning")}
     return out
 
 

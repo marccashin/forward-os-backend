@@ -4657,7 +4657,7 @@ async def canva_status(check: bool = False):
 
 
 @app.post("/api/canva/test-export")
-async def canva_test_export(agent: str = "Marc Cashin"):
+async def canva_test_export(agent: str = "Marc Cashin", quality: str = "pro"):
     """Export one deck, measure it and run the ownership check. Stores nothing."""
     agent = AGENT_NAME_MAP.get(agent, agent)
     if agent not in _canva.PRESENTATIONS:
@@ -4668,7 +4668,9 @@ async def canva_test_export(agent: str = "Marc Cashin"):
         raise HTTPException(status_code=429, detail=f"Try again in {int(wait)} seconds.")
     _CANVA_STATE["last_test_at"] = now
     try:
-        res = await _canva.test_export(CANVA, agent)
+        if quality not in ("pro", "regular"):
+            raise HTTPException(status_code=400, detail="quality must be pro or regular")
+        res = await _canva.test_export(CANVA, agent, quality)
     except _canva.CanvaError as e:
         res = {"agent": agent, "ok": False, "error": str(e)}
     except Exception as e:
@@ -4715,12 +4717,15 @@ def _lp_email(run: dict) -> None:
             "<li><b>{}</b>: {}. Agents still get the copy from {}.</li>".format(
                 _esc(r["agent"]), _esc(r.get("reason", "")), _esc(r.get("serving") or "nowhere (none stored yet)"))
             for r in run["results"] if r["result"] == "failed")
+        rows += "".join(
+            "<li><b>{}</b>: {}</li>".format(_esc(r["agent"]), _esc(r["warning"]))
+            for r in run["results"] if r.get("warning"))
         resend_sdk.api_key = key
         resend_sdk.Emails.send({
             "from": "Forward OS Audit <audit@marccashin.com>",
             "to": ["marc@marccashin.com"],
-            "subject": "FORWARD OS: listing presentations could not be refreshed from Canva",
-            "html": "<p>The hourly Canva export could not refresh these decks:</p><ul>" + rows + "</ul>"
+            "subject": "FORWARD OS: listing presentations need attention (Canva export)",
+            "html": "<p>The hourly Canva export needs attention on these decks:</p><ul>" + rows + "</ul>"
                     "<p>If it says the connection has lapsed, open "
                     "https://forward-command-center-production.up.railway.app/api/canva/connect "
                     "signed in to Canva as operations@fwrdrealestate.com.</p>",
