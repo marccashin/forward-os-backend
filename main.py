@@ -4809,3 +4809,48 @@ async def listing_presentations_refresh(request: Request, background_tasks: Back
     _LP_STATE["last_manual_at"] = now
     background_tasks.add_task(_lp_run, True, "manual")
     return {"status": "started"}
+
+
+# ---------------------------------------------------------------------------
+# Open To Close: read-only probe of the task data (Oct 15, 2026; see otc_probe.py)
+# ---------------------------------------------------------------------------
+import otc_probe as _otc
+
+
+async def _otc_http(method: str, url: str):
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.request(method, url)
+    return r.status_code, r.content
+
+
+_OTC_STATE: dict = {"running": False}
+
+
+@app.get("/api/otc/probe")
+async def otc_probe(request: Request, property_id: int = 0):
+    """READ ONLY. No property_id: the newest transactions in Open To Close.
+    With property_id: every task on that transaction exactly as Open To Close
+    sends it, plus the shape of its fields. Opens only from FORWARD OS pages."""
+    _lp_guard(request)
+    token = os.environ.get("OTC_API_TOKEN", "").strip()
+    if not token:
+        raise HTTPException(status_code=503, detail="OTC_API_TOKEN is not set on the backend.")
+    if _OTC_STATE["running"]:
+        raise HTTPException(status_code=429, detail="A probe is already running. Try again in a few seconds.")
+    _OTC_STATE["running"] = True
+    client = _otc.OtcClient(token, _otc_http)
+    try:
+        if property_id:
+            res = await _otc.probe_tasks(client, property_id)
+        else:
+            res = await _otc.list_recent(client)
+    except _otc.OtcError as e:
+        res = {"ok": False, "error": _otc.scrub(str(e), token)}
+    except Exception as e:
+        logger.error("[otc] probe crashed: %s", _otc.scrub(f"{type(e).__name__}: {e}", token))
+        res = {"ok": False, "error": _otc.scrub(f"{type(e).__name__}: {e}", token)}
+    finally:
+        _OTC_STATE["running"] = False
+    res["calls"] = [{"path": p, "status": s} for p, s in client.calls]
+    logger.info("[otc] probe property_id=%s calls=%s", property_id or "-", json.dumps(res["calls"]))
+    return res
