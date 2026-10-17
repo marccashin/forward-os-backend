@@ -63,6 +63,11 @@ def test_pick_and_summary():
     assert how == "name" and hits[0]["id"] == 917
     assert fds.summarize(hits[0], how)["name_is_address"] is False, "so the agent is reminded to rename it"
     assert fds.pick_by_address("Kylie Dowling", live) == ([], "none"), "a name must match exactly"
+    flip = [deal(918, "2909 7th st NE", "Listed", "2026-10-15T14:40:14Z"), deal(729, "2909 7th St NE", "Total Closed This Year", "2026-05-01T00:00:00Z")]
+    hits, how = fds.pick_by_address("2909 7th st NE, 20017", flip)
+    assert how == "address" and [d["id"] for d in hits] == [918], "bought, flipped, listed again: the live sale wins"
+    assert fds.pick_by_address("2909 7th st NE", flip + [deal(950, "2909 7th St NE", "Pending", None)])[1] == "ambiguous", "two live deals are never guessed"
+    assert fds.pick_by_address("2909 7th st NE", [deal(729, "2909 7th St NE", "Total Closed This Year", None), deal(730, "2909 7th St NE", "Terminated", None)])[1] == "ambiguous", "no live deal: not guessed"
     assert fds.pick_by_address("12 Main St NW", [deal(1, "12 Main Ave NW", "Listed", None), deal(2, "12 Main Rd NW", "Listed", None)])[1] == "ambiguous", "two loose hits are never guessed"
     s = fds.summarize(SELLERS[0], "address")
     assert s == {"found": True, "how": "address", "deal_id": 940, "pipeline": "Sellers",
