@@ -74,6 +74,14 @@ def pick_by_address(address: str, deals: list[dict]) -> tuple[list[dict], str]:
     return [], "none"
 
 
+def name_is_address(name) -> bool:
+    """True when a deal's name reads as a street address: a house number, then a word
+    ("6300 Stevenson Ave #1120", "1415 Riverside Ave."). The guide tells agents to put
+    the address in the deal card's name, not the seller's name (Seller Engaged step);
+    FORWARD OS reminds them when the name is a person's ("Abby Wenk")."""
+    return bool(re.match(r"^\s*\d+[a-z]?(-\d+)?\s+[a-z0-9]", str(name or ""), re.I))
+
+
 def summarize(deal: dict | None, how: str, count: int = 0) -> dict:
     """What FORWARD OS gets: stage and when it entered it, nothing personal."""
     if not deal:
@@ -85,4 +93,5 @@ def summarize(deal: dict | None, how: str, count: int = 0) -> dict:
         "pipeline": deal.get("pipelineName") or "",
         "stage": deal.get("stageName") or "",
         "entered_stage_at": deal.get("enteredStageAt") or None,
+        "name_is_address": name_is_address(deal.get("name")),
     }
