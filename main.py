@@ -5032,7 +5032,7 @@ async def fub_listing_stage(request: Request, property_id: str = ""):
                     raise
                 logger.warning("[fub-stage] listing %s names deal %s, which Follow Up Boss no longer has", pid, did)
         hits, how = _fds.pick_by_address(prop.get("address") or "", await _fds_seller_deals())
-        return _fds.summarize(hits[0] if how == "address" else None, how, len(hits))
+        return _fds.summarize(hits[0] if how in ("address", "name") else None, how, len(hits))
     except HTTPException:
         raise
     except Exception as e:
