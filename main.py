@@ -5069,3 +5069,71 @@ async def otc_poll_now(request: Request):
         raise HTTPException(status_code=429, detail="Ran less than a minute ago. Try again shortly.")
     _OTCP_STATE["last_manual_at"] = now
     return await _otcp_run("manual")
+
+
+# ---------------------------------------------------------------------------
+# Daily hot sheet for Concierge and Transactions (Oct 17, 2026; see hot_sheet.py)
+#
+# Step 4 of the Deal Progress tracker. A Zap (Schedule by Zapier, weekdays 8am ET)
+# GETs /api/hot-sheet/concierge and /api/hot-sheet/transactions and sends each through
+# Gmail. This route only READS (service-role client) and writes the email text; it
+# sends nothing. The Zap is not a browser, so the FORWARD OS Origin check cannot guard
+# it: it must send the header x-hot-sheet-secret equal to the Railway variable
+# HOT_SHEET_SECRET. Unset variable = 503 (not switched on), wrong secret = 403.
+# ---------------------------------------------------------------------------
+import hmac as _hmac
+import hot_sheet as _hs
+
+_HS_PAGE = 1000
+
+
+def _hs_rows(table: str, cols: str, apply=None) -> list:
+    """Every matching row, read in pages so a long table is never cut off at 1,000."""
+    out, start = [], 0
+    while True:
+        q = supabase.table(table).select(cols)
+        if apply:
+            q = apply(q)
+        r = q.range(start, start + _HS_PAGE - 1).execute()
+        rows = r.data or []
+        out.extend(rows)
+        if len(rows) < _HS_PAGE:
+            return out
+        start += _HS_PAGE
+
+
+def _hs_build(team: str, now) -> dict:
+    if team == "concierge":
+        sheet = _hs.concierge_sheet(
+            _hs_rows("listings", "id,address,agent,stage,status", lambda q: q.eq("status", "active")),
+            _hs_rows("listing_checklist_items", "id,listing_id,title,completed,owner,stage,created_at",
+                     lambda q: q.eq("completed", False)),
+            _hs_rows("deals", "id,client_name,agent_name,pipeline,stage,closed_at", lambda q: q.eq("pipeline", "buyer")),
+            _hs_rows("deal_tasks", "id,deal_id,title,owner,completed,stage_triggered,created_at",
+                     lambda q: q.eq("completed", False)),
+            now)
+    else:
+        sheet = _hs.transactions_sheet(
+            _hs_rows("otc_properties", "id,address,status"),
+            _hs_rows("otc_tasks", "property_id,task_id,title,position,otc_created,completed,removed_at",
+                     lambda q: q.eq("completed", False)),
+            now)
+    return _hs.render(sheet, now)
+
+
+@app.get("/api/hot-sheet/{team}")
+async def hot_sheet(team: str, x_hot_sheet_secret: str = Header(default="")):
+    secret = os.environ.get("HOT_SHEET_SECRET", "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="The hot sheet is not switched on (HOT_SHEET_SECRET is not set).")
+    if not _hmac.compare_digest(x_hot_sheet_secret.strip().encode(), secret.encode()):
+        raise HTTPException(status_code=403, detail="Not allowed.")
+    if team not in _hs.TEAMS:
+        raise HTTPException(status_code=404, detail="Unknown team. Use concierge or transactions.")
+    try:
+        out = await asyncio.to_thread(_hs_build, team, datetime.now(timezone.utc))
+    except Exception as e:
+        logger.exception("[hot-sheet] %s could not be built", team)
+        raise HTTPException(status_code=502, detail="The hot sheet could not be built: " + type(e).__name__)
+    logger.info("[hot-sheet] %s built: %s items", team, out["count"])
+    return out
