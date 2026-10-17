@@ -3966,11 +3966,15 @@ async def _run_cc_audit() -> dict:
 
     # -----------------------------------------------------------------------
     # 16. audit_log unresolved errors — last 24h
+    # Only rows marked severity "error" count. The Command Center's columns
+    # (severity, resolved_at) were added to the live table on Oct 17, 2026; without
+    # this filter every routine entry would read as an unresolved error.
     # -----------------------------------------------------------------------
     try:
         r = (supabase.table("audit_log")
              .select("id", count="exact")
              .gte("created_at", cutoff_24h)
+             .eq("severity", "error")
              .is_("resolved_at", "null")
              .execute())
         count = r.count if r.count is not None else len(r.data)
