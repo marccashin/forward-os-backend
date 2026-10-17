@@ -16,6 +16,7 @@ P_ADDRESS = "22222222-2222-4222-8222-222222222222"
 P_TWO = "33333333-3333-4333-8333-333333333333"
 P_NONE = "44444444-4444-4444-8444-444444444444"
 P_GONE = "55555555-5555-4555-8555-555555555555"
+P_NAMED = "77777777-7777-4777-8777-777777777777"
 
 
 def deal(i, name, stage, entered, pipeline="Sellers"):
@@ -123,6 +124,7 @@ def test_route(monkeypatch):
         {"id": P_TWO, "address": "12 Twin Way NW, Washington, DC", "subfolder_drive_ids": None},
         {"id": P_NONE, "address": "9 Nowhere Rd, Bethesda, MD", "fub_deal_id": "917", "subfolder_drive_ids": {}},
         {"id": P_GONE, "address": "7532 Coxton Ct Unit G-127", "subfolder_drive_ids": {"_fub_deal_id": "1"}},
+        {"id": P_NAMED, "address": "Kylie & Brian Dowling", "subfolder_drive_ids": {}},
     ]
     monkeypatch.setattr(main, "supabase", FakeSB(props))
     calls = []
@@ -170,6 +172,10 @@ def test_route(monkeypatch):
     assert r["how"] == "address" and r["deal_id"] == 940, "a stamped deal FUB no longer has falls back to the address"
     assert sum(1 for p, q in calls if p == "/deals") == 2, "the Sellers list is kept for 10 minutes"
     assert sum(1 for p, q in calls if p == "/pipelines") == 1
+
+    r = c.get("/api/fub/listing-stage", params={"property_id": P_NAMED}, headers=ORIGIN).json()
+    assert r["found"] is True and r["how"] == "name" and r["deal_id"] == 917 and r["name_is_address"] is False, \
+        "a card named after the sellers finds its deal by name, through the route (missed in #67)"
 
     async def broken(path, params=None):
         raise RuntimeError("401 Unauthorized")
