@@ -64,13 +64,51 @@ def stamped_deal_id(prop: dict) -> str:
     return str(sdi.get("_fub_deal_id") or "").strip()
 
 
+_STREET_TYPES = {"st", "ave", "rd", "dr", "ct", "pl", "blvd", "ln", "ter", "cir", "hwy", "pkwy", "sq", "trl", "way"}
+
+
+def same_address_loose(a, b) -> bool:
+    """same_address with street types left out ("St", "Ave", ...), for deal names
+    typed without one: "2500 N Van Dorn #205" is "2500 N Van Dorn St, Unit 205".
+    Used only when the strict rule finds nothing, and only a single hit counts."""
+    x = [t for t in addr_tokens(a) if t not in _STREET_TYPES]
+    y = [t for t in addr_tokens(b) if t not in _STREET_TYPES]
+    short, long_ = (x, y) if len(x) <= len(y) else (y, x)
+    if len(short) < 3 or not re.search(r"\d", short[0]):
+        return False
+    return all(i < len(long_) and long_[i] == tok for i, tok in enumerate(short))
+
+
+def _norm_name(v) -> str:
+    return " ".join(str(v or "").lower().replace(".", "").replace(",", " ").split())
+
+
 def pick_by_address(address: str, deals: list[dict]) -> tuple[list[dict], str]:
-    """Sellers deals whose name is this address. Returns (hits, how)."""
-    hits = [d for d in (deals or []) if isinstance(d, dict) and same_address(address, d.get("name"))]
+    """Sellers deals that are this listing. Returns (hits, how).
+
+    1. strict address rule (same as FORWARD OS and the Command Center);
+    2. else the same rule without street types, single hit only;
+    3. else, for a listing whose "address" is not an address (a card named after the
+       seller, as the Seller Engaged webhook does when the deal card keeps the
+       seller's name), a deal whose name is exactly that name, single hit only.
+    Two or more hits at any step are reported as ambiguous, never guessed."""
+    deals = [d for d in (deals or []) if isinstance(d, dict)]
+    hits = [d for d in deals if same_address(address, d.get("name"))]
     if len(hits) == 1:
         return hits, "address"
     if len(hits) > 1:
         return hits, "ambiguous"
+    hits = [d for d in deals if same_address_loose(address, d.get("name"))]
+    if len(hits) == 1:
+        return hits, "address"
+    if len(hits) > 1:
+        return hits, "ambiguous"
+    if not name_is_address(address) and _norm_name(address):
+        hits = [d for d in deals if _norm_name(d.get("name")) == _norm_name(address)]
+        if len(hits) == 1:
+            return hits, "name"
+        if len(hits) > 1:
+            return hits, "ambiguous"
     return [], "none"
 
 

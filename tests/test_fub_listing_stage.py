@@ -48,6 +48,21 @@ def test_pick_and_summary():
     hits, how = fds.pick_by_address("12 Twin Way", SELLERS)
     assert how == "ambiguous" and len(hits) == 2
     assert fds.pick_by_address("9 Nowhere Rd", SELLERS) == ([], "none")
+    # Live cases (Oct 17, 2026): a deal name typed without "St", and a card named after the sellers
+    live = [deal(777, "2500 N Van Dorn #205", "Listed", "2026-09-01T00:00:00Z"),
+            deal(917, "Kylie & Brian Dowling", "Seller Engaged", "2026-10-06T12:42:29Z"),
+            deal(833, "1300 Army Navy Dr #1019", "Seller Engaged", "2026-09-01T00:00:00Z"),
+            deal(918, "2909 7th st NE", "Listed", "2026-10-15T14:40:14Z")]
+    hits, how = fds.pick_by_address("2500 N Van Dorn St, Unit 205, Alexandria VA 22302", live)
+    assert how == "address" and hits[0]["id"] == 777, (how, hits)
+    assert fds.pick_by_address("2500 N Van Dorn St, Unit #304, Alexandria VA 22302", live) == ([], "none"), "another unit is another home"
+    assert fds.pick_by_address("1300 Army Navy Dr #518", live) == ([], "none"), "another unit is another home"
+    assert fds.pick_by_address("2909 7th st NW, 20017", live) == ([], "none"), "NW is not NE"
+    hits, how = fds.pick_by_address("Kylie & Brian Dowling", live)
+    assert how == "name" and hits[0]["id"] == 917
+    assert fds.summarize(hits[0], how)["name_is_address"] is False, "so the agent is reminded to rename it"
+    assert fds.pick_by_address("Kylie Dowling", live) == ([], "none"), "a name must match exactly"
+    assert fds.pick_by_address("12 Main St NW", [deal(1, "12 Main Ave NW", "Listed", None), deal(2, "12 Main Rd NW", "Listed", None)])[1] == "ambiguous", "two loose hits are never guessed"
     s = fds.summarize(SELLERS[0], "address")
     assert s == {"found": True, "how": "address", "deal_id": 940, "pipeline": "Sellers",
                  "stage": "Listing App. Scheduled", "entered_stage_at": "2026-10-09T15:00:00Z", "name_is_address": True}
