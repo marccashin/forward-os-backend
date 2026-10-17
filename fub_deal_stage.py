@@ -83,6 +83,18 @@ def _norm_name(v) -> str:
     return " ".join(str(v or "").lower().replace(".", "").replace(",", " ").split())
 
 
+FINISHED_STAGES = {"closed this quarter", "total closed this year", "previous year", "total", "terminated"}
+
+
+def _one_open(hits: list[dict]) -> list[dict]:
+    """Of several deals at one address, the single one still in progress, if there is
+    exactly one. A home sold earlier and listed again (2909 7th St NE, Oct 2026: bought,
+    flipped, now for sale) has a finished deal and a live one; the listing card is the
+    live sale."""
+    live = [d for d in hits if str(d.get("stageName") or "").strip().lower() not in FINISHED_STAGES]
+    return live if len(live) == 1 else []
+
+
 def pick_by_address(address: str, deals: list[dict]) -> tuple[list[dict], str]:
     """Sellers deals that are this listing. Returns (hits, how).
 
@@ -91,24 +103,25 @@ def pick_by_address(address: str, deals: list[dict]) -> tuple[list[dict], str]:
     3. else, for a listing whose "address" is not an address (a card named after the
        seller, as the Seller Engaged webhook does when the deal card keeps the
        seller's name), a deal whose name is exactly that name, single hit only.
-    Two or more hits at any step are reported as ambiguous, never guessed."""
+    Two or more hits at any step are ambiguous, unless exactly one of them is still in
+    progress (not closed or terminated): that one is the listing's live sale."""
     deals = [d for d in (deals or []) if isinstance(d, dict)]
     hits = [d for d in deals if same_address(address, d.get("name"))]
     if len(hits) == 1:
         return hits, "address"
     if len(hits) > 1:
-        return hits, "ambiguous"
+        return (_one_open(hits), "address") if _one_open(hits) else (hits, "ambiguous")
     hits = [d for d in deals if same_address_loose(address, d.get("name"))]
     if len(hits) == 1:
         return hits, "address"
     if len(hits) > 1:
-        return hits, "ambiguous"
+        return (_one_open(hits), "address") if _one_open(hits) else (hits, "ambiguous")
     if not name_is_address(address) and _norm_name(address):
         hits = [d for d in deals if _norm_name(d.get("name")) == _norm_name(address)]
         if len(hits) == 1:
             return hits, "name"
         if len(hits) > 1:
-            return hits, "ambiguous"
+            return (_one_open(hits), "name") if _one_open(hits) else (hits, "ambiguous")
     return [], "none"
 
 
