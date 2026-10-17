@@ -201,7 +201,7 @@ class FakeSupabase:
 def test_route():
     m = load_main()
     many = [LI("a", f"Item {k}", et(2026, 9, 1)) for k in range(2500)]   # crosses two page edges
-    fake = FakeSupabase({"listings": [L("a")], "listing_checklist_items": many, "deals": [], "deal_tasks": [],
+    fake = FakeSupabase({"listings": [L("a")], "listing_checklist_items": many, "deals": [], "deal_tasks": [], "cc_buyers": [],
                          "otc_properties": [{"id": 1, "address": "138 U St NE", "status": "Open"}],
                          "otc_tasks": [T(1, k, k, et(2026, 9, 1)) for k in range(1, 10)]})
     m.supabase = fake
@@ -216,6 +216,7 @@ def test_route():
     assert r.status_code == 200, r.text
     assert r.json()["count"] == 2500, r.json()["count"]
     assert ("listing_checklist_items", 2000, 2999) in fake.log
+    assert any(x[0] == "cc_buyers" for x in fake.log)
     r = c.get("/api/hot-sheet/transactions", headers={"x-hot-sheet-secret": "s3cret"})
     assert r.status_code == 200 and r.json()["count"] == 4
     assert set(r.json()) == {"team", "subject", "html", "text", "count"}
@@ -227,3 +228,49 @@ def test_route():
     r = c.get("/api/hot-sheet/transactions", headers={"x-hot-sheet-secret": "s3cret"})
     assert r.status_code == 502 and "could not be built" in r.text
     m.supabase = fake
+
+
+# ── Oct 17, 2026 (second change): start date, buyer cards, no em dash ─────────
+
+def test_start_date_is_fixed_aug_1():
+    assert hs.START_DATE.isoformat() == "2026-08-01"
+    items = [LI("a", "Opened Jul 31 late", datetime(2026, 7, 31, 23, 30, tzinfo=ET).isoformat()),
+             LI("a", "Opened Aug 1 early", datetime(2026, 8, 1, 0, 30, tzinfo=ET).isoformat()),
+             # 3am UTC Aug 1 is still Jul 31 in Eastern time: left off.
+             LI("a", "UTC says Aug 1", datetime(2026, 8, 1, 3, 0, tzinfo=timezone.utc).isoformat()),
+             LI("a", "Unknown date", None)]
+    s = hs.concierge_sheet([L("a")], items, [], [], MON_OCT19)
+    assert sorted(i["title"] for g in s["groups"] for i in g["items"]) == ["Opened Aug 1 early", "Unknown date"]
+
+
+def test_start_date_on_buyer_tasks_and_open_to_close():
+    deals = [{"id": 1, "fub_deal_id": "900", "client_name": "B", "agent_name": "x", "pipeline": "buyer", "stage": "BA Signed", "closed_at": None}]
+    tasks = [{"deal_id": 1, "title": "Old", "owner": "concierge", "completed": False, "stage_triggered": "x", "created_at": et(2026, 7, 1)},
+             {"deal_id": 1, "title": "New", "owner": "concierge", "completed": False, "stage_triggered": "x", "created_at": et(2026, 9, 1)}]
+    s = hs.concierge_sheet([], [], deals, tasks, MON_OCT19)
+    assert [i["title"] for g in s["groups"] for i in g["items"]] == ["New"]
+    props = [{"id": 1, "address": "1111 Trenton Place", "status": "Listing - Under Contract"}]
+    s = hs.transactions_sheet(props, [T(1, 1, 1, et(2026, 3, 2)), T(1, 2, 2, et(2026, 3, 2))], MON_OCT19)
+    assert s["count"] == 0 and s["groups"] == []
+
+
+def test_buyers_need_an_active_command_center_card():
+    deals = [{"id": k, "fub_deal_id": f, "client_name": n, "agent_name": "x", "pipeline": "buyer", "stage": "BA Signed", "closed_at": None}
+             for k, f, n in [(1, "813", "MC Test 1234 Test1234"), (2, "TEST-001", "John & Jane Smith"), (3, 900, "Real Buyer"), (4, "901", "Archived Buyer")]]
+    tasks = [{"deal_id": k, "title": "T", "owner": "concierge", "completed": False, "stage_triggered": "x", "created_at": et(2026, 9, 1)} for k in (1, 2, 3, 4)]
+    cards = [{"id": "a", "status": "active", "fub_deal_id": "900"},       # text vs number id still matches
+             {"id": "b", "status": "archived", "fub_deal_id": "901"},
+             {"id": "c", "status": "active", "fub_deal_id": None}]
+    s = hs.concierge_sheet([], [], deals, tasks, MON_OCT19, cc_buyers=cards)
+    assert [g["name"] for g in s["groups"]] == ["Real Buyer"]
+    assert hs.concierge_sheet([], [], deals, tasks, MON_OCT19, cc_buyers=[])["count"] == 0
+
+
+def test_no_em_dash_in_the_email():
+    items = [LI("a", "Review deal card in Follow Up Boss and FORWARD OS — confirm all fields", et(2026, 9, 1)),
+             LI("a", "Notify seller that listing is live—send email", et(2026, 9, 1))]
+    s = hs.concierge_sheet([L("a", address="1 Main St — Unit 2")], items, [], [], MON_OCT19)
+    out = hs.render(s, MON_OCT19)
+    assert "—" not in out["html"] + out["text"] + out["subject"]
+    assert "FORWARD OS: confirm all fields" in out["text"]
+    assert "listing is live: send email" in out["text"] and "1 Main St: Unit 2" in out["text"]

@@ -5111,7 +5111,8 @@ def _hs_build(team: str, now) -> dict:
             _hs_rows("deals", "id,client_name,agent_name,pipeline,stage,closed_at", lambda q: q.eq("pipeline", "buyer")),
             _hs_rows("deal_tasks", "id,deal_id,title,owner,completed,stage_triggered,created_at",
                      lambda q: q.eq("completed", False)),
-            now)
+            now,
+            cc_buyers=_hs_rows("cc_buyers", "id,status,fub_deal_id", lambda q: q.eq("status", "active")))
     else:
         sheet = _hs.transactions_sheet(
             _hs_rows("otc_properties", "id,address,status"),

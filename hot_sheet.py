@@ -18,7 +18,11 @@ What goes on it (Marc, Oct 16 and 17, 2026):
   they wait; same titles as WAITING_TITLES in the Command Center's
   src/lib/conciergeTasks.js and DP_WAITING in FORWARD OS: change all three
   together) and Keep in mind reminders (never stored as rows, so never read).
-- Buyer deals: pipeline 'buyer', no closed_at, a stage, and the stage is not a
+- Start date (Oct 17, 2026): nothing opened before START_DATE (Aug 1, 2026) is
+  listed. Fixed, not rolling. Older backlog is deliberately not chased.
+- Buyer deals: only those with an ACTIVE Command Center buyer card (cc_buyers,
+  same fub_deal_id). Test deals and old closed buyers have no card. Then also:
+  pipeline 'buyer', no closed_at, a stage, and the stage is not a
   finished one (Closed..., Total..., Terminated). Some deals still carry
   "Total Closed This Year" with no closed_at (seen live Oct 17): those are done.
 - Transactions: for each open Open To Close transaction, the NEXT 4 unticked tasks
@@ -41,6 +45,11 @@ from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
 MIN_BUSINESS_DAYS = 3
+# Nothing opened before this day (Eastern) goes on the sheet (Marc, Oct 17, 2026: "imagine
+# that today was August 1st, 2026. That's the first date that I want you paying attention
+# to. Anything that happened before then, we're gonna count it as lost"). FIXED, not
+# rolling: a rolling window would silently drop an unfinished item as it aged out.
+START_DATE = date(2026, 8, 1)
 OTC_NEXT = 4
 
 # Word for word the waiting: true rows of forward-command-center src/lib/conciergeTasks.js.
@@ -96,6 +105,21 @@ def is_waiting(title) -> bool:
     return str(title or "").strip() in WAITING_TITLES
 
 
+def _opened_on_or_after_start(ts) -> bool:
+    """True when the item opened on or after START_DATE (Eastern), or its date is unknown.
+
+    An unknown date is kept and labelled, not dropped: a silent omission is worse."""
+    d = _parse(ts)
+    return d is None or d.astimezone(ET).date() >= START_DATE
+
+
+def _clean(text) -> str:
+    """Titles come from the Command Center and Open To Close as typed. Marc's rule is no
+    em dash in anything FORWARD sends, so the email shows ' — ' as ': ' (display only;
+    the stored titles are not changed)."""
+    return re.sub(r"\s*\u2014\s*", ": ", str(text or "")).strip()
+
+
 def _old_enough(days: Optional[int]) -> bool:
     return days is None or days >= MIN_BUSINESS_DAYS
 
@@ -103,7 +127,8 @@ def _old_enough(days: Optional[int]) -> bool:
 # ── Concierge ────────────────────────────────────────────────────────────────
 
 def concierge_sheet(listings: Iterable[dict], listing_items: Iterable[dict],
-                    deals: Iterable[dict], deal_tasks: Iterable[dict], now: datetime) -> dict:
+                    deals: Iterable[dict], deal_tasks: Iterable[dict], now: datetime,
+                    cc_buyers: Optional[Iterable[dict]] = None) -> dict:
     groups = []
 
     active = {x["id"]: x for x in listings if str(x.get("status") or "").lower() == "active"}
@@ -112,6 +137,8 @@ def concierge_sheet(listings: Iterable[dict], listing_items: Iterable[dict],
         if it.get("completed") or it.get("listing_id") not in active:
             continue
         if str(it.get("owner") or "").lower() == "agent" or is_waiting(it.get("title")):
+            continue
+        if not _opened_on_or_after_start(it.get("created_at")):
             continue
         days = business_days_open(it.get("created_at"), now)
         if it.get("created_at") and not _old_enough(days):
@@ -125,8 +152,17 @@ def concierge_sheet(listings: Iterable[dict], listing_items: Iterable[dict],
         groups.append({"kind": "Listing", "name": l.get("address") or "Listing with no address",
                        "agent": l.get("agent") or "", "stage": l.get("stage") or "", "items": items})
 
+    # A buyer counts only when the Command Center shows it: an ACTIVE cc_buyers card with
+    # that Follow Up Boss deal id (how the Command Center's own buyer list reads deals).
+    # Deal rows with no card (test deals, old closed buyers) are not Concierge's list.
+    shown = None
+    if cc_buyers is not None:
+        shown = {str(b.get("fub_deal_id")) for b in cc_buyers
+                 if str(b.get("status") or "").lower() == "active" and b.get("fub_deal_id") not in (None, "")}
     open_deals = {}
     for d in deals:
+        if shown is not None and str(d.get("fub_deal_id")) not in shown:
+            continue
         if str(d.get("pipeline") or "").lower() != "buyer" or d.get("closed_at"):
             continue
         st = str(d.get("stage") or "").strip()
@@ -138,6 +174,8 @@ def concierge_sheet(listings: Iterable[dict], listing_items: Iterable[dict],
         if t.get("completed") or t.get("deal_id") not in open_deals:
             continue
         if str(t.get("owner") or "").lower() != "concierge" or is_waiting(t.get("title")):
+            continue
+        if not _opened_on_or_after_start(t.get("created_at")):
             continue
         days = business_days_open(t.get("created_at"), now)
         if t.get("created_at") and not _old_enough(days):
@@ -167,6 +205,8 @@ def transactions_sheet(otc_properties: Iterable[dict], otc_tasks: Iterable[dict]
         tasks.sort(key=lambda t: (t.get("position") is None, t.get("position") or 0, t.get("task_id") or 0))
         items = []
         for t in tasks[:OTC_NEXT]:
+            if not _opened_on_or_after_start(t.get("otc_created")):
+                continue
             days = business_days_open(t.get("otc_created"), now)
             if not _old_enough(days):
                 continue
@@ -227,15 +267,17 @@ def render(sheet: dict, now: datetime) -> dict:
         parts.append('<p style="margin:0 0 16px;font-size:14px">Check these: open 3 or more business days.</p>')
         text.append("Check these: open 3 or more business days.")
         for g in sheet["groups"]:
+            g = dict(g, name=_clean(g["name"]), agent=_clean(g["agent"]), stage=_clean(g["stage"]))
             meta = " · ".join(x for x in (g["kind"], g["stage"], g["agent"]) if x)
             parts.append('<p style="margin:16px 0 4px;font-size:15px;font-weight:bold">{}</p>'.format(e(g["name"])))
             parts.append('<p style="margin:0 0 6px;font-size:12px;color:#5b6b7b">{}</p>'.format(e(meta)))
             parts.append('<ul style="margin:0;padding-left:20px;font-size:14px">')
             text += ["", g["name"], meta]
             for i in g["items"]:
+                title = _clean(i["title"])
                 parts.append('<li style="margin:0 0 4px">{} <span style="color:#a0522d">({})</span></li>'
-                             .format(e(i["title"]), e(_days_label(i["days"]))))
-                text.append("- {} ({})".format(i["title"], _days_label(i["days"])))
+                             .format(e(title), e(_days_label(i["days"]))))
+                text.append("- {} ({})".format(title, _days_label(i["days"])))
             parts.append("</ul>")
     parts.append('<p style="margin:24px 0 0;font-size:12px;color:#5b6b7b">Sent by FORWARD OS every weekday '
                  'morning. Items waiting on an event and Keep in mind reminders are left out.</p></div>')
