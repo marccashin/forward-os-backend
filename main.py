@@ -2728,9 +2728,22 @@ async def delete_file(payload: DeleteFileRequest):
 class UpdatePropertyRequest(BaseModel):
     fields: dict
 
+# Changing or deleting a listing or buyer card, and its partners, is for FORWARD OS
+# pages only (Marc, Oct 17, 2026). Until now anyone holding a card id could rename or
+# delete it, notes included. The same Origin check as listing presentations
+# (listing_presentations.origin_allowed): a browser always sends Origin and a page
+# cannot fake it; a script outside a browser can, so this is a lock on the front door
+# against casual use, not a login. Only FORWARD OS calls these routes (checked: the
+# Command Center and the Netlify functions never do).
+def _os_write_guard(request: Request) -> None:
+    if not _lp.origin_allowed(request.headers.get("origin")):
+        raise HTTPException(status_code=403, detail="Listing and buyer cards can be changed only from FORWARD OS.")
+
+
 @app.patch("/properties/{property_id}")
-async def update_property(property_id: str, payload: UpdatePropertyRequest):
+async def update_property(property_id: str, payload: UpdatePropertyRequest, request: Request):
     """Update specific fields on a property record."""
+    _os_write_guard(request)
     allowed = {"seller_name", "address", "status", "market", "agent_name", "archived"}
     safe_fields = {k: v for k, v in payload.fields.items() if k in allowed}
     if not safe_fields:
@@ -2742,8 +2755,9 @@ async def update_property(property_id: str, payload: UpdatePropertyRequest):
         raise HTTPException(status_code=500, detail=f"Update failed: {e}")
 
 @app.delete("/properties/{property_id}")
-async def delete_property(property_id: str, agent_name: str = None):
+async def delete_property(property_id: str, request: Request, agent_name: str = None):
     """Delete a property and all related records (notes, assets, offers)."""
+    _os_write_guard(request)
     try:
         row = supabase.table("properties").select("address,agent_name").eq("id", property_id).execute().data
         address_val = row[0]["address"] if row else None
@@ -2969,8 +2983,9 @@ class UpdateBuyerRequest(BaseModel):
     fields: dict
 
 @app.patch("/buyers/{buyer_id}")
-async def update_buyer(buyer_id: str, payload: UpdateBuyerRequest):
+async def update_buyer(buyer_id: str, payload: UpdateBuyerRequest, request: Request):
     """Update specific fields on a buyer record."""
+    _os_write_guard(request)
     allowed = {
         "buyer_name", "first_name", "last_name", "email", "phone", "status", "agent_name",
         "market_area", "target_areas", "areas_note",
@@ -3001,8 +3016,9 @@ async def update_buyer(buyer_id: str, payload: UpdateBuyerRequest):
         raise HTTPException(status_code=500, detail=f"Update failed: {e}")
 
 @app.delete("/buyers/{buyer_id}")
-async def delete_buyer(buyer_id: str, agent_name: str = None):
+async def delete_buyer(buyer_id: str, request: Request, agent_name: str = None):
     """Delete a buyer and all related records (assets)."""
+    _os_write_guard(request)
     try:
         row = supabase.table("buyers").select("buyer_name,agent_name").eq("id", buyer_id).execute().data
         buyer_name_val = row[0]["buyer_name"] if row else None
@@ -3114,7 +3130,8 @@ class PartnerRequest(BaseModel):
     agent_name: str
 
 @app.post("/properties/{property_id}/add-partner")
-async def add_property_partner(property_id: str, payload: PartnerRequest):
+async def add_property_partner(property_id: str, payload: PartnerRequest, request: Request):
+    _os_write_guard(request)
     try:
         rows = supabase.table("properties").select("subfolder_drive_ids").eq("id", property_id).execute()
         if not rows.data:
@@ -3132,7 +3149,8 @@ async def add_property_partner(property_id: str, payload: PartnerRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/properties/{property_id}/remove-partner")
-async def remove_property_partner(property_id: str, payload: PartnerRequest):
+async def remove_property_partner(property_id: str, payload: PartnerRequest, request: Request):
+    _os_write_guard(request)
     try:
         rows = supabase.table("properties").select("subfolder_drive_ids").eq("id", property_id).execute()
         if not rows.data:
@@ -3148,7 +3166,8 @@ async def remove_property_partner(property_id: str, payload: PartnerRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/buyers/{buyer_id}/add-partner")
-async def add_buyer_partner(buyer_id: str, payload: PartnerRequest):
+async def add_buyer_partner(buyer_id: str, payload: PartnerRequest, request: Request):
+    _os_write_guard(request)
     try:
         rows = supabase.table("buyers").select("subfolder_drive_ids").eq("id", buyer_id).execute()
         if not rows.data:
@@ -3166,7 +3185,8 @@ async def add_buyer_partner(buyer_id: str, payload: PartnerRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/buyers/{buyer_id}/remove-partner")
-async def remove_buyer_partner(buyer_id: str, payload: PartnerRequest):
+async def remove_buyer_partner(buyer_id: str, payload: PartnerRequest, request: Request):
+    _os_write_guard(request)
     try:
         rows = supabase.table("buyers").select("subfolder_drive_ids").eq("id", buyer_id).execute()
         if not rows.data:
