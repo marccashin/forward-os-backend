@@ -4858,3 +4858,125 @@ async def otc_probe(request: Request, property_id: int = 0):
     res["calls"] = [{"path": p, "status": s} for p, s in client.calls]
     logger.info("[otc] probe property_id=%s calls=%s", property_id or "-", json.dumps(res["calls"]))
     return res
+
+
+# ---------------------------------------------------------------------------
+# Open To Close poller (Oct 17, 2026; see otc_poller.py). Step 2 of the Deal Progress tracker.
+# Reads every open transaction's tasks every 15 minutes, 7am to 9:45pm ET, and records
+# when each box is first seen ticked (Open To Close itself keeps no date or name).
+# ---------------------------------------------------------------------------
+import otc_poller as _otcp
+
+
+class SupabaseOtcStore:
+    """otc_properties / otc_tasks through the service-role client."""
+
+    def properties(self) -> dict:
+        r = supabase.table("otc_properties").select("*").execute()
+        return {int(x["id"]): x for x in (r.data or [])}
+
+    def tasks(self, property_id: int) -> list:
+        r = supabase.table("otc_tasks").select("*").eq("property_id", property_id).execute()
+        return r.data or []
+
+    def upsert_tasks(self, rows: list) -> None:
+        if rows:
+            supabase.table("otc_tasks").upsert(rows, on_conflict="property_id,task_id").execute()
+
+    def upsert_properties(self, rows: list) -> None:
+        if rows:
+            supabase.table("otc_properties").upsert(rows, on_conflict="id").execute()
+
+
+_OTCP_STATE: dict = {"running": False, "last_run": None, "fail_streak": 0,
+                     "last_email_at": 0.0, "last_manual_at": 0.0}
+OTC_FAIL_EMAIL_AFTER = 3   # consecutive failed runs (45 minutes) before Marc is emailed
+
+
+def _otcp_email(run: dict) -> None:
+    """Tell Marc when the poller keeps failing. At most one a day."""
+    now = _time.time()
+    if now - _OTCP_STATE["last_email_at"] < 20 * 3600:
+        return
+    try:
+        import resend as resend_sdk
+        key = os.environ.get("RESEND_API_KEY", "")
+        if not key:
+            logger.error("[otc-poll] RESEND_API_KEY not set, cannot email the failure")
+            return
+        rows = "".join("<li>{}: {}</li>".format(_esc(str(e.get("property_id") or "all transactions")),
+                                                  _esc(e.get("error", ""))) for e in run.get("errors", []))
+        resend_sdk.api_key = key
+        resend_sdk.Emails.send({
+            "from": "Forward OS Audit <audit@marccashin.com>",
+            "to": ["marc@marccashin.com"],
+            "subject": "FORWARD OS: Open To Close tracking needs attention",
+            "html": "<p>The Open To Close reader has failed {} times in a row, so Transactions' "
+                    "ticks are not being recorded. The Deal Progress view shows the last ticks it saw.</p>"
+                    "<ul>{}</ul><p>Status: https://forward-command-center-production.up.railway.app/api/otc/poll/status</p>"
+                    .format(_OTCP_STATE["fail_streak"], rows),
+        })
+        _OTCP_STATE["last_email_at"] = now
+    except Exception as e:
+        logger.error("[otc-poll] failure email could not be sent: %s", e)
+
+
+async def _otcp_run(trigger: str) -> dict:
+    token = os.environ.get("OTC_API_TOKEN", "").strip()
+    if not token:
+        run = {"ok": False, "errors": [{"property_id": None, "error": "OTC_API_TOKEN is not set"}]}
+    elif _OTCP_STATE["running"]:
+        return {"ok": False, "skipped": "already running"}
+    else:
+        _OTCP_STATE["running"] = True
+        client = _otc.OtcClient(token, _otc_http)
+        try:
+            run = await _otcp.poll(client, SupabaseOtcStore())
+        except Exception as e:
+            run = {"ok": False, "errors": [{"property_id": None,
+                                             "error": _otc.scrub(f"{type(e).__name__}: {e}", token)}]}
+        finally:
+            _OTCP_STATE["running"] = False
+        run["calls"] = len(client.calls)
+        for e in run.get("errors", []):
+            e["error"] = _otc.scrub(e.get("error", ""), token)
+    run["trigger"] = trigger
+    _OTCP_STATE["last_run"] = run
+    if run.get("ok"):
+        _OTCP_STATE["fail_streak"] = 0
+    else:
+        _OTCP_STATE["fail_streak"] += 1
+        if _OTCP_STATE["fail_streak"] >= OTC_FAIL_EMAIL_AFTER:
+            _otcp_email(run)
+    logger.info("[otc-poll] %s ok=%s read=%s changes=%s errors=%s", trigger, run.get("ok"),
+                run.get("read"), json.dumps(run.get("changes", []))[:2000], json.dumps(run.get("errors", []))[:1000])
+    return run
+
+
+async def job_otc_poll():
+    await _otcp_run("scheduled")
+
+
+@app.on_event("startup")
+async def register_otc_poll_job():
+    scheduler.add_job(job_otc_poll, CronTrigger(minute="*/15", hour="7-21", timezone="America/New_York"),
+                      id="otc_poll", replace_existing=True)
+    logger.info("[otc-poll] Open To Close reader registered (every 15 minutes, 7am to 9:45pm ET)")
+
+
+@app.get("/api/otc/poll/status")
+async def otc_poll_status():
+    """Last run summary. No task titles beyond the last run's changes; no token."""
+    return {"running": _OTCP_STATE["running"], "fail_streak": _OTCP_STATE["fail_streak"],
+            "last_run": _OTCP_STATE["last_run"]}
+
+
+@app.post("/api/otc/poll")
+async def otc_poll_now(request: Request):
+    """Run one pass now (FORWARD OS pages only, once a minute)."""
+    _lp_guard(request)
+    now = _time.time()
+    if now - _OTCP_STATE["last_manual_at"] < 60:
+        raise HTTPException(status_code=429, detail="Ran less than a minute ago. Try again shortly.")
+    _OTCP_STATE["last_manual_at"] = now
+    return await _otcp_run("manual")
