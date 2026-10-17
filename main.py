@@ -5108,7 +5108,7 @@ def _hs_build(team: str, now) -> dict:
             _hs_rows("listings", "id,address,agent,stage,status", lambda q: q.eq("status", "active")),
             _hs_rows("listing_checklist_items", "id,listing_id,title,completed,owner,stage,created_at",
                      lambda q: q.eq("completed", False)),
-            _hs_rows("deals", "id,client_name,agent_name,pipeline,stage,closed_at", lambda q: q.eq("pipeline", "buyer")),
+            _hs_rows("deals", "id,fub_deal_id,client_name,agent_name,pipeline,stage,closed_at", lambda q: q.eq("pipeline", "buyer")),
             _hs_rows("deal_tasks", "id,deal_id,title,owner,completed,stage_triggered,created_at",
                      lambda q: q.eq("completed", False)),
             now,

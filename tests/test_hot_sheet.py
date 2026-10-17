@@ -174,7 +174,11 @@ class FakeQuery:
     def __init__(self, db, name, log):
         self.db, self.name, self.f, self.log, self.rng = db, name, [], log, None
 
-    def select(self, *_a, **_k):
+    def select(self, cols="*", *_a, **_k):
+        # Like PostgREST: only the columns asked for come back. A column the route
+        # forgets to ask for is then missing in the test exactly as in production
+        # (Oct 17, 2026: deals was read without fub_deal_id and every buyer vanished).
+        self.cols = None if cols == "*" else [c.strip() for c in cols.split(",")]
         return self
 
     def eq(self, k, v):
@@ -187,6 +191,8 @@ class FakeQuery:
         rows = [r for r in self.db.get(self.name, []) if all(r.get(k) == v for k, v in self.f)]
         a, b = self.rng
         self.log.append((self.name, a, b))
+        if getattr(self, "cols", None):
+            rows = [{k: r.get(k) for k in self.cols if k in r} for r in rows]
         return type("R", (), {"data": rows[a:b + 1]})
 
 
@@ -274,3 +280,26 @@ def test_no_em_dash_in_the_email():
     assert "—" not in out["html"] + out["text"] + out["subject"]
     assert "FORWARD OS: confirm all fields" in out["text"]
     assert "listing is live: send email" in out["text"] and "1 Main St: Unit 2" in out["text"]
+
+
+def test_route_buyers_with_a_card_reach_the_sheet():
+    """Through the real route, with the stand-in returning only the columns asked for."""
+    m = load_main()
+    deals = [{"id": "d1", "fub_deal_id": "892", "client_name": "Debra Morris", "agent_name": "Ash McGowan",
+              "pipeline": "buyer", "stage": "Pending", "closed_at": None, "email": "x"},
+             {"id": "d2", "fub_deal_id": "813", "client_name": "MC Test 1234 Test1234", "agent_name": "Marc Cashin",
+              "pipeline": "buyer", "stage": "BA Signed", "closed_at": None}]
+    tasks = [{"id": 1, "deal_id": "d1", "title": "Remind agent about a gift", "owner": "concierge", "completed": False,
+              "stage_triggered": "Pending", "created_at": et(2026, 9, 16), "due_date": None},
+             {"id": 2, "deal_id": "d2", "title": "Review deal card", "owner": "concierge", "completed": False,
+              "stage_triggered": "BA Signed", "created_at": et(2026, 9, 16)}]
+    cards = [{"id": "c1", "status": "active", "fub_deal_id": "892", "buyer_name": "Debra Morris"}]
+    m.supabase = FakeSupabase({"listings": [], "listing_checklist_items": [], "deals": deals, "deal_tasks": tasks,
+                               "cc_buyers": cards, "otc_properties": [], "otc_tasks": []})
+    os.environ["HOT_SHEET_SECRET"] = "s3cret"
+    r = TestClient(m.app).get("/api/hot-sheet/concierge", headers={"x-hot-sheet-secret": "s3cret"})
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["count"] == 1, j["text"]
+    assert "Debra Morris" in j["text"] and "Remind agent about a gift" in j["text"]
+    assert "MC Test" not in j["text"]
