@@ -50,8 +50,13 @@ def test_pick_and_summary():
     assert fds.pick_by_address("9 Nowhere Rd", SELLERS) == ([], "none")
     s = fds.summarize(SELLERS[0], "address")
     assert s == {"found": True, "how": "address", "deal_id": 940, "pipeline": "Sellers",
-                 "stage": "Listing App. Scheduled", "entered_stage_at": "2026-10-09T15:00:00Z"}
+                 "stage": "Listing App. Scheduled", "entered_stage_at": "2026-10-09T15:00:00Z", "name_is_address": True}
     assert not ({"price", "commissionValue", "people", "users", "name"} & set(s)), "nothing personal or financial"
+    for n in ["6300 Stevenson Ave #1120", "1415 Riverside Ave.", "41 V st. NW", "7532 Coxton Ct, Unit G-127", "1926 Ruxton Rd", "12-14 Main St"]:
+        assert fds.name_is_address(n), n
+    for n in ["Abby Wenk", "Kristina Poplin", "Joseph D'Angelo", "Robert & Julie Brown", "Kylie & Brian Dowling", "", None, "  "]:
+        assert not fds.name_is_address(n), n
+    assert fds.summarize(SELLERS[3], "linked")["name_is_address"] is False, "a deal named after the seller is flagged"
     assert fds.stamped_deal_id({"subfolder_drive_ids": {"_fub_deal_id": 917}}) == "917"
     assert fds.stamped_deal_id({"fub_deal_id": "123", "subfolder_drive_ids": {}}) == "", "legacy column ignored"
 
@@ -133,6 +138,7 @@ def test_route(monkeypatch):
 
     r = c.get("/api/fub/listing-stage", params={"property_id": P_LINKED}, headers=ORIGIN).json()
     assert r["how"] == "linked" and r["stage"] == "Seller Engaged" and r["entered_stage_at"] == "2026-10-06T12:42:29Z", r
+    assert r["name_is_address"] is False and "name" not in r, "says the name is a person's without sending the name"
     assert ("/deals", {"pipelineId": 2, "limit": 100}) not in calls, "a linked deal is read directly, fresh"
 
     r = c.get("/api/fub/listing-stage", params={"property_id": P_ADDRESS}, headers=ORIGIN).json()
