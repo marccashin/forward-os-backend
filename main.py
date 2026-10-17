@@ -4971,6 +4971,75 @@ async def otc_poll_status():
             "last_run": _OTCP_STATE["last_run"]}
 
 
+# ---------------------------------------------------------------------------
+# Where a FORWARD OS listing stands in Follow Up Boss (Oct 17, 2026)
+#
+# Deal Progress in FORWARD OS asks this for a listing the Command Center does not
+# have yet (before Listing Agreement Signed), so it can say "Seller Engaged since
+# Oct 1" instead of nothing. FORWARD OS pages only (_lp_guard). Returns the stage and
+# when the deal entered it, never the people or money on the deal. Rules for which
+# deal: fub_deal_stage.py.
+# ---------------------------------------------------------------------------
+import fub_deal_stage as _fds
+
+_FDS_CACHE: dict = {"at": 0.0, "deals": [], "pipeline_id": None}
+
+
+async def _fds_seller_deals() -> list[dict]:
+    """Every Sellers deal, kept 10 minutes (one listing page asks once; FUB pages 100)."""
+    now = _time.time()
+    if _FDS_CACHE["deals"] and now - _FDS_CACHE["at"] < 600:
+        return _FDS_CACHE["deals"]
+    if _FDS_CACHE["pipeline_id"] is None:
+        pipes = (await fub_get("/pipelines")).get("pipelines") or []
+        sellers = [p for p in pipes if str(p.get("name") or "").strip().lower() == "sellers"]
+        if len(sellers) != 1:
+            raise ValueError(f"expected one Sellers pipeline in Follow Up Boss, found {len(sellers)}")
+        _FDS_CACHE["pipeline_id"] = sellers[0]["id"]
+    deals: list[dict] = []
+    nxt = None
+    for _ in range(20):
+        params = {"pipelineId": _FDS_CACHE["pipeline_id"], "limit": 100}
+        if nxt:
+            params["next"] = nxt
+        page = await fub_get("/deals", params)
+        deals.extend(page.get("deals") or [])
+        nxt = (page.get("_metadata") or {}).get("next")
+        if not nxt:
+            break
+    _FDS_CACHE.update(at=now, deals=deals)
+    return deals
+
+
+@app.get("/api/fub/listing-stage")
+async def fub_listing_stage(request: Request, property_id: str = ""):
+    _lp_guard(request)
+    pid = (property_id or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", pid):
+        raise HTTPException(status_code=400, detail="property_id must be a listing id.")
+    rows = supabase.table("properties").select("id,address,subfolder_drive_ids").eq("id", pid).limit(1).execute().data or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="No FORWARD OS listing with that id.")
+    prop = rows[0]
+    try:
+        did = _fds.stamped_deal_id(prop)
+        if did:
+            try:
+                deal = await fub_get(f"/deals/{did}")
+                return _fds.summarize(deal, "linked")
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code != 404:
+                    raise
+                logger.warning("[fub-stage] listing %s names deal %s, which Follow Up Boss no longer has", pid, did)
+        hits, how = _fds.pick_by_address(prop.get("address") or "", await _fds_seller_deals())
+        return _fds.summarize(hits[0] if how == "address" else None, how, len(hits))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("[fub-stage] listing %s: %s", pid, e)
+        raise HTTPException(status_code=502, detail=f"Follow Up Boss could not be read: {e}")
+
+
 @app.post("/api/otc/poll")
 async def otc_poll_now(request: Request):
     """Run one pass now (FORWARD OS pages only, once a minute)."""
