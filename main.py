@@ -5174,3 +5174,120 @@ async def hot_sheet(team: str, x_hot_sheet_secret: str = Header(default="")):
         raise HTTPException(status_code=502, detail="The hot sheet could not be built: " + type(e).__name__)
     logger.info("[hot-sheet] %s built: %s items", team, out["count"])
     return out
+
+
+# ---------------------------------------------------------------------------
+# Hot sheet emails sent by the backend itself (Oct 19, 2026, Marc's choice).
+#
+# The plan was a Zap calling the route above with the secret header. The Zapier
+# tools available build code workflows, where a secret may not sit in the source,
+# so Marc chose: the backend sends the sheets itself with Resend, on its own
+# schedule, weekdays 8:00 ET. Nothing outside this server needs the secret.
+#
+# OFF until Marc sets the Railway variable HOT_SHEET_SEND=on. With it off the job
+# runs, sends nothing and records "off". POST /api/hot-sheet/preview (FORWARD OS
+# pages only, once every 2 minutes) sends both sheets to Marc ONLY, marked PREVIEW,
+# whatever the switch says. GET /api/hot-sheet/send/status says whether the switch
+# is on and what the last send did; it never returns a sheet's content.
+# ---------------------------------------------------------------------------
+HOT_SHEET_TO = {"concierge": ["concierge@fwrdrealestate.com"],
+                "transactions": ["transactions@fwrdrealestate.com"]}
+HOT_SHEET_MARC = "marc.cashin@corcoranmce.com"   # FORWARD OS notices go to his work email
+HOT_SHEET_FROM = "FORWARD OS <audit@marccashin.com>"   # the Resend domain the other notices use
+HOT_SHEET_PREVIEW_GAP = 120
+_HS_SEND: dict = {"last": None, "last_preview_at": 0.0}
+
+
+def _hs_switch_on() -> bool:
+    return os.environ.get("HOT_SHEET_SEND", "").strip().lower() == "on"
+
+
+def _hs_resend(payload: dict) -> str:
+    """One email through Resend. Returns its id. Raises when it was not sent."""
+    import resend as resend_sdk
+    key = os.environ.get("RESEND_API_KEY", "")
+    if not key:
+        raise RuntimeError("RESEND_API_KEY is not set")
+    resend_sdk.api_key = key
+    r = resend_sdk.Emails.send(payload)
+    rid = (r or {}).get("id") if isinstance(r, dict) else getattr(r, "id", None)
+    if not rid:
+        raise RuntimeError("Resend did not confirm the email")
+    return rid
+
+
+def _hs_send_one(team: str, to: list, now, preview: bool = False) -> dict:
+    out = _hs_build(team, now)
+    subject = ("PREVIEW (only to Marc): " if preview else "") + out["subject"]
+    rid = _hs_resend({"from": HOT_SHEET_FROM, "to": to, "subject": subject,
+                      "html": out["html"], "text": out["text"]})
+    return {"team": team, "to": to, "count": out["count"], "subject": subject, "id": rid}
+
+
+def _hs_send_all(now, preview: bool = False) -> dict:
+    """Both sheets. One team failing never stops the other; every failure is recorded."""
+    run = {"ran_at": now.isoformat(), "preview": preview, "sent": [], "errors": []}
+    for team in ("concierge", "transactions"):
+        to = [HOT_SHEET_MARC] if preview else HOT_SHEET_TO[team]
+        try:
+            run["sent"].append(_hs_send_one(team, to, now, preview))
+        except Exception as e:
+            logger.exception("[hot-sheet-send] %s not sent", team)
+            run["errors"].append({"team": team, "error": f"{type(e).__name__}: {e}"[:300]})
+    run["ok"] = not run["errors"]
+    return run
+
+
+def _hs_alert(run: dict) -> None:
+    """Tell Marc when a real (not preview) send failed."""
+    try:
+        rows = "".join("<li>{}: {}</li>".format(_esc(e["team"]), _esc(e["error"])) for e in run["errors"])
+        _hs_resend({"from": "Forward OS Audit <audit@marccashin.com>", "to": [HOT_SHEET_MARC],
+                    "subject": "FORWARD OS: the hot sheet was NOT sent",
+                    "html": "<p>This morning's hot sheet email failed for:</p><ul>{}</ul>"
+                            "<p>Status: https://forward-command-center-production.up.railway.app/api/hot-sheet/send/status</p>".format(rows)})
+    except Exception as e:
+        logger.error("[hot-sheet-send] failure alert could not be sent: %s", e)
+
+
+async def job_hot_sheet_send():
+    now = datetime.now(timezone.utc)
+    if not _hs_switch_on():
+        _HS_SEND["last"] = {"ran_at": now.isoformat(), "preview": False, "sent": [], "errors": [],
+                            "ok": True, "skipped": "HOT_SHEET_SEND is not on"}
+        logger.info("[hot-sheet-send] switched off (HOT_SHEET_SEND is not on); nothing sent")
+        return _HS_SEND["last"]
+    run = await asyncio.to_thread(_hs_send_all, now, False)
+    _HS_SEND["last"] = run
+    logger.info("[hot-sheet-send] sent=%s errors=%s", [(x["team"], x["count"]) for x in run["sent"]], run["errors"])
+    if run["errors"]:
+        await asyncio.to_thread(_hs_alert, run)
+    return run
+
+
+@app.on_event("startup")
+async def register_hot_sheet_send_job():
+    scheduler.add_job(job_hot_sheet_send, CronTrigger(day_of_week="mon-fri", hour=8, minute=0, timezone="America/New_York"),
+                      id="hot_sheet_send", replace_existing=True)
+    logger.info("[hot-sheet-send] registered (weekdays 8:00 ET); switch is %s", "ON" if _hs_switch_on() else "off")
+
+
+@app.get("/api/hot-sheet/send/status")
+async def hot_sheet_send_status():
+    """Switch and last send only: subjects and counts, never a sheet's content."""
+    return {"switch": "on" if _hs_switch_on() else "off", "schedule": "weekdays 8:00 ET",
+            "to": HOT_SHEET_TO, "last": _HS_SEND["last"]}
+
+
+@app.post("/api/hot-sheet/preview")
+async def hot_sheet_preview(request: Request):
+    """Both sheets to Marc only, marked PREVIEW (FORWARD OS pages only, once every 2 minutes)."""
+    _lp_guard(request)
+    now_t = _time.time()
+    if now_t - _HS_SEND["last_preview_at"] < HOT_SHEET_PREVIEW_GAP:
+        raise HTTPException(status_code=429, detail="A preview was sent less than 2 minutes ago.")
+    _HS_SEND["last_preview_at"] = now_t
+    run = await asyncio.to_thread(_hs_send_all, datetime.now(timezone.utc), True)
+    if run["errors"] and not run["sent"]:
+        raise HTTPException(status_code=502, detail="Preview not sent: " + "; ".join(e["error"] for e in run["errors"]))
+    return run
