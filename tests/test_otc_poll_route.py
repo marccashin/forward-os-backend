@@ -112,3 +112,71 @@ def test_poll_route(monkeypatch):
     s = c.get("/api/otc/poll/status").json()
     assert s["fail_streak"] == 3 and len(sent) == 1, (s, len(sent))
     assert fake.db["otc_tasks"][(1471375, 2)]["removed_at"] is None, "a failed list removes nothing"
+
+
+def test_check_now_wait_and_join(monkeypatch):
+    """Oct 19, 2026: the OS shows a shared countdown, and a press during a running pass joins it."""
+    import asyncio
+    main = load_main()
+    fake = FakeSupabase()
+    monkeypatch.setattr(main, "supabase", fake)
+    monkeypatch.setenv("OTC_API_TOKEN", TOKEN)
+    routes = {"/v1.1/properties": [{"id": 7, "address": "1 A St", "contract_status": "Listing- Active",
+                                    "contract_client_type": "Seller", "created": "2026-10-19 10:00:00"}],
+              "/v1/properties/7/tasks": [{"id": 1, "created": {"date": "2026-10-19 10:00:00.000000", "timezone": "UTC"}, "title": "A", "completed": None}]}
+    http, seen = otc_http(routes)
+    monkeypatch.setattr(main, "_otc_http", http)
+    main._OTCP_STATE.update({"running": False, "last_run": None, "fail_streak": 0, "last_manual_at": 0.0})
+    clock = {"t": 1_000_000.0}
+    monkeypatch.setattr(main._time, "time", lambda: clock["t"])
+    c = TestClient(main.app)
+    O = {"Origin": "https://forward-os.netlify.app"}
+
+    s = c.get("/api/otc/poll/status").json()
+    assert s["manual_wait_seconds"] == 0 and s["manual_gap_seconds"] == 60 and s["manual_last_at"] is None, s
+
+    r = c.post("/api/otc/poll", headers=O)
+    assert r.status_code == 200 and r.json()["ok"] and r.json()["manual_wait_seconds"] == 60, r.text
+
+    # Another agent, 20 seconds later, sees 40 seconds left (from the server's clock)
+    clock["t"] += 20
+    s = c.get("/api/otc/poll/status").json()
+    assert s["manual_wait_seconds"] == 40 and s["manual_last_at"], s
+    r = c.post("/api/otc/poll", headers=O)
+    assert r.status_code == 429 and r.headers.get("Retry-After") == "40" and "40 seconds" in r.json()["detail"], (r.status_code, r.text)
+    calls = len(seen)
+
+    # 19.5 s later: rounds up, never says 0 while still refused
+    clock["t"] += 39.5
+    assert c.get("/api/otc/poll/status").json()["manual_wait_seconds"] == 1
+    clock["t"] += 0.5
+    assert c.get("/api/otc/poll/status").json()["manual_wait_seconds"] == 0
+
+    # A press while a pass is running waits for it, returns its result, starts nothing new,
+    # and does not use up the minute
+    main._OTCP_STATE["running"] = True
+    main._OTCP_STATE["last_run"] = {"ok": True, "trigger": "scheduled", "read": [7], "changes": []}
+    async def finish():
+        await asyncio.sleep(1.2)
+        main._OTCP_STATE["running"] = False
+    async def press():
+        import httpx
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as ac:
+            fin = asyncio.create_task(finish())
+            resp = await ac.post("/api/otc/poll", headers=O)
+            await fin
+            return resp
+    before = main._OTCP_STATE["last_manual_at"]
+    resp = asyncio.run(press())
+    j = resp.json()
+    assert resp.status_code == 200 and j["joined"] is True and j["trigger"] == "scheduled" and j["read"] == [7], j
+    assert len(seen) == calls, "joining a running pass reads Open To Close no more"
+    assert main._OTCP_STATE["last_manual_at"] == before, "joining does not start the one-minute wait"
+    assert c.get("/api/otc/poll/status").json()["manual_wait_seconds"] == 0
+    assert TOKEN not in resp.text
+
+    # Still refused without a FORWARD OS page, even while running
+    main._OTCP_STATE["running"] = True
+    assert c.post("/api/otc/poll").status_code == 403
+    main._OTCP_STATE["running"] = False

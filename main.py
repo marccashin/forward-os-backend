@@ -4910,6 +4910,7 @@ class SupabaseOtcStore:
 
 _OTCP_STATE: dict = {"running": False, "last_run": None, "fail_streak": 0,
                      "last_email_at": 0.0, "last_manual_at": 0.0}
+OTC_JOIN_MAX_SECONDS = 90   # a press during a running pass waits at most this long for it
 OTC_FAIL_EMAIL_AFTER = 3   # consecutive failed runs (45 minutes) before Marc is emailed
 
 
@@ -4984,11 +4985,27 @@ async def register_otc_poll_job():
     logger.info("[otc-poll] Open To Close reader registered (every 15 minutes, 7am to 9:45pm ET)")
 
 
+import math
+OTC_MANUAL_GAP = 60   # seconds between "Check Open To Close now" presses, across ALL agents
+
+
+def _otcp_manual_wait(now: float) -> int:
+    """Whole seconds until the next manual check may start (0 = now). Server clock only, so
+    every agent's countdown agrees whatever their own device's clock says."""
+    left = OTC_MANUAL_GAP - (now - _OTCP_STATE["last_manual_at"])
+    return max(0, int(math.ceil(left))) if left > 0 else 0
+
+
 @app.get("/api/otc/poll/status")
 async def otc_poll_status():
-    """Last run summary. No task titles beyond the last run's changes; no token."""
+    """Last run summary. No task titles beyond the last run's changes; no token.
+    manual_wait_seconds: how long until the next "Check Open To Close now" (Oct 19, 2026)."""
+    last = _OTCP_STATE["last_manual_at"]
     return {"running": _OTCP_STATE["running"], "fail_streak": _OTCP_STATE["fail_streak"],
-            "last_run": _OTCP_STATE["last_run"]}
+            "last_run": _OTCP_STATE["last_run"],
+            "manual_wait_seconds": _otcp_manual_wait(_time.time()),
+            "manual_gap_seconds": OTC_MANUAL_GAP,
+            "manual_last_at": datetime.fromtimestamp(last, timezone.utc).isoformat() if last else None}
 
 
 # ---------------------------------------------------------------------------
@@ -5064,11 +5081,30 @@ async def fub_listing_stage(request: Request, property_id: str = ""):
 async def otc_poll_now(request: Request):
     """Run one pass now (FORWARD OS pages only, once a minute)."""
     _lp_guard(request)
+    # A pass is already running (the 15-minute one, or another agent's press): wait for it
+    # and hand back its result instead of refusing. It is reading Open To Close right now,
+    # so it answers the agent's question, and it costs Open To Close nothing extra
+    # (Oct 19, 2026; before this the press returned "already running" and still used up
+    # the minute, so the agent saw nothing new for a minute).
+    if _OTCP_STATE["running"]:
+        for _ in range(int(OTC_JOIN_MAX_SECONDS / 0.5)):
+            await asyncio.sleep(0.5)
+            if not _OTCP_STATE["running"]:
+                break
+        run = dict(_OTCP_STATE["last_run"] or {"ok": False, "errors": [{"property_id": None, "error": "the running check did not finish in time"}]})
+        run["joined"] = True
+        run["manual_wait_seconds"] = _otcp_manual_wait(_time.time())
+        return run
     now = _time.time()
-    if now - _OTCP_STATE["last_manual_at"] < 60:
-        raise HTTPException(status_code=429, detail="Ran less than a minute ago. Try again shortly.")
+    wait = _otcp_manual_wait(now)
+    if wait > 0:
+        raise HTTPException(status_code=429, headers={"Retry-After": str(wait)},
+                            detail=f"Open To Close was checked less than a minute ago. Next check in {wait} seconds.")
     _OTCP_STATE["last_manual_at"] = now
-    return await _otcp_run("manual")
+    run = await _otcp_run("manual")
+    run = dict(run)
+    run["manual_wait_seconds"] = _otcp_manual_wait(_time.time())
+    return run
 
 
 # ---------------------------------------------------------------------------
