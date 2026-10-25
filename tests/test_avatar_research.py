@@ -151,7 +151,8 @@ def test_bad_web_answer_is_said():
     async def post(body):
         return {"content": [{"type": "text", "text": "I could not find anything."}]}
     r = run(avr.research(ADDR, "", "m", Net().get, post))
-    assert r["web"] == {"error": "the web research gave no readable answer"}
+    assert r["web"]["error"] == "the web research gave no readable answer"
+    assert r["web"]["debug"]["text_start"] == "I could not find anything." and set(r["web"]) == {"error", "debug"}
     assert r["ok"] is False
 
 
@@ -244,3 +245,46 @@ def test_the_findings_are_found_among_notes_and_stray_braces():
         raise AssertionError("should refuse")
     except avr.ResearchError as e:
         assert str(e) == "the web research gave no readable answer"
+
+
+def test_a_paused_search_is_sent_back_until_it_finishes():
+    j = '{"employers":[{"name":"Inova","what":"hospital","where":"Alexandria","source_url":"https://example.org/i"}],"moving":[],"salaries":[]}'
+    turns = [
+        {"stop_reason": "pause_turn", "content": [{"type": "text", "text": "I'll search for employers."}, {"type": "server_tool_use", "id": "s1"}]},
+        {"stop_reason": "pause_turn", "content": [{"type": "web_search_tool_result", "tool_use_id": "s1"}, {"type": "text", "text": "Now pay ranges."}]},
+        {"stop_reason": "end_turn", "content": [{"type": "text", "text": "Here are the findings. " + j}]},
+    ]
+    bodies = []
+
+    async def post(body):
+        bodies.append(body)
+        return turns[len(bodies) - 1]
+    r = run(avr.web_research(ADDR, "20814", "", "m", post))
+    assert r["employers"][0]["name"] == "Inova" and len(bodies) == 3
+    # each round sends the conversation so far, with the paused turn as the assistant's reply, unchanged
+    assert [m["role"] for m in bodies[1]["messages"]] == ["user", "assistant"]
+    assert bodies[1]["messages"][1]["content"] == turns[0]["content"]
+    assert [m["role"] for m in bodies[2]["messages"]] == ["user", "assistant", "assistant"]
+    assert bodies[0]["messages"] == [bodies[0]["messages"][0]] and len(bodies[0]["messages"]) == 1, "the first request is not changed afterwards"
+
+
+def test_a_search_that_never_finishes_is_said_with_a_debug_note():
+    calls = []
+
+    async def post(body):
+        calls.append(body)
+        return {"stop_reason": "pause_turn", "content": [{"type": "text", "text": "Still searching {"}]}
+    r = run(avr.research(ADDR, "", "m", Net().get, post))
+    assert len(calls) == avr.MAX_PAUSES + 1
+    assert r["web"]["error"] == "the web research did not finish (it was still searching after 4 rounds)"
+    d = r["web"]["debug"]
+    assert d["stop_reasons"] == ["pause_turn"] * 4 and d["text_blocks"] == 4 and "Still searching" in d["text_start"]
+
+
+def test_a_cut_off_answer_is_said():
+    async def post(body):
+        return {"stop_reason": "max_tokens", "content": [{"type": "text", "text": '{"employers":[{"name":"Ino'}]}
+    r = run(avr.research(ADDR, "", "m", Net().get, post))
+    assert r["web"]["error"] == "the web research answer was cut off before it finished"
+    assert r["web"]["debug"]["stop_reasons"] == ["max_tokens"]
+

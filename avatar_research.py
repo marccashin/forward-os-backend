@@ -73,7 +73,12 @@ PostClaude = Callable[[dict], Awaitable[dict]]
 
 
 class ResearchError(Exception):
-    """A part of the research that could not be read, in words for the agent."""
+    """A part of the research that could not be read, in words for the agent. `debug`
+    (optional) is for whoever reads the JSON to fix it; the app never shows it."""
+
+    def __init__(self, msg, debug=None):
+        super().__init__(msg)
+        self.debug = debug
 
 
 def zip_of(address: str) -> str:
@@ -303,24 +308,49 @@ def parse_claude_json(data: dict) -> dict:
     raise ResearchError("the web research answer was not valid JSON")
 
 
+MAX_PAUSES = 3   # a paused web-search turn is sent back this many times at most
+
+
 async def web_research(address: str, zip5: str, county_name: str, model: str, post: PostClaude) -> dict:
+    """Live on Oct 24, 2026 the web part failed twice on 219 N Pitt St (52 and 74 seconds)
+    with the findings unreadable. A long web-search turn can come back with stop_reason
+    "pause_turn": the answer is not finished, and the API expects the turn to be sent back
+    as it is so the model can continue. This now does that (up to MAX_PAUSES times) and
+    reads the findings from all the text it was given. Whatever still fails carries a debug
+    note (how it stopped, the start and end of the text) in the JSON, so the next fix can
+    be read rather than guessed."""
     user = ("Research the market around this home.\nAddress: {0}\nZIP: {1}\nCounty: {2}"
             .format(address, zip5 or "unknown", county_name or "unknown"))
+    messages = [{"role": "user", "content": user}]
     body = {"model": model, "max_tokens": 6000,
             "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 6}],
-            "system": WEB_SYSTEM, "messages": [{"role": "user", "content": user}]}
+            "system": WEB_SYSTEM, "messages": messages}
+    content, stops = [], []
+    for _turn in range(MAX_PAUSES + 1):
+        try:
+            data = await post(dict(body, messages=list(messages)))
+        except Exception as e:
+            raise ResearchError("Web research did NOT run: {0}".format(e))
+        part = (data or {}).get("content") or []
+        content += [b for b in part if isinstance(b, dict)]
+        stop = (data or {}).get("stop_reason")
+        stops.append(stop)
+        if stop != "pause_turn":
+            break
+        messages.append({"role": "assistant", "content": part})
     try:
-        data = await post(body)
-    except Exception as e:
-        raise ResearchError("Web research did NOT run: {0}".format(e))
-    try:
-        return clean_web(parse_claude_json(data))
-    except ResearchError:
-        texts = [b.get("text", "") for b in (data or {}).get("content", []) if isinstance(b, dict) and b.get("type") == "text"]
-        _log.warning("[avatar-research] unreadable web answer, stop_reason=%s, %d text blocks, start: %r, end: %r",
-                     (data or {}).get("stop_reason"), len(texts), "".join(texts)[:600], "".join(texts)[-300:])
-        raise
-
+        return clean_web(parse_claude_json({"content": content}))
+    except ResearchError as e:
+        text = "".join(b.get("text", "") for b in content if b.get("type") == "text")
+        debug = {"stop_reasons": stops, "text_blocks": sum(1 for b in content if b.get("type") == "text"),
+                 "block_types": sorted({str(b.get("type")) for b in content}),
+                 "text_start": text[:500], "text_end": text[-300:]}
+        _log.warning("[avatar-research] unreadable web answer: %r", debug)
+        if stops and stops[-1] == "pause_turn":
+            raise ResearchError("the web research did not finish (it was still searching after {0} rounds)".format(len(stops)), debug)
+        if stops and stops[-1] == "max_tokens":
+            raise ResearchError("the web research answer was cut off before it finished", debug)
+        raise ResearchError(str(e), debug)
 
 async def research(address: str, census_key: str, model: str, get: GetJson, post: PostClaude) -> dict:
     """All three parts at once. Each part is either its findings or {"error": why}."""
@@ -345,6 +375,8 @@ async def research(address: str, census_key: str, model: str, get: GetJson, post
     for name, val in zip(("census", "jobs", "web"), parts):
         if isinstance(val, ResearchError):
             result[name] = {"error": str(val)}
+            if getattr(val, "debug", None):
+                result[name]["debug"] = val.debug
         elif isinstance(val, Exception):
             result[name] = {"error": "{0} could not be read: {1}".format(name, val)}
         else:
