@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from typing import Awaitable, Callable, Optional
 
@@ -62,6 +63,8 @@ ACS_VARS = {
 FAIR_HOUSING_EXCLUDED = ("age", "race", "ethnicity", "religion", "national origin", "sex",
                          "disability", "familial status", "household or family make-up",
                          "children", "schools")
+
+_log = logging.getLogger("forward-cc")
 
 ZIP_RX = re.compile(r"\b(\d{5})(?:-\d{4})?\b")
 
@@ -272,29 +275,51 @@ def clean_web(raw: dict) -> dict:
     return out
 
 
+WEB_KEYS = ("employers", "moving", "salaries")
+
+
 def parse_claude_json(data: dict) -> dict:
+    """The findings object in the model's answer. With web search on, the answer is many
+    text blocks with notes around the JSON ("I'll search for...", a closing remark), and a
+    note can hold a brace of its own. So every "{" is tried as the start of a JSON value
+    (json's raw_decode, which stops where the value ends) and the last one that is an
+    object with at least one of the expected lists wins. Live on Oct 24, 2026 the first
+    version (first "{" to last "}") failed on 219 N Pitt St with "not valid JSON"."""
     text = "".join(b.get("text", "") for b in (data or {}).get("content", [])
                    if isinstance(b, dict) and b.get("type") == "text")
-    m = re.search(r"\{[\s\S]*\}", text)
-    if not m:
+    dec, found, seen_brace = json.JSONDecoder(), None, False
+    for m in re.finditer(r"\{", text):
+        seen_brace = True
+        try:
+            val, _end = dec.raw_decode(text, m.start())
+        except ValueError:
+            continue
+        if isinstance(val, dict) and any(k in val for k in WEB_KEYS):
+            found = val
+    if found is not None:
+        return found
+    if not seen_brace:
         raise ResearchError("the web research gave no readable answer")
-    try:
-        return json.loads(m.group())
-    except ValueError:
-        raise ResearchError("the web research answer was not valid JSON")
+    raise ResearchError("the web research answer was not valid JSON")
 
 
 async def web_research(address: str, zip5: str, county_name: str, model: str, post: PostClaude) -> dict:
     user = ("Research the market around this home.\nAddress: {0}\nZIP: {1}\nCounty: {2}"
             .format(address, zip5 or "unknown", county_name or "unknown"))
-    body = {"model": model, "max_tokens": 3000,
+    body = {"model": model, "max_tokens": 6000,
             "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 6}],
             "system": WEB_SYSTEM, "messages": [{"role": "user", "content": user}]}
     try:
         data = await post(body)
     except Exception as e:
         raise ResearchError("Web research did NOT run: {0}".format(e))
-    return clean_web(parse_claude_json(data))
+    try:
+        return clean_web(parse_claude_json(data))
+    except ResearchError:
+        texts = [b.get("text", "") for b in (data or {}).get("content", []) if isinstance(b, dict) and b.get("type") == "text"]
+        _log.warning("[avatar-research] unreadable web answer, stop_reason=%s, %d text blocks, start: %r, end: %r",
+                     (data or {}).get("stop_reason"), len(texts), "".join(texts)[:600], "".join(texts)[-300:])
+        raise
 
 
 async def research(address: str, census_key: str, model: str, get: GetJson, post: PostClaude) -> dict:

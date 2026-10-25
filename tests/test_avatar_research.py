@@ -222,3 +222,25 @@ def test_route(monkeypatch):
     monkeypatch.setattr(main, "CENSUS_API_KEY", "")
     j = c.post("/api/avatar-research", json={"property_id": P}, headers=ORIGIN).json()
     assert "no Census key" in j["census"]["error"]
+
+
+def test_the_findings_are_found_among_notes_and_stray_braces():
+    def ans(*texts):
+        return {"content": [{"type": "text", "text": x} for x in texts]}
+    j = '{"employers":[{"name":"Inova","what":"hospital","where":"Alexandria","source_url":"https://example.org/i"}],"moving":[],"salaries":[]}'
+    # notes before and after, a brace in a note, the JSON split across text blocks (web search answers come in many blocks)
+    got = avr.parse_claude_json(ans("I'll search for employers {near the address}. ", j[:40], j[40:], " Note: figures are from 2024 {see sources}."))
+    assert got["employers"][0]["name"] == "Inova"
+    got = avr.parse_claude_json(ans("```json\n" + j + "\n```"))
+    assert got["employers"][0]["source_url"] == "https://example.org/i"
+    # an object that is not the findings is not taken for them
+    try:
+        avr.parse_claude_json(ans('Searching {"query": "employers"} now.'))
+        raise AssertionError("should refuse")
+    except avr.ResearchError as e:
+        assert str(e) == "the web research answer was not valid JSON"
+    try:
+        avr.parse_claude_json(ans("No braces at all."))
+        raise AssertionError("should refuse")
+    except avr.ResearchError as e:
+        assert str(e) == "the web research gave no readable answer"
