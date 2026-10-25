@@ -3116,6 +3116,62 @@ async def meeting_prep_research(payload: MeetingPrepResearchRequest):
         return {"found": False, "error": str(e), "sources": []}
 
 
+# ── Buyer avatar research (Oct 24, 2026) ──────────────────────────────────────
+# The listing's ZIP and county, researched for the five buyer avatars: Census figures,
+# job clusters and web research with sources. See avatar_research.py for what is and is
+# not gathered (fair housing) and why. The address is read from the database, never
+# taken from the caller. Opens only from FORWARD OS, like the listing presentation.
+import avatar_research as _avr
+
+CENSUS_API_KEY = os.environ.get("CENSUS_API_KEY", "")
+
+
+class AvatarResearchRequest(BaseModel):
+    property_id: str
+
+
+async def _avr_get(url: str, params: dict):
+    async with httpx.AsyncClient(timeout=25) as client:
+        r = await client.get(url, params=params)
+    if r.status_code >= 400:
+        txt = (r.text or "").strip().replace("\n", " ")[:160]
+        raise _avr.ResearchError("{0} answered {1}{2}".format(url.split("/")[2], r.status_code, (": " + txt) if txt else ""))
+    try:
+        return r.json()
+    except ValueError:
+        raise _avr.ResearchError("{0} did not answer with data (it may need a key)".format(url.split("/")[2]))
+
+
+async def _avr_post(body: dict) -> dict:
+    headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01",
+               "anthropic-beta": "web-search-2025-03-05", "content-type": "application/json"}
+    resp = await claude_post(headers, body, timeout=100, where="avatar-research")
+    return resp.json()
+
+
+@app.post("/api/avatar-research")
+async def avatar_research(payload: AvatarResearchRequest, request: Request):
+    _lp_guard(request)
+    pid = (payload.property_id or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", pid):
+        raise HTTPException(status_code=400, detail="property_id must be a listing id.")
+    rows = supabase.table("properties").select("id,address").eq("id", pid).limit(1).execute().data or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="No FORWARD OS listing with that id.")
+    address = (rows[0].get("address") or "").strip()
+    if not address:
+        raise HTTPException(status_code=422, detail="This listing has no address to research.")
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="The backend has no AI key, so the research cannot run.")
+    result = await _avr.research(address, CENSUS_API_KEY, BMR_MODEL, _avr_get, _avr_post)
+    result["prompt"] = _avr.prompt_block(result)
+    result["researched_at"] = datetime.now(timezone.utc).isoformat()
+    for part in ("census", "jobs", "web"):
+        if "error" in result.get(part, {}):
+            logger.warning("[avatar-research] %s %s: %s", pid, part, result[part]["error"])
+    return result
+
+
 # ── Deal Partners ─────────────────────────────────────────────────────────────
 
 def _get_co_agents(record):
