@@ -35,7 +35,7 @@ def test_text_issues():
                 "The best value on the tour.", "Priced to sell.", "A motivated seller.", "Expect a bidding war."):
         assert any("facts only" in i for i in tp.text_issues(adv)), adv
     for fact in ("On the market 22 days, the longest of the four.", "The lowest price on the tour.",
-                 "The newest listing on the tour."):
+                 "The newest listing on the tour.", "An open main level with room to entertain."):
         assert tp.text_issues(fact) == [], fact
 
 

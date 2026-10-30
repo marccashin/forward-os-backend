@@ -62,7 +62,7 @@ WHO_RX = re.compile(
 # Marc, Oct 30 2026: the tour sheet is objective ("here's where we're going, here's what they
 # look like"). No negotiating or value commentary, e.g. "room to negotiate" from days on market.
 ADVICE_RX = re.compile(
-    r"\b(?:negotiat\w*|room to|leverage|bargain|good deal|great deal|best deal|(?:best|good|great) value|"
+    r"\b(?:negotiat\w*|leverage|bargain|good deal|great deal|best deal|(?:best|good|great) value|"
     r"underpriced|overpriced|priced to sell|motivated|price (?:cut|drop|reduction)|reduced|offers? (?:below|under|over|above)|"
     r"below asking|over asking|bidding war|compet\w+ offers?|move quickly|act fast|won'?t last|sit(?:s|ting)? on the market|stale|"
     r"worth (?:it|the)|investment|appreciat\w*|resale|should (?:offer|buy|consider))\b", re.I)
