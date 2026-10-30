@@ -59,6 +59,13 @@ WHO_RX = re.compile(
     r"\b(?:family[- ]friendly|famil(?:y|ies)|kids?|children|young professionals?|empty[- ]nesters?|"
     r"retirees?|newlyweds?|bachelor|singles?|couples?|first[- ]time (?:home ?)?buyers?|"
     r"schools?|church(?:es)?|synagogues?|mosques?|handicap(?:ped)?|perfect for|ideal for)\b", re.I)
+# Marc, Oct 30 2026: the tour sheet is objective ("here's where we're going, here's what they
+# look like"). No negotiating or value commentary, e.g. "room to negotiate" from days on market.
+ADVICE_RX = re.compile(
+    r"\b(?:negotiat\w*|room to|leverage|bargain|good deal|great deal|best deal|(?:best|good|great) value|"
+    r"underpriced|overpriced|priced to sell|motivated|price (?:cut|drop|reduction)|reduced|offers? (?:below|under|over|above)|"
+    r"below asking|over asking|bidding war|compet\w+ offers?|move quickly|act fast|won'?t last|sit(?:s|ting)? on the market|stale|"
+    r"worth (?:it|the)|investment|appreciat\w*|resale|should (?:offer|buy|consider))\b", re.I)
 
 PostJson = Callable[[str, dict, dict], Awaitable[object]]
 GetJson = Callable[[str, dict], Awaitable[object]]
@@ -84,6 +91,9 @@ def text_issues(t: str) -> list[str]:
     m = WHO_RX.search(text)
     if m:
         out.append('"{0}" says who should live there or names a protected group (fair housing)'.format(m.group(0)))
+    a = ADVICE_RX.search(text)
+    if a:
+        out.append('"{0}" is commentary on price or negotiating; the tour sheet states facts only'.format(a.group(0)))
     return out
 
 
@@ -106,7 +116,8 @@ LOOKUP_SYSTEM = (
     "A different unit in the same building is NOT this home.\n"
     "- overview: one or two sentences in your own words, from the listing's description, saying what the "
     "home is and its most notable features. Never copy more than four words in a row from the description. "
-    "Describe the home and its location only, never who should live there or any group of people. "
+    "Describe the home and its location only, never who should live there or any group of people, and "
+    "never comment on price, value or negotiating. "
     "No long dashes. Never use the words stunning, luxurious, impeccable, nestled, boasts or charming.\n\n"
     "Return ONLY valid JSON in this exact shape, nothing before or after it:\n"
     '{"matched_address":"","status":"","list_price":[{"value":"","source_url":""}],'
@@ -272,6 +283,9 @@ COMPARE_SYSTEM = (
     "- Use ONLY the facts given. Any number you write must appear in the facts exactly as written. "
     "Never calculate anything (no differences, no price per square foot, no percentages).\n"
     "- Comparisons in words are fine: the largest, the only one with a half bath, the newest on the market.\n"
+    "- Objective facts only. No advice and no commentary on price, value or negotiating (never say a home "
+    "may leave room to negotiate, is a good value, is priced to sell, or should get an offer). Days on market "
+    "is stated as a fact, never interpreted.\n"
     "- Describe the homes only, never who should live there or any group of people (fair housing). "
     "No schools.\n"
     "- No long dashes. Never use the words stunning, luxurious, impeccable, nestled, boasts or charming.\n\n"

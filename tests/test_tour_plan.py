@@ -30,6 +30,13 @@ def test_text_issues():
     for who in ("Great for families.", "Near top schools.", "Ideal for young professionals.", "Kids will love the yard."):
         assert any("fair housing" in i for i in tp.text_issues(who)), who
     assert tp.text_issues("Close to the Metro and Rock Creek Park.") == []
+    # Marc, Oct 30: facts only, no negotiating or value commentary
+    for adv in ("It has been on the market the longest, which may leave room to negotiate.",
+                "The best value on the tour.", "Priced to sell.", "A motivated seller.", "Expect a bidding war."):
+        assert any("facts only" in i for i in tp.text_issues(adv)), adv
+    for fact in ("On the market 22 days, the longest of the four.", "The lowest price on the tour.",
+                 "The newest listing on the tour."):
+        assert tp.text_issues(fact) == [], fact
 
 
 # ── address matching ────────────────────────────────────────────────────────────
