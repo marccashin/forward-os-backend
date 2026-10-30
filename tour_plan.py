@@ -427,15 +427,19 @@ def best_order(matrix: list[list[int]], n: int, origin: Optional[int] = None) ->
     return best
 
 
-def plan_schedule(order: list[int], legs_sec: list[int], start: int, minutes_each: int, buffer_min: int) -> list[dict]:
+ALLOWED_MINUTES = (15, 30, 45, 60)   # the agent's dropdown, per home (Marc, Oct 30 2026)
+
+
+def plan_schedule(order: list[int], legs_sec: list[int], start: int, minutes: list[int], buffer_min: int) -> list[dict]:
     """Suggested times: the first home at `start`; each next one at the end of the last
-    plus the drive plus the buffer, rounded UP to 5 minutes."""
+    plus the drive plus the buffer, rounded UP to 5 minutes. minutes[k] is the time at the
+    k-th home in tour order (each home has its own: an hour at one, 30 minutes at the next)."""
     out, t = [], start
     for k, i in enumerate(order):
         if k > 0:
             t = ceil5(out[-1]["end_min"] + legs_sec[k - 1] / 60.0 + buffer_min)
-        out.append({"home": i, "start_min": t, "end_min": t + minutes_each,
-                    "start": hhmm(t), "end": hhmm(t + minutes_each)})
+        out.append({"home": i, "start_min": t, "end_min": t + minutes[k],
+                    "start": hhmm(t), "end": hhmm(t + minutes[k])})
     return out
 
 
@@ -545,8 +549,8 @@ def static_map_url(homes: list[dict], key: str, polyline: str = "", start: Optio
 async def route(req: dict, key: str, get: GetJson, post: PostJson, get_bytes: GetBytes,
                 now: Optional[datetime] = None) -> dict:
     """Plan or confirmed mode, see the module docstring. `req`:
-    {mode, date, start_time (plan), minutes_each (plan), buffer_minutes, start_address (optional),
-     stops:[{address, start?, end?}]}"""
+    {mode, date, start_time (plan), buffer_minutes, start_address (optional),
+     stops:[{address, minutes (plan: 15, 30, 45 or 60), start?, end? (confirmed)}]}"""
     mode = req.get("mode")
     if mode not in ("plan", "confirmed"):
         raise TourError("mode must be plan or confirmed")
@@ -567,9 +571,13 @@ async def route(req: dict, key: str, get: GetJson, post: PostJson, get_bytes: Ge
         stops = [stops[i] for i in order_in]
     else:
         start = parse_hhmm(req.get("start_time"))
-        minutes_each = int(req.get("minutes_each") or 0)
-        if minutes_each < 5 or minutes_each > 240:
-            raise TourError("Minutes at each home must be 5 to 240")
+        for s in stops:
+            try:
+                s["minutes"] = int(s.get("minutes"))
+            except (TypeError, ValueError):
+                s["minutes"] = None
+            if s["minutes"] not in ALLOWED_MINUTES:
+                raise TourError("{0}: pick the time at this home (15, 30, 45 min or 1 hour)".format(s["address"].strip()))
 
     async def geo(addr):
         try:
@@ -618,12 +626,13 @@ async def route(req: dict, key: str, get: GetJson, post: PostJson, get_bytes: Ge
         legs, poly = read_route(rpay, len(pts) - 1)
 
     if mode == "plan":
-        sched = plan_schedule(list(range(len(pts))), legs, start, minutes_each, buffer_min)
+        sched = plan_schedule(list(range(len(pts))), legs, start, [s["minutes"] for s in stops], buffer_min)
         for s, t in zip(stops, sched):
             s.update({k: t[k] for k in ("start", "end", "start_min", "end_min")})
     rows = check_times(stops, legs, buffer_min)
 
     out_stops = [{"stop": i + 1, "address": s["address"].strip(), "start": s["start"], "end": s["end"],
+                  "minutes": s["end_min"] - s["start_min"],
                   "lat": p["lat"], "lng": p["lng"], "google_address": p["formatted"]}
                  for i, (s, p) in enumerate(zip(stops, pts))]
 

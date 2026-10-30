@@ -231,13 +231,15 @@ def test_plan_schedule():
     for _ in range(200):
         n = rnd.randint(1, 8)
         legs = [rnd.randint(0, 3600) for _ in range(n - 1)]
-        start, each, buf = rnd.randint(480, 900), rnd.choice([15, 20, 30, 45]), rnd.choice([0, 5, 10])
+        start, buf = rnd.randint(480, 900), rnd.choice([0, 5, 10])
+        each = [rnd.choice(tp.ALLOWED_MINUTES) for _ in range(n)]
         s = tp.plan_schedule(list(range(n)), legs, start, each, buf)
         assert s[0]["start_min"] == start
         for k in range(1, n):
             earliest = s[k - 1]["end_min"] + legs[k - 1] / 60.0 + buf
             assert earliest <= s[k]["start_min"] < earliest + 5 and s[k]["start_min"] % 5 == 0
-            assert s[k]["end_min"] - s[k]["start_min"] == each
+        for k in range(n):
+            assert s[k]["end_min"] - s[k]["start_min"] == each[k], "each home keeps its own time"
         assert all(r["warning"] == "" for r in tp.check_times(s, legs, buf))
 
 
@@ -348,14 +350,19 @@ class Google:
 
 def test_route_plan_mode():
     g = Google()
-    req = {"mode": "plan", "date": "2026-10-31", "start_time": "10:00", "minutes_each": 30, "buffer_minutes": 5,
+    mins = {"1": 60, "2": 30, "3": 45, "4": 15}   # Marc: an hour at one, 30 minutes at the next
+    req = {"mode": "plan", "date": "2026-10-31", "start_time": "10:00", "buffer_minutes": 5,
            "start_address": "Office, 1 Main St, Washington, DC 20001",
-           "stops": [{"address": a} for a in ("2 B St, Washington, DC 20001", "1 A St, Washington, DC 20001",
-                                              "4 D St, Washington, DC 20001", "3 C St, Washington, DC 20001")]}
+           "stops": [{"address": a, "minutes": mins[a[0]]} for a in (
+               "2 B St, Washington, DC 20001", "1 A St, Washington, DC 20001",
+               "4 D St, Washington, DC 20001", "3 C St, Washington, DC 20001")]}
     out = run(tp.route(req, "KEY", g.get, g.post, g.get_bytes, NOW))
     # from the office (south), north along the line: A, C, D, B
     assert [s["address"][0] for s in out["stops"]] == ["1", "3", "4", "2"]
-    assert [s["start"] for s in out["stops"]] == ["10:00", "10:55", "12:25", "13:20"]
+    # A 10:00-11:00; +17.7 drive +5 -> 11:25 C 11:25-12:10; +51 +5 -> 13:10 D 13:10-13:25; +17.7 +5 -> 13:50 B
+    assert [(s["start"], s["end"]) for s in out["stops"]] == [("10:00", "11:00"), ("11:25", "12:10"),
+                                                              ("13:10", "13:25"), ("13:50", "14:20")]
+    assert [s["minutes"] for s in out["stops"]] == [60, 45, 15, 30], "each home's own time follows it into the order"
     assert out["warnings"] == [] and out["traffic"] is True
     assert g.posts[0][1]["departureTime"] == "2026-10-31T10:00:00-04:00"
     assert g.posts[0][1]["routingPreference"] == "TRAFFIC_AWARE"
@@ -381,12 +388,13 @@ def test_route_confirmed_mode():
 
 def test_route_refusals():
     g = Google()
-    base = {"mode": "plan", "date": "2026-10-31", "start_time": "10:00", "minutes_each": 30}
+    base = {"mode": "plan", "date": "2026-10-31", "start_time": "10:00"}
     cases = [(dict(base, stops=[]), "1 to 8"),
              (dict(base, stops=[{"address": "1 A St, Washington, DC 20001"}] * 9), "1 to 8"),
              (dict(base, mode="x", stops=[{"address": "a"}]), "plan or confirmed"),
-             (dict(base, minutes_each=2, stops=[{"address": "1 A St, Washington, DC 20001"}]), "5 to 240"),
-             (dict(base, stops=[{"address": "9 Nowhere Rd"}]), "could not find"),
+             (dict(base, stops=[{"address": "1 A St, Washington, DC 20001"}]), "pick the time at this home"),
+             (dict(base, stops=[{"address": "1 A St, Washington, DC 20001", "minutes": 20}]), "pick the time at this home"),
+             (dict(base, stops=[{"address": "9 Nowhere Rd", "minutes": 30}]), "could not find"),
              ({"mode": "confirmed", "date": "2026-10-31", "stops": [{"address": "1 A St, Washington, DC 20001", "start": "10:30", "end": "10:00"}]}, "after the start"),
              ({"mode": "confirmed", "date": "2026-10-31", "stops": [{"address": "1 A St, Washington, DC 20001", "start": "10am", "end": "11"}]}, "Times are written")]
     for req, word in cases:
@@ -399,7 +407,7 @@ def test_route_refusals():
     async def not_png(url):
         return b"<html>error</html>"
     try:
-        run(tp.route(dict(base, stops=[{"address": "1 A St, Washington, DC 20001"}]), "K", g.get, g.post, not_png, NOW))
+        run(tp.route(dict(base, stops=[{"address": "1 A St, Washington, DC 20001", "minutes": 30}]), "K", g.get, g.post, not_png, NOW))
         raise AssertionError
     except tp.TourError as e:
         assert "map image did NOT load" in str(e)
@@ -443,15 +451,16 @@ def test_http_routes(monkeypatch):
     r = c.post("/api/tour/lookup", json={"address": "219 N Pitt St, Alexandria, VA 22314"}, headers=ORIGIN)
     assert r.status_code == 200 and r.json()["fields"]["beds"]["display"] == "4" and r.json()["looked_up_at"]
     assert c.post("/api/tour/lookup", json={"address": "Pitt"}, headers=ORIGIN).status_code == 502
-    req = {"mode": "plan", "date": "2026-10-31", "start_time": "10:00", "minutes_each": 30,
-           "stops": [{"address": "1 A St, Washington, DC 20001"}, {"address": "2 B St, Washington, DC 20001"}]}
+    req = {"mode": "plan", "date": "2026-10-31", "start_time": "10:00",
+           "stops": [{"address": "1 A St, Washington, DC 20001", "minutes": 60},
+                     {"address": "2 B St, Washington, DC 20001", "minutes": 30}]}
     monkeypatch.setattr(main, "GOOGLE_MAPS_SERVER_KEY", "")
     r = c.post("/api/tour/route", json=req, headers=ORIGIN)
     assert r.status_code == 503 and "GOOGLE_MAPS_SERVER_KEY" in r.json()["detail"]
     monkeypatch.setattr(main, "GOOGLE_MAPS_SERVER_KEY", "SERVERKEY")
     r = c.post("/api/tour/route", json=req, headers=ORIGIN)
     assert r.status_code == 200 and len(r.json()["stops"]) == 2 and "SERVERKEY" not in r.text
-    r = c.post("/api/tour/route", json=dict(req, stops=[{"address": "9 Nowhere Rd"}]), headers=ORIGIN)
+    r = c.post("/api/tour/route", json=dict(req, stops=[{"address": "9 Nowhere Rd", "minutes": 30}]), headers=ORIGIN)
     assert r.status_code == 422 and "could not find" in r.json()["detail"]
     r = c.post("/api/tour/compare", json={"homes": HOMES[:1]}, headers=ORIGIN)
     assert r.status_code == 200 and r.json()["homes"][0]["issues"] == []
