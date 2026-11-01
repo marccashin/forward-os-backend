@@ -5347,3 +5347,106 @@ async def hot_sheet_preview(request: Request):
     if run["errors"] and not run["sent"]:
         raise HTTPException(status_code=502, detail="Preview not sent: " + "; ".join(e["error"] for e in run["errors"]))
     return run
+
+
+# ── Showing tour plans (Oct 30, 2026) ─────────────────────────────────────────
+# The buyer's showing tour: each home looked up on the web (every figure with its page,
+# the agent confirms them in the app before a client sees anything), the drive order and
+# times (Google Routes API), the two map images, and the comparison sentences written only
+# from the confirmed figures. See tour_plan.py. Opens only from FORWARD OS. The Google key
+# is the server's own (GOOGLE_MAPS_SERVER_KEY, with Geocoding API, Routes API and Maps
+# Static API turned on); the browser key is never used for this.
+import tour_plan as _tour
+
+GOOGLE_MAPS_SERVER_KEY = os.environ.get("GOOGLE_MAPS_SERVER_KEY", "")
+_TOUR_SEARCHES = asyncio.Semaphore(4)   # at most four web searches at once for this tool
+
+
+class TourLookupRequest(BaseModel):
+    address: str
+
+
+class TourCompareRequest(BaseModel):
+    homes: list[dict]
+
+
+def _google_error(r) -> str:
+    try:
+        j = r.json()
+        msg = (j.get("error") or {}).get("message") or j.get("error_message") or ""
+    except ValueError:
+        msg = ""
+    return "Google answered {0}{1}".format(r.status_code, (": " + msg[:200]) if msg else "")
+
+
+async def _tour_get(url: str, params: dict):
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, params=params)
+    if r.status_code >= 400:
+        raise _tour.TourError(_google_error(r))
+    return r.json()
+
+
+async def _tour_post(url: str, body: dict, headers: dict):
+    h = {"X-Goog-Api-Key": GOOGLE_MAPS_SERVER_KEY, "Content-Type": "application/json"}
+    h.update(headers or {})
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, json=body, headers=h)
+    if r.status_code >= 400:
+        raise _tour.TourError(_google_error(r))
+    return r.json()
+
+
+async def _tour_get_bytes(url: str) -> bytes:
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url)
+    if r.status_code >= 400:
+        raise _tour.TourError(_google_error(r))
+    return r.content
+
+
+async def _tour_claude(body: dict, web: bool) -> dict:
+    headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01",
+               "content-type": "application/json"}
+    if web:
+        headers["anthropic-beta"] = "web-search-2025-03-05"
+    resp = await claude_post(headers, body, timeout=100, where="tour-lookup" if web else "tour-compare")
+    return resp.json()
+
+
+@app.post("/api/tour/lookup")
+async def tour_lookup(payload: TourLookupRequest, request: Request):
+    _lp_guard(request)
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="The backend has no AI key, so the listing search cannot run.")
+    async with _TOUR_SEARCHES:
+        try:
+            out = await _tour.lookup(payload.address, BMR_MODEL, lambda b: _tour_claude(b, True))
+        except _tour.TourError as e:
+            logger.warning("[tour] lookup %r: %s", payload.address, e)
+            raise HTTPException(status_code=502, detail=str(e))
+    out["looked_up_at"] = datetime.now(timezone.utc).isoformat()
+    return out
+
+
+@app.post("/api/tour/route")
+async def tour_route(payload: dict, request: Request):
+    _lp_guard(request)
+    if not GOOGLE_MAPS_SERVER_KEY:
+        raise HTTPException(status_code=503, detail="The backend has no Google Maps key (GOOGLE_MAPS_SERVER_KEY), so the route cannot be worked out.")
+    try:
+        return await _tour.route(payload, GOOGLE_MAPS_SERVER_KEY, _tour_get, _tour_post, _tour_get_bytes)
+    except _tour.TourError as e:
+        logger.warning("[tour] route: %s", e)
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.post("/api/tour/compare")
+async def tour_compare(payload: TourCompareRequest, request: Request):
+    _lp_guard(request)
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="The backend has no AI key, so the comparisons cannot be written.")
+    try:
+        return await _tour.compare(payload.homes, BMR_MODEL, lambda b: _tour_claude(b, False))
+    except _tour.TourError as e:
+        raise HTTPException(status_code=502, detail=str(e))
