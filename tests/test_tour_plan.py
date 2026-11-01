@@ -465,3 +465,168 @@ def test_http_routes(monkeypatch):
     r = c.post("/api/tour/compare", json={"homes": HOMES[:1]}, headers=ORIGIN)
     assert r.status_code == 200 and r.json()["homes"][0]["issues"] == []
     assert calls == [True, False]
+
+
+# ── FORWARD's standard booking, start and end points (Marc, Nov 1 2026) ─────────
+def held_karp_end(m, n, origin, dest):
+    """Least total drive from origin, through every home, to dest: dynamic programming over
+    subsets, a different method from best_order's exhaustive search."""
+    INF = float("inf")
+    dp = {(1 << i, i): (m[origin][i] if origin is not None else 0) for i in range(n)}
+    for mask in range(1, 1 << n):
+        for last in range(n):
+            if (mask, last) not in dp:
+                continue
+            for nxt in range(n):
+                if not mask & (1 << nxt):
+                    k = (mask | 1 << nxt, nxt)
+                    dp[k] = min(dp.get(k, INF), dp[(mask, last)] + m[last][nxt])
+    full = (1 << n) - 1
+    return min(dp[(full, i)] + (m[i][dest] if dest is not None else 0) for i in range(n))
+
+
+def test_best_order_with_end_point():
+    rnd = random.Random(19)
+    for trial in range(80):
+        n = rnd.randint(2, 7)
+        has_o = trial % 2 == 0
+        size = n + (1 if has_o else 0) + 1
+        m = [[0 if i == j else rnd.randint(60, 2400) for j in range(size)] for i in range(size)]
+        origin = n if has_o else None
+        dest = size - 1
+        o = tp.best_order(m, n, origin, dest)
+        assert sorted(o) == list(range(n))
+        got = (m[origin][o[0]] if has_o else 0) + sum(m[a][b] for a, b in zip(o, o[1:])) + m[o[-1]][dest]
+        assert got == held_karp_end(m, n, origin, dest), (trial, o)
+    # The end point changes the answer: homes on a line 0..3, ending beside home 0 means
+    # the tour should finish at 0, not start there.
+    pos = [0, 10, 20, 30, 35, -1]          # four homes, a start at 35, an end at -1
+    m = [[abs(a - b) * 60 for b in pos] for a in pos]
+    assert tp.best_order(m, 4, 4, None)[0] == 3 and tp.best_order(m, 4, 4, 5) == [3, 2, 1, 0]
+    assert tp.best_order(m, 4, None, 5)[-1] == 0
+
+
+def test_standard_schedule():
+    # Marc's example: an hour each, the second starting 15 minutes before the first ends.
+    # Arriving 10 minutes into the second, the agent leaves at 2:40 after 45 minutes; a 30 min
+    # drive starts the third 15 minutes after that, at 2:55.
+    legs = [10 * 60, 30 * 60]
+    s = tp.standard_schedule(3, legs, 13 * 60)
+    assert [(x["start"], x["end"]) for x in s] == [("13:00", "14:00"), ("13:45", "14:45"), ("14:55", "15:55")]
+    assert [(tp.hhmm(x["arrive_min"]), tp.hhmm(x["leave_min"])) for x in s] == [("13:00", "13:45"), ("13:55", "14:40"), ("15:10", "15:55")]
+    assert all(r["warning"] == "" for r in tp.check_standard(s, legs)), "the standard's own times never warn"
+    # independent rule over random tours
+    rnd = random.Random(23)
+    for _ in range(400):
+        n = rnd.randint(1, 8)
+        legs = [rnd.randint(0, 4000) for _ in range(n - 1)]
+        start = rnd.randint(480, 900)
+        s = tp.standard_schedule(n, legs, start)
+        assert s[0]["start_min"] == start
+        for k in range(n):
+            assert s[k]["end_min"] - s[k]["start_min"] == 60
+        # independent walk: arrive, 45 minutes inside, drive; the booking starts at least when the
+        # agent leaves the last home and no more than 15 minutes before the agent gets there
+        arrive = start
+        for k in range(1, n):
+            drive = -(-legs[k - 1] // 60)
+            leave = arrive + 45
+            want = leave + max(0, drive - 15)
+            assert want <= s[k]["start_min"] < want + 5 and s[k]["start_min"] % 5 == 0
+            arrive = max(s[k]["start_min"], leave + drive)
+            assert arrive - s[k]["start_min"] <= 15 and arrive + 45 <= s[k]["end_min"], "45 minutes inside the booking"
+        if n > 1 and legs[0] <= 15 * 60:
+            assert s[1]["start_min"] == tp.ceil5(s[0]["end_min"] - 15), "after the first home, a short drive overlaps 15 minutes"
+        assert all(r["warning"] == "" for r in tp.check_standard(s, legs))
+
+
+def test_check_standard():
+    def st(a, b):
+        return {"start_min": a, "end_min": b, "start": tp.hhmm(a), "end": tp.hhmm(b)}
+    # Marc's confirmed times: 1-2, 1:45-2:45, 3:30-4:30. Short drives fit.
+    three = [st(780, 840), st(825, 885), st(930, 990)]
+    assert [r["warning"] for r in tp.check_standard(three, [10 * 60, 40 * 60])] == ["", ""]
+    # the same times judged the old way call the overlap an error; the standard does not
+    assert "before stop 1 ends" in tp.check_times(three, [10 * 60, 40 * 60], 5)[0]["warning"]
+    rows = tp.check_standard(three, [25 * 60, 40 * 60])
+    assert rows[0]["warning"].startswith("Leaving stop 1 at 13:45 after 45 minutes inside, the drive is about 25 min") \
+        and "around 14:10, 25 minutes into its 13:45 booking" in rows[0]["warning"] and rows[1]["warning"] == ""
+    # independent rule: arrive at the first booking, 45 minutes inside (or to its end), then drive;
+    # a warning exactly when that is more than 15 minutes into the next booking
+    rnd = random.Random(29)
+    for _ in range(600):
+        a0 = rnd.randint(500, 800); a1 = a0 + rnd.choice([30, 45, 60, 75]); b0 = a0 + rnd.randint(0, 120)
+        d = rnd.randint(0, 3600)
+        r = tp.check_standard([st(a0, a1), st(b0, b0 + 60)], [d])[0]
+        arrive = min(a1, a0 + 45) + -(-d // 60)
+        assert bool(r["warning"]) == (arrive - b0 > 15), (a0, a1, b0, d, r)
+
+
+def test_route_standard_with_start_and_end():
+    g = Google()
+    req = {"mode": "plan", "booking": "standard", "date": "2026-10-31", "start_time": "13:00",
+           "start_address": "Office, 1 Main St, Washington, DC 20001",
+           "end_address": "1 A St, Washington, DC 20001",
+           "stops": [{"address": a} for a in ("2 B St, Washington, DC 20001", "3 C St, Washington, DC 20001",
+                                              "4 D St, Washington, DC 20001")]}
+    out = run(tp.route(req, "KEY", g.get, g.post, g.get_bytes, NOW))
+    matrix = [p for p in g.posts if "computeRouteMatrix" in p[0]][0][1]
+    assert len(matrix["origins"]) == 5, "the three homes, the start and the end"
+    # office at 38.89 (south), end at 38.90: start with C (38.91), out to B (38.95), back via D (38.94)?
+    # independent check: every order's total from the office through the homes to the end
+    lat = {"2": 38.95, "3": 38.91, "4": 38.94}
+    def sec(a, b):
+        return int(abs(a - b) * 100000) + 60
+    best = min(itertools.permutations("234"),
+               key=lambda o: sec(38.89, lat[o[0]]) + sum(sec(lat[a], lat[b]) for a, b in zip(o, o[1:])) + sec(lat[o[-1]], 38.90))
+    assert [s["address"][0] for s in out["stops"]] == list(best)
+    route_call = [p for p in g.posts if "computeRoutes" in p[0]][0][1]
+    assert abs(route_call["origin"]["location"]["latLng"]["latitude"] - 38.89) < 1e-9
+    assert abs(route_call["destination"]["location"]["latLng"]["latitude"] - 38.90) < 1e-9
+    assert len(out["legs"]) == 2 and all(r["warning"] == "" for r in out["legs"])
+    st0 = out["stops"][0]
+    assert (st0["start"], st0["end"]) == ("13:00", "14:00") and all(s["minutes"] == 60 for s in out["stops"])
+    drv = [-(-sec(lat[a], lat[b]) // 60) for a, b in zip(best, best[1:])]
+    arrive = 780
+    for k, s in enumerate(out["stops"][1:]):
+        leave = arrive + 45
+        t = -(-(leave + max(0, drv[k] - 15)) // 5) * 5
+        arrive = max(t, leave + drv[k])
+        assert s["start"] == tp.hhmm(t), (k, s, t)
+    sd = -(-sec(38.89, lat[best[0]]) // 60)
+    ed = -(-sec(lat[best[-1]], 38.90) // 60)
+    assert out["start"]["drive_min"] == sd and out["start"]["leave_by"] == tp.hhmm(780 - sd)
+    last = out["stops"][-1]
+    assert out["end"]["drive_min"] == ed and out["end"]["arrive_about"] == tp.hhmm(arrive + 45 + ed)
+    agent, client = unquote(g.imgs[0]), unquote(g.imgs[1])
+    assert "label:S|" in agent and "label:E|" in agent and "label:S" not in client and "label:E" not in client
+    assert out["booking"] == "standard" and "KEY" not in json.dumps(out)
+    # without a booking the old per-home custom rules still apply
+    old = dict(req, booking=None, stops=[{"address": "2 B St, Washington, DC 20001"}])
+    try:
+        run(tp.route(old, "KEY", g.get, g.post, g.get_bytes, NOW))
+        assert False, "custom booking needs a time per home"
+    except tp.TourError as e:
+        assert "pick the time at this home" in str(e)
+    try:
+        run(tp.route(dict(req, booking="weekly"), "KEY", g.get, g.post, g.get_bytes, NOW))
+        assert False
+    except tp.TourError as e:
+        assert "standard or custom" in str(e)
+
+
+def test_route_confirmed_standard():
+    g = Google()
+    PLACES["5 E St, Washington, DC 20001"] = (38.905, -77.00)   # about 10 minutes from 1 A St
+    req = {"mode": "confirmed", "booking": "standard", "date": "2026-10-31",
+           "stops": [{"address": "1 A St, Washington, DC 20001", "start": "13:00", "end": "14:00"},
+                     {"address": "5 E St, Washington, DC 20001", "start": "13:45", "end": "14:45"},
+                     {"address": "4 D St, Washington, DC 20001", "start": "15:30", "end": "16:30"}]}
+    out = run(tp.route(req, "KEY", g.get, g.post, g.get_bytes, NOW))
+    assert [s["start"] for s in out["stops"]] == ["13:00", "13:45", "15:30"]
+    assert out["warnings"] == [], "Marc's own overlapping bookings are not flagged"
+    assert out["start"] is None and out["end"] is None
+    assert [(s["arrive"], s["leave"]) for s in out["stops"]] == [("13:00", "13:45"), ("13:55", "14:40"), ("15:40", "16:25")]
+    late = dict(req, stops=[dict(req["stops"][0]), dict(req["stops"][1]), dict(req["stops"][2], start="15:00", end="16:00")])
+    out = run(tp.route(late, "KEY", g.get, g.post, g.get_bytes, NOW))
+    assert len(out["warnings"]) == 1 and "around 15:40, 40 minutes into its 15:00 booking" in out["warnings"][0]
