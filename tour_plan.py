@@ -14,6 +14,11 @@ An agent types the addresses of the homes a buyer will see. FORWARD OS then:
   route    plan mode: the drive-time matrix (Google Routes API) and the fastest order of
            the homes, tried exhaustively (8 homes = 40,320 orders), with suggested start
            times rounded UP to 5 minutes so a schedule is never tighter than the drive.
+           booking "standard" (FORWARD's, Marc Nov 1 2026): each showing booked 1 hour, 45
+           minutes inside, the next booking starting as the agent leaves the last home, so
+           the bookings overlap 15 minutes and the overlap is the drive. booking "custom":
+           the agent's own time at each home. A start and an end point (office, home, the
+           next appointment) count in the order, and the route and map run through them.
            confirmed mode: the agent's own times, kept in time order, with each drive
            and a warning wherever the gap is shorter than the drive plus a buffer, or two
            showings overlap. Both modes return two map images: the agent's with the route
@@ -412,14 +417,19 @@ def ceil5(mins: float) -> int:
     return int(math.ceil(mins / 5.0) * 5)
 
 
-def best_order(matrix: list[list[int]], n: int, origin: Optional[int] = None) -> list[int]:
+def best_order(matrix: list[list[int]], n: int, origin: Optional[int] = None,
+               dest: Optional[int] = None) -> list[int]:
     """The order of homes 0..n-1 with the least total driving, every order tried.
     matrix[i][j] = seconds from point i to point j; with an origin (the agent's starting
-    point, index n) the drive from it to the first home counts. Ties go to the order that
-    sorts first, so the answer never changes between runs."""
+    point) the drive from it to the first home counts, and with a dest (where the agent goes
+    after the tour: a next appointment, home, the office) the drive from the last home to it
+    counts (Marc, Nov 1 2026). Ties go to the order that sorts first, so the answer never
+    changes between runs."""
     best, best_cost = None, None
     for perm in itertools.permutations(range(n)):
         cost = matrix[origin][perm[0]] if origin is not None else 0
+        if dest is not None:
+            cost += matrix[perm[-1]][dest]
         for a, b in zip(perm, perm[1:]):
             cost += matrix[a][b]
         if best_cost is None or cost < best_cost:
@@ -428,6 +438,68 @@ def best_order(matrix: list[list[int]], n: int, origin: Optional[int] = None) ->
 
 
 ALLOWED_MINUTES = (15, 30, 45, 60)   # the agent's dropdown, per home (Marc, Oct 30 2026)
+
+# FORWARD's standard booking (Marc, Nov 1 2026): every showing is booked for 1 hour and the
+# agent spends 45 minutes inside; the 15 minutes left over cover the drive. So the next booking
+# starts when the agent leaves the last home (15 minutes before its booking ends when the agent
+# arrived on time), and the agent arrives within its first 15 minutes. A drive longer than 15
+# minutes starts the next booking later by the extra minutes, rounded up to 5. Marc's example:
+# "1:00 to 2:00, 1:45 to 2:45 ... That gives me 45 minutes at each house and 15 minutes of
+# buffer/travel time." The schedule follows the agent: arriving 10 minutes into a booking means
+# leaving 10 minutes later, so the next booking moves with it and every home keeps its 45.
+BOOK_MIN, INSIDE_MIN, OVERLAP_MIN = 60, 45, 15
+
+
+def standard_schedule(n: int, legs_sec: list[int], start: int) -> list[dict]:
+    """Booking windows for n homes in tour order under the standard. legs_sec[k] is the drive
+    from home k to home k+1. Each row also says when the agent arrives and leaves."""
+    out = []
+    for k in range(n):
+        if k == 0:
+            t = arrive = start
+        else:
+            drive = int(math.ceil(legs_sec[k - 1] / 60.0))
+            leave = out[-1]["leave_min"]
+            t = ceil5(leave + max(0, drive - OVERLAP_MIN))
+            arrive = max(t, leave + drive)
+        out.append({"home": k, "start_min": t, "end_min": t + BOOK_MIN, "start": hhmm(t), "end": hhmm(t + BOOK_MIN),
+                    "arrive_min": arrive, "leave_min": arrive + INSIDE_MIN})
+    return out
+
+
+def standard_walk(stops: list[dict], legs_sec: list[int]) -> list[tuple]:
+    """(arrive, leave) at each home under the standard: the agent reaches the first booking at
+    its start, stays 45 minutes (or to the booking's end, if shorter), then drives; at the next
+    home the agent arrives at the booking's start or when the drive gets them there, whichever
+    is later."""
+    out, arrive = [], stops[0]["start_min"] if stops else 0
+    for k, a in enumerate(stops):
+        if k > 0:
+            arrive = max(a["start_min"], out[-1][1] + int(math.ceil(legs_sec[k - 1] / 60.0)))
+        out.append((arrive, min(a["end_min"], arrive + INSIDE_MIN)))
+    return out
+
+
+def check_standard(stops: list[dict], legs_sec: list[int]) -> list[dict]:
+    """Confirmed times under the standard. The agent arrives at the first booking's start, is
+    inside 45 minutes (or to the booking's end, if shorter), then drives. A warning when that
+    puts the agent more than 15 minutes into the next booking, or when the next booking
+    starts before the agent would leave."""
+    rows, walk = [], standard_walk(stops, legs_sec)
+    for k in range(len(stops) - 1):
+        a, b = stops[k], stops[k + 1]
+        drive = int(math.ceil(legs_sec[k] / 60.0))
+        arrive_a, leave = walk[k]
+        arrive = leave + drive
+        late = arrive - b["start_min"]
+        warn = ""
+        if late > OVERLAP_MIN:
+            warn = ("Leaving stop {0} at {1} after {2} minutes inside, the drive is about {3} min, so you reach "
+                    "stop {4} around {5}, {6} minutes into its {7} booking (the standard allows 15)").format(
+                        k + 1, hhmm(leave), leave - arrive_a, drive, k + 2, hhmm(arrive), late, b["start"])
+        rows.append({"from": k + 1, "to": k + 2, "drive_min": drive, "gap_min": b["start_min"] - a["end_min"],
+                     "warning": warn})
+    return rows
 
 
 def plan_schedule(order: list[int], legs_sec: list[int], start: int, minutes: list[int], buffer_min: int) -> list[dict]:
@@ -532,14 +604,17 @@ def read_route(payload: dict, n_legs: int) -> tuple[list[int], str]:
     return [seconds(l.get("duration")) for l in legs], ((r.get("polyline") or {}).get("encodedPolyline") or "")
 
 
-def static_map_url(homes: list[dict], key: str, polyline: str = "", start: Optional[dict] = None) -> str:
+def static_map_url(homes: list[dict], key: str, polyline: str = "", start: Optional[dict] = None,
+                   end: Optional[dict] = None) -> str:
     """The map image address. Homes are numbered 1..n in tour order (navy pins); the
-    agent's copy adds the route line (gold) and the starting point (S)."""
+    agent's copy adds the route line (gold), the starting point (S) and the end point (E)."""
     parts = ["size=640x400", "scale=2", "format=png", "maptype=roadmap"]
     for i, h in enumerate(homes, start=1):
         parts.append("markers=" + quote("color:{0}|label:{1}|{2:.6f},{3:.6f}".format(NAVY, i, h["lat"], h["lng"]), safe=":,"))
     if start:
         parts.append("markers=" + quote("color:{0}|label:S|{1:.6f},{2:.6f}".format(GOLD, start["lat"], start["lng"]), safe=":,"))
+    if end:
+        parts.append("markers=" + quote("color:{0}|label:E|{1:.6f},{2:.6f}".format(GOLD, end["lat"], end["lng"]), safe=":,"))
     if polyline:
         parts.append("path=" + quote("color:{0}ff|weight:4|enc:{1}".format(GOLD, polyline), safe=":,"))
     parts.append("key=" + quote(key, safe=""))
@@ -557,6 +632,9 @@ async def route(req: dict, key: str, get: GetJson, post: PostJson, get_bytes: Ge
     stops = [s for s in (req.get("stops") or []) if isinstance(s, dict) and str(s.get("address") or "").strip()]
     if not stops or len(stops) > MAX_HOMES:
         raise TourError("A tour needs 1 to {0} homes".format(MAX_HOMES))
+    booking = req.get("booking") or "custom"
+    if booking not in ("standard", "custom"):
+        raise TourError("booking must be standard or custom")
     buffer_min = int(req.get("buffer_minutes", 5) or 0)
     if buffer_min < 0 or buffer_min > 60:
         raise TourError("The buffer must be 0 to 60 minutes")
@@ -569,6 +647,10 @@ async def route(req: dict, key: str, get: GetJson, post: PostJson, get_bytes: Ge
             s["start"], s["end"] = hhmm(s["start_min"]), hhmm(s["end_min"])
         order_in = sorted(range(len(stops)), key=lambda i: (stops[i]["start_min"], i))
         stops = [stops[i] for i in order_in]
+    elif booking == "standard":
+        start = parse_hhmm(req.get("start_time"))
+        for s in stops:
+            s["minutes"] = BOOK_MIN
     else:
         start = parse_hhmm(req.get("start_time"))
         for s in stops:
@@ -590,13 +672,14 @@ async def route(req: dict, key: str, get: GetJson, post: PostJson, get_bytes: Ge
 
     pts = [await geo(s["address"].strip()) for s in stops]
     start_pt = await geo(req["start_address"].strip()) if str(req.get("start_address") or "").strip() else None
+    end_pt = await geo(req["end_address"].strip()) if str(req.get("end_address") or "").strip() else None
 
     if mode == "plan":
         n = len(pts)
         if n == 1:
             order = [0]
         else:
-            allpts = pts + ([start_pt] if start_pt else [])
+            allpts = pts + ([start_pt] if start_pt else []) + ([end_pt] if end_pt else [])
             dep = departure_rfc3339(req.get("date"), start, now)
             try:
                 mpay = await post(MATRIX_URL, matrix_body(allpts, dep),
@@ -605,31 +688,50 @@ async def route(req: dict, key: str, get: GetJson, post: PostJson, get_bytes: Ge
                 raise
             except Exception as e:
                 raise TourError("The drive times did NOT load: {0}".format(e))
-            order = best_order(read_matrix(mpay, len(allpts)), n, n if start_pt else None)
+            order = best_order(read_matrix(mpay, len(allpts)), n, n if start_pt else None,
+                               (n + (1 if start_pt else 0)) if end_pt else None)
         stops = [stops[i] for i in order]
         pts = [pts[i] for i in order]
         first_dep_min = start
     else:
         first_dep_min = stops[0]["end_min"]
+    if start_pt:
+        # The day starts with the drive to the first home; traffic is read for about half an
+        # hour before the first showing (the drive itself is not known until the route is).
+        first_dep_min = max(0, stops[0]["start_min"] - 30) if mode == "confirmed" else max(0, start - 30)
 
+    # The drive is worked out from the start point, through every home, to the end point,
+    # so the agent's map shows the whole day and the first and last drives are known.
     legs = []
     poly = ""
-    if len(pts) > 1:
+    start_drive = end_drive = None
+    path = ([start_pt] if start_pt else []) + pts + ([end_pt] if end_pt else [])
+    if len(path) > 1:
         dep = departure_rfc3339(req.get("date"), first_dep_min, now)
         try:
-            rpay = await post(ROUTES_URL, routes_body(pts, dep),
+            rpay = await post(ROUTES_URL, routes_body(path, dep),
                               {"X-Goog-FieldMask": "routes.legs.duration,routes.polyline.encodedPolyline"})
         except TourError:
             raise
         except Exception as e:
             raise TourError("The route did NOT load: {0}".format(e))
-        legs, poly = read_route(rpay, len(pts) - 1)
+        all_legs, poly = read_route(rpay, len(path) - 1)
+        if start_pt:
+            start_drive = int(math.ceil(all_legs[0] / 60.0))
+            all_legs = all_legs[1:]
+        if end_pt:
+            end_drive = int(math.ceil(all_legs[-1] / 60.0))
+            all_legs = all_legs[:-1]
+        legs = all_legs
 
     if mode == "plan":
-        sched = plan_schedule(list(range(len(pts))), legs, start, [s["minutes"] for s in stops], buffer_min)
+        if booking == "standard":
+            sched = standard_schedule(len(pts), legs, start)
+        else:
+            sched = plan_schedule(list(range(len(pts))), legs, start, [s["minutes"] for s in stops], buffer_min)
         for s, t in zip(stops, sched):
             s.update({k: t[k] for k in ("start", "end", "start_min", "end_min")})
-    rows = check_times(stops, legs, buffer_min)
+    rows = check_standard(stops, legs) if booking == "standard" else check_times(stops, legs, buffer_min)
 
     out_stops = [{"stop": i + 1, "address": s["address"].strip(), "start": s["start"], "end": s["end"],
                   "minutes": s["end_min"] - s["start_min"],
@@ -645,9 +747,22 @@ async def route(req: dict, key: str, get: GetJson, post: PostJson, get_bytes: Ge
             raise TourError("The map image did NOT load (Google did not send an image)")
         return "data:image/png;base64," + base64.b64encode(b).decode("ascii")
 
-    return {"mode": mode, "date": req.get("date"), "buffer_minutes": buffer_min,
+    first_start = stops[0]["start_min"]
+    walk = standard_walk(stops, legs) if booking == "standard" else None
+    last_leave = walk[-1][1] if walk else stops[-1]["end_min"]
+    if walk:
+        # the agent's copy says when to be there and when to leave each home
+        for o, (arr, lv) in zip(out_stops, walk):
+            o["arrive"], o["leave"] = hhmm(arr), hhmm(lv)
+    return {"mode": mode, "booking": booking, "date": req.get("date"), "buffer_minutes": buffer_min,
             "stops": out_stops, "legs": rows,
+            "start": ({"address": req["start_address"].strip(), "google_address": start_pt["formatted"],
+                       "drive_min": start_drive, "leave_by": hhmm(max(0, first_start - start_drive))}
+                      if start_pt else None),
+            "end": ({"address": req["end_address"].strip(), "google_address": end_pt["formatted"],
+                     "drive_min": end_drive, "arrive_about": hhmm(last_leave + end_drive)}
+                    if end_pt else None),
             "warnings": [r["warning"] for r in rows if r["warning"]],
             "traffic": departure_rfc3339(req.get("date"), first_dep_min, now) is not None,
-            "maps": {"agent": await img(static_map_url(pts, key, poly, start_pt)),
+            "maps": {"agent": await img(static_map_url(pts, key, poly, start_pt, end_pt)),
                      "client": await img(static_map_url(pts, key))}}
