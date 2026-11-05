@@ -252,6 +252,11 @@ ANCHORS = {
     "dockType":          [r"docktype:"],
     "dockSlip":          [r"dockslipconveyance:"],
     "riparianRights":    [r"riparianrights:"],
+    # Comp-only anchors (Nov 4 2026, second pass). A Bright lot prints as
+    # "0.25a / 10881sf"; garage spaces as "Attached Garage - # of Spaces 1"
+    # (no colon in pypdf's text), and no garage as "Garage: No".
+    "compLot":           [r"lotacres/sqft:(?:[\d.]+a/)?"],
+    "compGarage":        [r"garage-#ofspaces:?"],
 }
 
 
@@ -491,12 +496,25 @@ async def ask_claude(api_key: str, content: str, max_tokens: int, temperature=No
 MAX_FILES = 12
 MAX_LISTINGS_PER_FILE = 30
 
-# Comp fields added Nov 4 2026. Unlike the older comp fields (left exactly as
-# they were), these are checked against the comp's OWN part of the PDF: the
-# text from its "MLS #:" line to the next property's. A comp packet prints
+# Every comp field the strategy reads beyond price, dates, credit and above-
+# grade square footage (those are unchanged) is checked against the comp's OWN
+# part of the PDF: the text from its "MLS #:" line to the next property's. A comp packet prints
 # Waterfront: Yes on one property and No on the next, so matching anywhere
 # in the file would prove nothing. A value that cannot be matched is blanked.
 COMP_EXTRAS = {  # comp key -> (ANCHORS key, numeric)
+    # Fields the comp reader returned before Nov 4 2026 and the page never
+    # used. Since forward-os #265 sends them to the strategy they are checked
+    # too: on Marc's 2 Old Sound Rd sheet Claude returned the 576 sf printed
+    # as "Below Grade Unfin SQFT" as finished space.
+    "beds": ("beds", True),
+    "fullBaths": ("fullBaths", True),
+    "halfBaths": ("halfBaths", True),
+    "below": ("belowGradeFin", True),
+    "assessorGla": ("assessorGla", True),
+    "yearBuilt": ("yearBuilt", True),
+    "lotSize": ("compLot", True),
+    "garageSpaces": ("compGarage", True),
+    # Added Nov 4 2026 (first pass).
     "waterfront": ("waterfront", False),
     "waterFrontage": ("waterFrontage", True),
     "views": ("views", False),
@@ -510,7 +528,7 @@ _MLS_LABEL = re.compile(r"MLS\s*#\s*:\s*", re.IGNORECASE)
 
 def comp_block(text: str, mls: str) -> str:
     """The comp's own text: its MLS # line up to the next property's."""
-    m = re.search(r"MLS\s*#\s*:\s*" + re.escape(str(mls or "").strip()) + r"(?![A-Za-z0-9])",
+    m = re.search(r"MLS\s*#\s*:\s*" + re.escape(str(mls or "").strip()) + r"(?!\d)",
                   str(text or ""), re.IGNORECASE)
     if not str(mls or "").strip() or not m:
         return ""
@@ -524,13 +542,17 @@ def verify_comp_extras(item: dict, text: str) -> list:
     block = comp_block(text, item.get("mlsNumber"))
     blanked = []
     for key, (anchor, numeric) in COMP_EXTRAS.items():
-        raw = str(item.get(key, "") or "").strip()
+        v = item.get(key)
+        raw = "" if v is None else str(v).strip()   # keep a real 0
         if not raw:
             item[key] = ""
             continue
         val = _digits(raw) if numeric else raw
-        if block and val and field_on_sheet(anchor, val, block, numeric=numeric) \
-                and not is_sensitive(raw):
+        if key == "garageSpaces" and val == "0":
+            ok = bool(block) and "garage:no" in _flat(block)
+        else:
+            ok = bool(block and val) and field_on_sheet(anchor, val, block, numeric=numeric)
+        if ok and not is_sensitive(raw):
             item[key] = val
         else:
             item[key] = ""

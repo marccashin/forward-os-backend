@@ -168,7 +168,8 @@ def test_comp_extras_kept_from_the_comps_own_block():
         it = dict(src)
         assert o.verify_comp_extras(it, COMPS) == []
         for k in o.COMP_EXTRAS:
-            assert it[k] == src[k], k
+            if k in src:
+                assert it[k] == src[k], k
 
 
 def test_comp_extras_from_another_property_are_blanked():
@@ -186,10 +187,11 @@ def test_comp_tax_total_is_not_total_finished():
 
 
 def test_comp_without_a_findable_mls_number_gets_no_extras():
+    given = {k for k in o.COMP_EXTRAS if WET.get(k)}
     it = dict(WET, mlsNumber="")
-    assert set(o.verify_comp_extras(it, COMPS)) == set(o.COMP_EXTRAS)
+    assert set(o.verify_comp_extras(it, COMPS)) == given
     it = dict(WET, mlsNumber="MDTEST000001")   # a prefix of a real number
-    assert set(o.verify_comp_extras(it, COMPS)) == set(o.COMP_EXTRAS)
+    assert set(o.verify_comp_extras(it, COMPS)) == given
 
 
 def test_prompts_ask_for_the_new_fields():
@@ -197,3 +199,58 @@ def test_prompts_ask_for_the_new_fields():
         assert '"' + k + '"' in o.SUBJECT_PARSE_PROMPT, k
     for k in o.COMP_EXTRAS:
         assert '"' + k + '"' in o.OSG_COMP_PARSE_PROMPT, k
+
+
+# Live run, Nov 4 2026 (second pass). Production's pypdf prints the MLS
+# number straight into the next label ("MLS #:MDHR2054110Tax ID #:"), which
+# the first version refused, blanking every added comp field on Marc's real
+# sheet. And Claude returned 2 Old Sound Rd's "Below Grade Unfin SQFT: 576" as
+# finished space. Layout below copies production's text, made-up values.
+JOINED = (
+    "1 Test Water Dr, Joppa, MD 21085 Closed | 05/26/26 Residential $780,000\n"
+    "MLS #:MDTEST0000010Tax ID #:1301000001Beds:3Baths:2 / 1Year Built:1968Garage:Yes"
+    "Waterfront:YesViews:Trees/Woods, WaterWater Frontage in FT:62"
+    "Dock Slip Conveyance:DeededLot Acres / SQFT:0.37a / 16097sf / Estimated"
+    "Assessor AbvGrd Fin SQFT:2,114Total Fin SQFT:2,534 / AssessorTax Total Fin SQFT:2,114"
+    "ParkingAttached Garage - # of Spaces 2Total Parking Spaces 6Basement:No\n"
+    "2 Test Dry Rd, Joppa, MD 21085 Closed | 12/04/25 Residential $415,000\n"
+    "MLS #:MDTEST0000020Tax ID #:1301000002Beds:3Baths:2 / 1Year Built:1976Garage:No"
+    "Waterfront:NoAbove Grade Fin SQFT:1,824 / AssessorTotal Below Grade SQFT:576 / Assessor"
+    "Total Fin SQFT:1,824 / AssessorBasement Type:Connecting Stairway, Daylight, Full,"
+    "Fully Finished, Walkout LevelBelow Grade Unfin SQFT:576 / AssessorLot Acres / SQFT:0.25a / 10881sf / Assessor\n"
+)
+
+
+def test_mls_number_joined_to_the_next_label_is_found():
+    it = dict(mlsNumber="MDTEST0000010", waterfront="Yes", waterFrontage="62", dockSlip="Deeded",
+              totalFin="2534", basement="No", beds="3", fullBaths="2", halfBaths="1",
+              yearBuilt="1968", assessorGla="2114", lotSize="16097", garageSpaces=2)
+    assert o.verify_comp_extras(it, JOINED) == []
+    assert it["waterfront"] == "Yes" and it["garageSpaces"] == "2" and it["lotSize"] == "16097"
+
+
+def test_a_shorter_mls_number_still_finds_nothing():
+    it = dict(mlsNumber="MDTEST000001", waterfront="Yes")   # prefix of MDTEST0000010
+    assert o.verify_comp_extras(it, JOINED) == ["waterfront"]
+
+
+def test_unfinished_below_grade_is_never_taken_as_finished():
+    it = dict(mlsNumber="MDTEST0000020", below="576", waterfront="No")
+    assert o.verify_comp_extras(it, JOINED) == ["below"]
+    assert it["below"] == "" and it["waterfront"] == "No"
+
+
+def test_garage_zero_kept_only_when_the_sheet_says_no_garage():
+    it = dict(mlsNumber="MDTEST0000020", garageSpaces=0)
+    assert o.verify_comp_extras(it, JOINED) == [] and it["garageSpaces"] == "0"
+    it = dict(mlsNumber="MDTEST0000010", garageSpaces=0)   # that one has a garage
+    assert o.verify_comp_extras(it, JOINED) == ["garageSpaces"]
+    it = dict(mlsNumber="MDTEST0000010", garageSpaces=6)   # total parking, not garage
+    assert o.verify_comp_extras(it, JOINED) == ["garageSpaces"]
+
+
+def test_beds_baths_year_and_lot_from_another_comp_are_blanked():
+    it = dict(mlsNumber="MDTEST0000020", beds="4", fullBaths="1", halfBaths="0",
+              yearBuilt="1968", lotSize="16097", assessorGla="2114")
+    assert set(o.verify_comp_extras(it, JOINED)) == {"beds", "fullBaths", "halfBaths",
+                                                      "yearBuilt", "lotSize", "assessorGla"}
