@@ -29,8 +29,12 @@ An agent types the addresses of the homes a buyer will see. FORWARD OS then:
            marked for the agent to fix, never silently printed.
 
 Every address is geocoded first and must land on a street address (ROOFTOP or
-RANGE_INTERPOLATED, not a partial match). A route through a guessed point is worse than
-no route, so an address Google can only place approximately is refused with the reason.
+RANGE_INTERPOLATED, not a partial match), or be the typed street address itself (same
+house number, street and ZIP or state) when Google places the building by its centre or
+flags a partial match (Nov 13, 2026: "1111 23rd St NW, Washington, DC 20037" was refused
+even pasted exactly as Google wrote it). A route through a guessed point is worse than no
+route, so anything else is refused with the reason, and with the street address Google
+matched as a suggestion the app offers to the agent with one press.
 
 The Google key lives on the server (GOOGLE_MAPS_SERVER_KEY), never in the browser; the
 map images come back as image bytes.
@@ -376,21 +380,85 @@ async def compare(homes: list[dict], model: str, post: PostClaude) -> dict:
 
 # ── geocoding, times and routes ─────────────────────────────────────────────────
 
+class AddressNotPlaced(TourError):
+    """Google could not place an address at a street address. `suggestion` is the street
+    address Google matched (with no ", USA"), or '' when it matched only an area. `which`
+    is set by route(): {"kind": "home", "index": i}, {"kind": "start"} or {"kind": "end"},
+    so the app can put the suggestion in the right box with one press."""
+
+    def __init__(self, msg: str, address: str, suggestion: str = ""):
+        super().__init__(msg)
+        self.address = address
+        self.suggestion = suggestion
+        self.which: Optional[dict] = None
+
+
+_ADDR_WORDS = {
+    "street": "st", "str": "st", "avenue": "ave", "av": "ave", "road": "rd", "drive": "dr",
+    "place": "pl", "court": "ct", "lane": "ln", "boulevard": "blvd", "terrace": "ter",
+    "circle": "cir", "parkway": "pkwy", "highway": "hwy", "square": "sq", "trail": "trl",
+    "northwest": "nw", "northeast": "ne", "southwest": "sw", "southeast": "se",
+    "north": "n", "south": "s", "east": "e", "west": "w",
+}
+
+
+def _addr_tokens(s: str) -> list:
+    words = re.sub(r"[^a-z0-9]+", " ", (s or "").lower().replace(".", "")).split()   # N.W. = NW
+    return [_ADDR_WORDS.get(w, w) for w in words]
+
+
+def _component(r: dict, kind: str) -> str:
+    for c in r.get("address_components") or []:
+        if kind in (c.get("types") or []):
+            return str(c.get("short_name") or c.get("long_name") or "")
+    return ""
+
+
+def _same_street_address(typed: str, r: dict) -> bool:
+    """True when Google's answer is the street address that was typed: the same house
+    number, the same street (suffix and NW / Northwest spelled either way), and the same
+    ZIP when one was typed, else the same state. A building Google places by its centre
+    (GEOMETRIC_CENTER) or flags as a partial match is still the right point for a drive."""
+    num, route = _component(r, "street_number"), _component(r, "route")
+    if not num or not route:
+        return False
+    m = re.match(r"\s*(\d+[a-z]?)\b(.*)$", typed or "", re.I | re.S)
+    if not m or m.group(1).lower() != num.lower():
+        return False
+    rest, rt = _addr_tokens(m.group(2)), _addr_tokens(route)
+    if not rt or rest[:len(rt)] != rt:
+        return False
+    zips = re.findall(r"\b(\d{5})(?:-\d{4})?\b", m.group(2))
+    gzip = _component(r, "postal_code")
+    if zips:
+        return bool(gzip) and zips[-1] == gzip
+    state = _component(r, "administrative_area_level_1").lower()
+    return bool(state) and state in rest[len(rt):]
+
+
 def geocode_result(payload: dict, address: str) -> dict:
-    """{lat, lng, formatted} for a street-level match, else TourError saying why."""
+    """{lat, lng, formatted} for a street-level match, else TourError saying why. When
+    Google matched a street address other than the one typed, the error carries it as a
+    suggestion (AddressNotPlaced.suggestion), and that suggestion typed back in passes."""
     st = (payload or {}).get("status")
     if st == "ZERO_RESULTS":
-        raise TourError("Google could not find {0}. Check the spelling, city and ZIP".format(address))
+        raise AddressNotPlaced("Google could not find {0}. Check the spelling, city and ZIP".format(address), address)
     if st != "OK":
         msg = (payload or {}).get("error_message") or st or "no answer"
         raise TourError("The address check did NOT run ({0})".format(msg))
     r = (payload.get("results") or [{}])[0]
     lt = ((r.get("geometry") or {}).get("location_type")) or ""
-    if r.get("partial_match") or lt not in ("ROOFTOP", "RANGE_INTERPOLATED"):
-        raise TourError("Google could only place {0} approximately (it matched {1}). Check the spelling, "
-                        "city and ZIP".format(address, r.get("formatted_address") or "an area, not a street address"))
+    formatted = r.get("formatted_address") or ""
+    exact = not r.get("partial_match") and lt in ("ROOFTOP", "RANGE_INTERPOLATED")
+    same = lt in ("ROOFTOP", "RANGE_INTERPOLATED", "GEOMETRIC_CENTER") and _same_street_address(address, r)
+    if not exact and not same:
+        street_level = bool(_component(r, "street_number") and _component(r, "route"))
+        suggestion = re.sub(r",\s*USA$", "", formatted.strip()) if street_level else ""
+        raise AddressNotPlaced("Google could only place {0} approximately (it matched {1}). Check the spelling, "
+                               "city and ZIP".format(address, formatted or "an area, not a street address"),
+                               address, suggestion)
     loc = (r.get("geometry") or {}).get("location") or {}
-    return {"lat": float(loc["lat"]), "lng": float(loc["lng"]), "formatted": r.get("formatted_address", "")}
+    return {"lat": float(loc["lat"]), "lng": float(loc["lng"]), "formatted": formatted}
 
 
 def seconds(d) -> int:
@@ -661,18 +729,22 @@ async def route(req: dict, key: str, get: GetJson, post: PostJson, get_bytes: Ge
             if s["minutes"] not in ALLOWED_MINUTES:
                 raise TourError("{0}: pick the time at this home (15, 30, 45 min or 1 hour)".format(s["address"].strip()))
 
-    async def geo(addr):
+    async def geo(addr, which):
         try:
             payload = await get(GEOCODE_URL, {"address": addr, "key": key})
         except TourError:
             raise
         except Exception as e:
             raise TourError("The address check did NOT run: {0}".format(e))
-        return geocode_result(payload, addr)
+        try:
+            return geocode_result(payload, addr)
+        except AddressNotPlaced as e:
+            e.which = which
+            raise
 
-    pts = [await geo(s["address"].strip()) for s in stops]
-    start_pt = await geo(req["start_address"].strip()) if str(req.get("start_address") or "").strip() else None
-    end_pt = await geo(req["end_address"].strip()) if str(req.get("end_address") or "").strip() else None
+    pts = [await geo(s["address"].strip(), {"kind": "home", "index": i}) for i, s in enumerate(stops)]
+    start_pt = await geo(req["start_address"].strip(), {"kind": "start"}) if str(req.get("start_address") or "").strip() else None
+    end_pt = await geo(req["end_address"].strip(), {"kind": "end"}) if str(req.get("end_address") or "").strip() else None
 
     if mode == "plan":
         n = len(pts)

@@ -5436,6 +5436,11 @@ async def tour_route(payload: dict, request: Request):
         raise HTTPException(status_code=503, detail="The backend has no Google Maps key (GOOGLE_MAPS_SERVER_KEY), so the route cannot be worked out.")
     try:
         return await _tour.route(payload, GOOGLE_MAPS_SERVER_KEY, _tour_get, _tour_post, _tour_get_bytes)
+    except _tour.AddressNotPlaced as e:
+        # detail stays the plain message every app version reads; the suggestion and which
+        # box it belongs to are extra keys for the app's one-press fix.
+        logger.warning("[tour] route: %s", e)
+        return JSONResponse(status_code=422, content={"detail": str(e), "suggestion": e.suggestion, "which": e.which})
     except _tour.TourError as e:
         logger.warning("[tour] route: %s", e)
         raise HTTPException(status_code=422, detail=str(e))

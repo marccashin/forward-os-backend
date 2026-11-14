@@ -298,6 +298,82 @@ def test_geocode_result():
             assert word in str(e)
 
 
+def _geo(formatted, lt="ROOFTOP", partial=False, comps=None, lat=38.9, lng=-77.05):
+    r = {"formatted_address": formatted, "geometry": {"location": {"lat": lat, "lng": lng}, "location_type": lt}}
+    if partial:
+        r["partial_match"] = True
+    if comps is not None:
+        r["address_components"] = [{"short_name": v, "long_name": v, "types": [k]} for k, v in comps.items()]
+    return {"status": "OK", "results": [r]}
+
+
+RITZ = {"street_number": "1111", "route": "23rd St NW", "locality": "Washington",
+        "administrative_area_level_1": "DC", "postal_code": "20037"}
+
+
+def test_geocode_building_and_suggestion():
+    """Nov 13, 2026 (Marc): "1111 23rd St NW, Washington, DC 20037" was refused as
+    approximate even pasted exactly as Google wrote it. A building Google places by its
+    centre, or flags as a partial match, is accepted when it is the typed street address;
+    anything else is refused with Google's street address as a suggestion, and that
+    suggestion typed back in passes."""
+    typed = "1111 23rd St NW, Washington, DC 20037"
+    for lt, partial in (("GEOMETRIC_CENTER", False), ("GEOMETRIC_CENTER", True), ("ROOFTOP", True),
+                        ("RANGE_INTERPOLATED", True)):
+        out = tp.geocode_result(_geo(typed + ", USA", lt, partial, RITZ), typed)
+        assert out["lat"] == 38.9 and out["formatted"] == typed + ", USA", (lt, partial)
+    # spelled differently but the same address
+    for t in ("1111 23rd st nw Washington, DC 20037", "1111 23rd Street Northwest, Washington DC 20037",
+              "1111 23rd St. N.W., Washington, DC", "1111 23rd St NW Unit PH1C, Washington, DC 20037"):
+        assert tp.geocode_result(_geo(typed + ", USA", "GEOMETRIC_CENTER", True, RITZ), t)["lat"] == 38.9, t
+    # not the same address: refused, with Google's street address offered
+    for t in ("1113 23rd St NW, Washington, DC 20037", "1111 22nd St NW, Washington, DC 20037",
+              "1111 23rd St NE, Washington, DC 20037", "1111 23rd St NW, Washington, DC 20036",
+              "1111 23rd St NW, Arlington, VA", "1111 23rd St NW"):
+        try:
+            tp.geocode_result(_geo(typed + ", USA", "GEOMETRIC_CENTER", True, RITZ), t)
+            raise AssertionError(t)
+        except tp.AddressNotPlaced as e:
+            assert "approximately" in str(e) and e.suggestion == typed and e.address == t, t
+    # the suggestion typed back in passes
+    assert tp.geocode_result(_geo(typed + ", USA", "GEOMETRIC_CENTER", True, RITZ), typed)["lat"] == 38.9
+    # an area is never accepted and never offered
+    for lt in ("APPROXIMATE", "GEOMETRIC_CENTER"):
+        try:
+            tp.geocode_result(_geo("Washington, DC 20037, USA", lt, True, {"locality": "Washington", "postal_code": "20037"}), typed)
+            raise AssertionError(lt)
+        except tp.AddressNotPlaced as e:
+            assert e.suggestion == "", lt
+    # APPROXIMATE stays refused even with a street number
+    try:
+        tp.geocode_result(_geo(typed + ", USA", "APPROXIMATE", False, RITZ), typed)
+        raise AssertionError
+    except tp.AddressNotPlaced as e:
+        assert e.suggestion == typed
+    # unchanged: an exact ROOFTOP answer with no components is accepted as before
+    assert tp.geocode_result(_geo("219 N Pitt St, Alexandria, VA 22314, USA"), "219 N Pitt St")["lat"] == 38.9
+    # could not find: no suggestion
+    try:
+        tp.geocode_result({"status": "ZERO_RESULTS", "results": []}, "9 Nowhere Rd")
+        raise AssertionError
+    except tp.AddressNotPlaced as e:
+        assert e.suggestion == ""
+
+
+def test_route_says_which_address():
+    g = Google()
+    base = {"mode": "plan", "date": "2026-10-31", "start_time": "10:00",
+            "stops": [{"address": "1 A St, Washington, DC 20001", "minutes": 30}, {"address": "9 Nowhere Rd", "minutes": 30}]}
+    for req, which in ((base, {"kind": "home", "index": 1}),
+                       (dict(base, stops=base["stops"][:1], start_address="9 Nowhere Rd"), {"kind": "start"}),
+                       (dict(base, stops=base["stops"][:1], end_address="9 Nowhere Rd"), {"kind": "end"})):
+        try:
+            run(tp.route(json.loads(json.dumps(req)), "K", g.get, g.post, g.get_bytes, NOW))
+            raise AssertionError(which)
+        except tp.AddressNotPlaced as e:
+            assert e.which == which, (e.which, which)
+
+
 def test_static_map_url():
     homes = [{"lat": 38.8, "lng": -77.04}, {"lat": 38.81, "lng": -77.05}]
     client = unquote(tp.static_map_url(homes, "KEY"))
@@ -462,6 +538,9 @@ def test_http_routes(monkeypatch):
     assert r.status_code == 200 and len(r.json()["stops"]) == 2 and "SERVERKEY" not in r.text
     r = c.post("/api/tour/route", json=dict(req, stops=[{"address": "9 Nowhere Rd", "minutes": 30}]), headers=ORIGIN)
     assert r.status_code == 422 and "could not find" in r.json()["detail"]
+    assert r.json()["which"] == {"kind": "home", "index": 0} and r.json()["suggestion"] == ""
+    r = c.post("/api/tour/route", json=dict(req, mode="x"), headers=ORIGIN)
+    assert r.status_code == 422 and set(r.json()) == {"detail"}, "other refusals keep the old shape"
     r = c.post("/api/tour/compare", json={"homes": HOMES[:1]}, headers=ORIGIN)
     assert r.status_code == 200 and r.json()["homes"][0]["issues"] == []
     assert calls == [True, False]
