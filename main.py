@@ -2728,9 +2728,22 @@ async def delete_file(payload: DeleteFileRequest):
 class UpdatePropertyRequest(BaseModel):
     fields: dict
 
+# Changing or deleting a listing or buyer card, and its partners, is for FORWARD OS
+# pages only (Marc, Oct 17, 2026). Until now anyone holding a card id could rename or
+# delete it, notes included. The same Origin check as listing presentations
+# (listing_presentations.origin_allowed): a browser always sends Origin and a page
+# cannot fake it; a script outside a browser can, so this is a lock on the front door
+# against casual use, not a login. Only FORWARD OS calls these routes (checked: the
+# Command Center and the Netlify functions never do).
+def _os_write_guard(request: Request) -> None:
+    if not _lp.origin_allowed(request.headers.get("origin")):
+        raise HTTPException(status_code=403, detail="Listing and buyer cards can be changed only from FORWARD OS.")
+
+
 @app.patch("/properties/{property_id}")
-async def update_property(property_id: str, payload: UpdatePropertyRequest):
+async def update_property(property_id: str, payload: UpdatePropertyRequest, request: Request):
     """Update specific fields on a property record."""
+    _os_write_guard(request)
     allowed = {"seller_name", "address", "status", "market", "agent_name", "archived"}
     safe_fields = {k: v for k, v in payload.fields.items() if k in allowed}
     if not safe_fields:
@@ -2742,8 +2755,9 @@ async def update_property(property_id: str, payload: UpdatePropertyRequest):
         raise HTTPException(status_code=500, detail=f"Update failed: {e}")
 
 @app.delete("/properties/{property_id}")
-async def delete_property(property_id: str, agent_name: str = None):
+async def delete_property(property_id: str, request: Request, agent_name: str = None):
     """Delete a property and all related records (notes, assets, offers)."""
+    _os_write_guard(request)
     try:
         row = supabase.table("properties").select("address,agent_name").eq("id", property_id).execute().data
         address_val = row[0]["address"] if row else None
@@ -2969,8 +2983,9 @@ class UpdateBuyerRequest(BaseModel):
     fields: dict
 
 @app.patch("/buyers/{buyer_id}")
-async def update_buyer(buyer_id: str, payload: UpdateBuyerRequest):
+async def update_buyer(buyer_id: str, payload: UpdateBuyerRequest, request: Request):
     """Update specific fields on a buyer record."""
+    _os_write_guard(request)
     allowed = {
         "buyer_name", "first_name", "last_name", "email", "phone", "status", "agent_name",
         "market_area", "target_areas", "areas_note",
@@ -3001,8 +3016,9 @@ async def update_buyer(buyer_id: str, payload: UpdateBuyerRequest):
         raise HTTPException(status_code=500, detail=f"Update failed: {e}")
 
 @app.delete("/buyers/{buyer_id}")
-async def delete_buyer(buyer_id: str, agent_name: str = None):
+async def delete_buyer(buyer_id: str, request: Request, agent_name: str = None):
     """Delete a buyer and all related records (assets)."""
+    _os_write_guard(request)
     try:
         row = supabase.table("buyers").select("buyer_name,agent_name").eq("id", buyer_id).execute().data
         buyer_name_val = row[0]["buyer_name"] if row else None
@@ -3100,6 +3116,62 @@ async def meeting_prep_research(payload: MeetingPrepResearchRequest):
         return {"found": False, "error": str(e), "sources": []}
 
 
+# ── Buyer avatar research (Oct 24, 2026) ──────────────────────────────────────
+# The listing's ZIP and county, researched for the five buyer avatars: Census figures,
+# job clusters and web research with sources. See avatar_research.py for what is and is
+# not gathered (fair housing) and why. The address is read from the database, never
+# taken from the caller. Opens only from FORWARD OS, like the listing presentation.
+import avatar_research as _avr
+
+CENSUS_API_KEY = os.environ.get("CENSUS_API_KEY", "")
+
+
+class AvatarResearchRequest(BaseModel):
+    property_id: str
+
+
+async def _avr_get(url: str, params: dict):
+    async with httpx.AsyncClient(timeout=25) as client:
+        r = await client.get(url, params=params)
+    if r.status_code >= 400:
+        txt = (r.text or "").strip().replace("\n", " ")[:160]
+        raise _avr.ResearchError("{0} answered {1}{2}".format(url.split("/")[2], r.status_code, (": " + txt) if txt else ""))
+    try:
+        return r.json()
+    except ValueError:
+        raise _avr.ResearchError("{0} did not answer with data (it may need a key)".format(url.split("/")[2]))
+
+
+async def _avr_post(body: dict) -> dict:
+    headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01",
+               "anthropic-beta": "web-search-2025-03-05", "content-type": "application/json"}
+    resp = await claude_post(headers, body, timeout=100, where="avatar-research")
+    return resp.json()
+
+
+@app.post("/api/avatar-research")
+async def avatar_research(payload: AvatarResearchRequest, request: Request):
+    _lp_guard(request)
+    pid = (payload.property_id or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", pid):
+        raise HTTPException(status_code=400, detail="property_id must be a listing id.")
+    rows = supabase.table("properties").select("id,address").eq("id", pid).limit(1).execute().data or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="No FORWARD OS listing with that id.")
+    address = (rows[0].get("address") or "").strip()
+    if not address:
+        raise HTTPException(status_code=422, detail="This listing has no address to research.")
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="The backend has no AI key, so the research cannot run.")
+    result = await _avr.research(address, CENSUS_API_KEY, BMR_MODEL, _avr_get, _avr_post)
+    result["prompt"] = _avr.prompt_block(result)
+    result["researched_at"] = datetime.now(timezone.utc).isoformat()
+    for part in ("census", "jobs", "web"):
+        if "error" in result.get(part, {}):
+            logger.warning("[avatar-research] %s %s: %s", pid, part, result[part]["error"])
+    return result
+
+
 # ── Deal Partners ─────────────────────────────────────────────────────────────
 
 def _get_co_agents(record):
@@ -3114,7 +3186,8 @@ class PartnerRequest(BaseModel):
     agent_name: str
 
 @app.post("/properties/{property_id}/add-partner")
-async def add_property_partner(property_id: str, payload: PartnerRequest):
+async def add_property_partner(property_id: str, payload: PartnerRequest, request: Request):
+    _os_write_guard(request)
     try:
         rows = supabase.table("properties").select("subfolder_drive_ids").eq("id", property_id).execute()
         if not rows.data:
@@ -3132,7 +3205,8 @@ async def add_property_partner(property_id: str, payload: PartnerRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/properties/{property_id}/remove-partner")
-async def remove_property_partner(property_id: str, payload: PartnerRequest):
+async def remove_property_partner(property_id: str, payload: PartnerRequest, request: Request):
+    _os_write_guard(request)
     try:
         rows = supabase.table("properties").select("subfolder_drive_ids").eq("id", property_id).execute()
         if not rows.data:
@@ -3148,7 +3222,8 @@ async def remove_property_partner(property_id: str, payload: PartnerRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/buyers/{buyer_id}/add-partner")
-async def add_buyer_partner(buyer_id: str, payload: PartnerRequest):
+async def add_buyer_partner(buyer_id: str, payload: PartnerRequest, request: Request):
+    _os_write_guard(request)
     try:
         rows = supabase.table("buyers").select("subfolder_drive_ids").eq("id", buyer_id).execute()
         if not rows.data:
@@ -3166,7 +3241,8 @@ async def add_buyer_partner(buyer_id: str, payload: PartnerRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/buyers/{buyer_id}/remove-partner")
-async def remove_buyer_partner(buyer_id: str, payload: PartnerRequest):
+async def remove_buyer_partner(buyer_id: str, payload: PartnerRequest, request: Request):
+    _os_write_guard(request)
     try:
         rows = supabase.table("buyers").select("subfolder_drive_ids").eq("id", buyer_id).execute()
         if not rows.data:
@@ -3966,11 +4042,15 @@ async def _run_cc_audit() -> dict:
 
     # -----------------------------------------------------------------------
     # 16. audit_log unresolved errors — last 24h
+    # Only rows marked severity "error" count. The Command Center's columns
+    # (severity, resolved_at) were added to the live table on Oct 17, 2026; without
+    # this filter every routine entry would read as an unresolved error.
     # -----------------------------------------------------------------------
     try:
         r = (supabase.table("audit_log")
              .select("id", count="exact")
              .gte("created_at", cutoff_24h)
+             .eq("severity", "error")
              .is_("resolved_at", "null")
              .execute())
         count = r.count if r.count is not None else len(r.data)
@@ -4809,3 +4889,569 @@ async def listing_presentations_refresh(request: Request, background_tasks: Back
     _LP_STATE["last_manual_at"] = now
     background_tasks.add_task(_lp_run, True, "manual")
     return {"status": "started"}
+
+
+# ---------------------------------------------------------------------------
+# Open To Close: read-only probe of the task data (Oct 15, 2026; see otc_probe.py)
+# ---------------------------------------------------------------------------
+import otc_probe as _otc
+
+
+async def _otc_http(method: str, url: str):
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.request(method, url)
+    return r.status_code, r.content
+
+
+_OTC_STATE: dict = {"running": False}
+
+
+@app.get("/api/otc/probe")
+async def otc_probe(request: Request, property_id: int = 0):
+    """READ ONLY. No property_id: the newest transactions in Open To Close.
+    With property_id: every task on that transaction exactly as Open To Close
+    sends it, plus the shape of its fields. Opens only from FORWARD OS pages."""
+    _lp_guard(request)
+    token = os.environ.get("OTC_API_TOKEN", "").strip()
+    if not token:
+        raise HTTPException(status_code=503, detail="OTC_API_TOKEN is not set on the backend.")
+    if _OTC_STATE["running"]:
+        raise HTTPException(status_code=429, detail="A probe is already running. Try again in a few seconds.")
+    _OTC_STATE["running"] = True
+    client = _otc.OtcClient(token, _otc_http)
+    try:
+        if property_id:
+            res = await _otc.probe_tasks(client, property_id)
+        else:
+            res = await _otc.list_recent(client)
+    except _otc.OtcError as e:
+        res = {"ok": False, "error": _otc.scrub(str(e), token)}
+    except Exception as e:
+        logger.error("[otc] probe crashed: %s", _otc.scrub(f"{type(e).__name__}: {e}", token))
+        res = {"ok": False, "error": _otc.scrub(f"{type(e).__name__}: {e}", token)}
+    finally:
+        _OTC_STATE["running"] = False
+    res["calls"] = [{"path": p, "status": s} for p, s in client.calls]
+    logger.info("[otc] probe property_id=%s calls=%s", property_id or "-", json.dumps(res["calls"]))
+    return res
+
+
+# ---------------------------------------------------------------------------
+# Open To Close poller (Oct 17, 2026; see otc_poller.py). Step 2 of the Deal Progress tracker.
+# Reads every open transaction's tasks every 15 minutes, 7am to 9:45pm ET, and records
+# when each box is first seen ticked (Open To Close itself keeps no date or name).
+# ---------------------------------------------------------------------------
+import otc_poller as _otcp
+
+
+class SupabaseOtcStore:
+    """otc_properties / otc_tasks through the service-role client."""
+
+    def properties(self) -> dict:
+        r = supabase.table("otc_properties").select("*").execute()
+        return {int(x["id"]): x for x in (r.data or [])}
+
+    def tasks(self, property_id: int) -> list:
+        r = supabase.table("otc_tasks").select("*").eq("property_id", property_id).execute()
+        return r.data or []
+
+    def upsert_tasks(self, rows: list) -> None:
+        if rows:
+            supabase.table("otc_tasks").upsert(rows, on_conflict="property_id,task_id").execute()
+
+    def upsert_properties(self, rows: list) -> None:
+        if rows:
+            supabase.table("otc_properties").upsert(rows, on_conflict="id").execute()
+
+
+_OTCP_STATE: dict = {"running": False, "last_run": None, "fail_streak": 0,
+                     "last_email_at": 0.0, "last_manual_at": 0.0}
+OTC_JOIN_MAX_SECONDS = 90   # a press during a running pass waits at most this long for it
+OTC_FAIL_EMAIL_AFTER = 3   # consecutive failed runs (45 minutes) before Marc is emailed
+
+
+def _otcp_email(run: dict) -> None:
+    """Tell Marc when the poller keeps failing. At most one a day."""
+    now = _time.time()
+    if now - _OTCP_STATE["last_email_at"] < 20 * 3600:
+        return
+    try:
+        import resend as resend_sdk
+        key = os.environ.get("RESEND_API_KEY", "")
+        if not key:
+            logger.error("[otc-poll] RESEND_API_KEY not set, cannot email the failure")
+            return
+        rows = "".join("<li>{}: {}</li>".format(_esc(str(e.get("property_id") or "all transactions")),
+                                                  _esc(e.get("error", ""))) for e in run.get("errors", []))
+        resend_sdk.api_key = key
+        resend_sdk.Emails.send({
+            "from": "Forward OS Audit <audit@marccashin.com>",
+            "to": ["marc@marccashin.com"],
+            "subject": "FORWARD OS: Open To Close tracking needs attention",
+            "html": "<p>The Open To Close reader has failed {} times in a row, so Transactions' "
+                    "ticks are not being recorded. The Deal Progress view shows the last ticks it saw.</p>"
+                    "<ul>{}</ul><p>Status: https://forward-command-center-production.up.railway.app/api/otc/poll/status</p>"
+                    .format(_OTCP_STATE["fail_streak"], rows),
+        })
+        _OTCP_STATE["last_email_at"] = now
+    except Exception as e:
+        logger.error("[otc-poll] failure email could not be sent: %s", e)
+
+
+async def _otcp_run(trigger: str) -> dict:
+    token = os.environ.get("OTC_API_TOKEN", "").strip()
+    if not token:
+        run = {"ok": False, "errors": [{"property_id": None, "error": "OTC_API_TOKEN is not set"}]}
+    elif _OTCP_STATE["running"]:
+        return {"ok": False, "skipped": "already running"}
+    else:
+        _OTCP_STATE["running"] = True
+        client = _otc.OtcClient(token, _otc_http)
+        try:
+            run = await _otcp.poll(client, SupabaseOtcStore())
+        except Exception as e:
+            run = {"ok": False, "errors": [{"property_id": None,
+                                             "error": _otc.scrub(f"{type(e).__name__}: {e}", token)}]}
+        finally:
+            _OTCP_STATE["running"] = False
+        run["calls"] = len(client.calls)
+        for e in run.get("errors", []):
+            e["error"] = _otc.scrub(e.get("error", ""), token)
+    run["trigger"] = trigger
+    _OTCP_STATE["last_run"] = run
+    if run.get("ok"):
+        _OTCP_STATE["fail_streak"] = 0
+    else:
+        _OTCP_STATE["fail_streak"] += 1
+        if _OTCP_STATE["fail_streak"] >= OTC_FAIL_EMAIL_AFTER:
+            _otcp_email(run)
+    logger.info("[otc-poll] %s ok=%s read=%s changes=%s errors=%s", trigger, run.get("ok"),
+                run.get("read"), json.dumps(run.get("changes", []))[:2000], json.dumps(run.get("errors", []))[:1000])
+    return run
+
+
+async def job_otc_poll():
+    await _otcp_run("scheduled")
+
+
+@app.on_event("startup")
+async def register_otc_poll_job():
+    scheduler.add_job(job_otc_poll, CronTrigger(minute="*/15", hour="7-21", timezone="America/New_York"),
+                      id="otc_poll", replace_existing=True)
+    logger.info("[otc-poll] Open To Close reader registered (every 15 minutes, 7am to 9:45pm ET)")
+
+
+import math
+OTC_MANUAL_GAP = 60   # seconds between "Check Open To Close now" presses, across ALL agents
+
+
+def _otcp_manual_wait(now: float) -> int:
+    """Whole seconds until the next manual check may start (0 = now). Server clock only, so
+    every agent's countdown agrees whatever their own device's clock says."""
+    left = OTC_MANUAL_GAP - (now - _OTCP_STATE["last_manual_at"])
+    return max(0, int(math.ceil(left))) if left > 0 else 0
+
+
+@app.get("/api/otc/poll/status")
+async def otc_poll_status():
+    """Last run summary. No task titles beyond the last run's changes; no token.
+    manual_wait_seconds: how long until the next "Check Open To Close now" (Oct 19, 2026)."""
+    last = _OTCP_STATE["last_manual_at"]
+    return {"running": _OTCP_STATE["running"], "fail_streak": _OTCP_STATE["fail_streak"],
+            "last_run": _OTCP_STATE["last_run"],
+            "manual_wait_seconds": _otcp_manual_wait(_time.time()),
+            "manual_gap_seconds": OTC_MANUAL_GAP,
+            "manual_last_at": datetime.fromtimestamp(last, timezone.utc).isoformat() if last else None}
+
+
+# ---------------------------------------------------------------------------
+# Where a FORWARD OS listing stands in Follow Up Boss (Oct 17, 2026)
+#
+# Deal Progress in FORWARD OS asks this for a listing the Command Center does not
+# have yet (before Listing Agreement Signed), so it can say "Seller Engaged since
+# Oct 1" instead of nothing. FORWARD OS pages only (_lp_guard). Returns the stage and
+# when the deal entered it, never the people or money on the deal. Rules for which
+# deal: fub_deal_stage.py.
+# ---------------------------------------------------------------------------
+import fub_deal_stage as _fds
+
+_FDS_CACHE: dict = {"at": 0.0, "deals": [], "pipeline_id": None}
+
+
+async def _fds_seller_deals() -> list[dict]:
+    """Every Sellers deal, kept 10 minutes (one listing page asks once; FUB pages 100)."""
+    now = _time.time()
+    if _FDS_CACHE["deals"] and now - _FDS_CACHE["at"] < 600:
+        return _FDS_CACHE["deals"]
+    if _FDS_CACHE["pipeline_id"] is None:
+        pipes = (await fub_get("/pipelines")).get("pipelines") or []
+        sellers = [p for p in pipes if str(p.get("name") or "").strip().lower() == "sellers"]
+        if len(sellers) != 1:
+            raise ValueError(f"expected one Sellers pipeline in Follow Up Boss, found {len(sellers)}")
+        _FDS_CACHE["pipeline_id"] = sellers[0]["id"]
+    deals: list[dict] = []
+    nxt = None
+    for _ in range(20):
+        params = {"pipelineId": _FDS_CACHE["pipeline_id"], "limit": 100}
+        if nxt:
+            params["next"] = nxt
+        page = await fub_get("/deals", params)
+        deals.extend(page.get("deals") or [])
+        nxt = (page.get("_metadata") or {}).get("next")
+        if not nxt:
+            break
+    _FDS_CACHE.update(at=now, deals=deals)
+    return deals
+
+
+@app.get("/api/fub/listing-stage")
+async def fub_listing_stage(request: Request, property_id: str = ""):
+    _lp_guard(request)
+    pid = (property_id or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", pid):
+        raise HTTPException(status_code=400, detail="property_id must be a listing id.")
+    rows = supabase.table("properties").select("id,address,subfolder_drive_ids").eq("id", pid).limit(1).execute().data or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="No FORWARD OS listing with that id.")
+    prop = rows[0]
+    try:
+        did = _fds.stamped_deal_id(prop)
+        if did:
+            try:
+                deal = await fub_get(f"/deals/{did}")
+                return _fds.summarize(deal, "linked")
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code != 404:
+                    raise
+                logger.warning("[fub-stage] listing %s names deal %s, which Follow Up Boss no longer has", pid, did)
+        hits, how = _fds.pick_by_address(prop.get("address") or "", await _fds_seller_deals())
+        return _fds.summarize(hits[0] if how in ("address", "name") else None, how, len(hits))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("[fub-stage] listing %s: %s", pid, e)
+        raise HTTPException(status_code=502, detail=f"Follow Up Boss could not be read: {e}")
+
+
+@app.post("/api/otc/poll")
+async def otc_poll_now(request: Request):
+    """Run one pass now (FORWARD OS pages only, once a minute)."""
+    _lp_guard(request)
+    # A pass is already running (the 15-minute one, or another agent's press): wait for it
+    # and hand back its result instead of refusing. It is reading Open To Close right now,
+    # so it answers the agent's question, and it costs Open To Close nothing extra
+    # (Oct 19, 2026; before this the press returned "already running" and still used up
+    # the minute, so the agent saw nothing new for a minute).
+    if _OTCP_STATE["running"]:
+        for _ in range(int(OTC_JOIN_MAX_SECONDS / 0.5)):
+            await asyncio.sleep(0.5)
+            if not _OTCP_STATE["running"]:
+                break
+        run = dict(_OTCP_STATE["last_run"] or {"ok": False, "errors": [{"property_id": None, "error": "the running check did not finish in time"}]})
+        run["joined"] = True
+        run["manual_wait_seconds"] = _otcp_manual_wait(_time.time())
+        return run
+    now = _time.time()
+    wait = _otcp_manual_wait(now)
+    if wait > 0:
+        raise HTTPException(status_code=429, headers={"Retry-After": str(wait)},
+                            detail=f"Open To Close was checked less than a minute ago. Next check in {wait} seconds.")
+    _OTCP_STATE["last_manual_at"] = now
+    run = await _otcp_run("manual")
+    run = dict(run)
+    run["manual_wait_seconds"] = _otcp_manual_wait(_time.time())
+    return run
+
+
+# ---------------------------------------------------------------------------
+# Daily hot sheet for Concierge and Transactions (Oct 17, 2026; see hot_sheet.py)
+#
+# Step 4 of the Deal Progress tracker. A Zap (Schedule by Zapier, weekdays 8am ET)
+# GETs /api/hot-sheet/concierge and /api/hot-sheet/transactions and sends each through
+# Gmail. This route only READS (service-role client) and writes the email text; it
+# sends nothing. The Zap is not a browser, so the FORWARD OS Origin check cannot guard
+# it: it must send the header x-hot-sheet-secret equal to the Railway variable
+# HOT_SHEET_SECRET. Unset variable = 503 (not switched on), wrong secret = 403.
+# ---------------------------------------------------------------------------
+import hmac as _hmac
+import hot_sheet as _hs
+
+_HS_PAGE = 1000
+
+
+def _hs_rows(table: str, cols: str, apply=None) -> list:
+    """Every matching row, read in pages so a long table is never cut off at 1,000."""
+    out, start = [], 0
+    while True:
+        q = supabase.table(table).select(cols)
+        if apply:
+            q = apply(q)
+        r = q.range(start, start + _HS_PAGE - 1).execute()
+        rows = r.data or []
+        out.extend(rows)
+        if len(rows) < _HS_PAGE:
+            return out
+        start += _HS_PAGE
+
+
+def _hs_build(team: str, now) -> dict:
+    if team == "concierge":
+        sheet = _hs.concierge_sheet(
+            _hs_rows("listings", "id,address,agent,stage,status", lambda q: q.eq("status", "active")),
+            _hs_rows("listing_checklist_items", "id,listing_id,title,completed,owner,stage,created_at",
+                     lambda q: q.eq("completed", False)),
+            _hs_rows("deals", "id,fub_deal_id,client_name,agent_name,pipeline,stage,closed_at", lambda q: q.eq("pipeline", "buyer")),
+            _hs_rows("deal_tasks", "id,deal_id,title,owner,completed,stage_triggered,created_at",
+                     lambda q: q.eq("completed", False)),
+            now,
+            cc_buyers=_hs_rows("cc_buyers", "id,status,fub_deal_id", lambda q: q.eq("status", "active")))
+    else:
+        sheet = _hs.transactions_sheet(
+            _hs_rows("otc_properties", "id,address,status"),
+            _hs_rows("otc_tasks", "property_id,task_id,title,position,otc_created,completed,removed_at",
+                     lambda q: q.eq("completed", False)),
+            now)
+    return _hs.render(sheet, now)
+
+
+@app.get("/api/hot-sheet/{team}")
+async def hot_sheet(team: str, x_hot_sheet_secret: str = Header(default="")):
+    secret = os.environ.get("HOT_SHEET_SECRET", "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="The hot sheet is not switched on (HOT_SHEET_SECRET is not set).")
+    if not _hmac.compare_digest(x_hot_sheet_secret.strip().encode(), secret.encode()):
+        raise HTTPException(status_code=403, detail="Not allowed.")
+    if team not in _hs.TEAMS:
+        raise HTTPException(status_code=404, detail="Unknown team. Use concierge or transactions.")
+    try:
+        out = await asyncio.to_thread(_hs_build, team, datetime.now(timezone.utc))
+    except Exception as e:
+        logger.exception("[hot-sheet] %s could not be built", team)
+        raise HTTPException(status_code=502, detail="The hot sheet could not be built: " + type(e).__name__)
+    logger.info("[hot-sheet] %s built: %s items", team, out["count"])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Hot sheet emails sent by the backend itself (Oct 19, 2026, Marc's choice).
+#
+# The plan was a Zap calling the route above with the secret header. The Zapier
+# tools available build code workflows, where a secret may not sit in the source,
+# so Marc chose: the backend sends the sheets itself with Resend, on its own
+# schedule, weekdays 8:00 ET. Nothing outside this server needs the secret.
+#
+# OFF until Marc sets the Railway variable HOT_SHEET_SEND=on. With it off the job
+# runs, sends nothing and records "off". POST /api/hot-sheet/preview (FORWARD OS
+# pages only, once every 2 minutes) sends both sheets to Marc ONLY, marked PREVIEW,
+# whatever the switch says. GET /api/hot-sheet/send/status says whether the switch
+# is on and what the last send did; it never returns a sheet's content.
+# ---------------------------------------------------------------------------
+HOT_SHEET_TO = {"concierge": ["concierge@fwrdrealestate.com"],
+                "transactions": ["transactions@fwrdrealestate.com"]}
+HOT_SHEET_MARC = "marc.cashin@corcoranmce.com"   # FORWARD OS notices go to his work email
+HOT_SHEET_FROM = "FORWARD OS <audit@marccashin.com>"   # the Resend domain the other notices use
+HOT_SHEET_PREVIEW_GAP = 120
+_HS_SEND: dict = {"last": None, "last_preview_at": 0.0}
+
+
+def _hs_switch_on() -> bool:
+    return os.environ.get("HOT_SHEET_SEND", "").strip().lower() == "on"
+
+
+def _hs_resend(payload: dict) -> str:
+    """One email through Resend. Returns its id. Raises when it was not sent."""
+    import resend as resend_sdk
+    key = os.environ.get("RESEND_API_KEY", "")
+    if not key:
+        raise RuntimeError("RESEND_API_KEY is not set")
+    resend_sdk.api_key = key
+    r = resend_sdk.Emails.send(payload)
+    rid = (r or {}).get("id") if isinstance(r, dict) else getattr(r, "id", None)
+    if not rid:
+        raise RuntimeError("Resend did not confirm the email")
+    return rid
+
+
+def _hs_send_one(team: str, to: list, now, preview: bool = False) -> dict:
+    out = _hs_build(team, now)
+    subject = ("PREVIEW (only to Marc): " if preview else "") + out["subject"]
+    rid = _hs_resend({"from": HOT_SHEET_FROM, "to": to, "subject": subject,
+                      "html": out["html"], "text": out["text"]})
+    return {"team": team, "to": to, "count": out["count"], "subject": subject, "id": rid}
+
+
+def _hs_send_all(now, preview: bool = False) -> dict:
+    """Both sheets. One team failing never stops the other; every failure is recorded."""
+    run = {"ran_at": now.isoformat(), "preview": preview, "sent": [], "errors": []}
+    for team in ("concierge", "transactions"):
+        to = [HOT_SHEET_MARC] if preview else HOT_SHEET_TO[team]
+        try:
+            run["sent"].append(_hs_send_one(team, to, now, preview))
+        except Exception as e:
+            logger.exception("[hot-sheet-send] %s not sent", team)
+            run["errors"].append({"team": team, "error": f"{type(e).__name__}: {e}"[:300]})
+    run["ok"] = not run["errors"]
+    return run
+
+
+def _hs_alert(run: dict) -> None:
+    """Tell Marc when a real (not preview) send failed."""
+    try:
+        rows = "".join("<li>{}: {}</li>".format(_esc(e["team"]), _esc(e["error"])) for e in run["errors"])
+        _hs_resend({"from": "Forward OS Audit <audit@marccashin.com>", "to": [HOT_SHEET_MARC],
+                    "subject": "FORWARD OS: the hot sheet was NOT sent",
+                    "html": "<p>This morning's hot sheet email failed for:</p><ul>{}</ul>"
+                            "<p>Status: https://forward-command-center-production.up.railway.app/api/hot-sheet/send/status</p>".format(rows)})
+    except Exception as e:
+        logger.error("[hot-sheet-send] failure alert could not be sent: %s", e)
+
+
+async def job_hot_sheet_send():
+    now = datetime.now(timezone.utc)
+    if not _hs_switch_on():
+        _HS_SEND["last"] = {"ran_at": now.isoformat(), "preview": False, "sent": [], "errors": [],
+                            "ok": True, "skipped": "HOT_SHEET_SEND is not on"}
+        logger.info("[hot-sheet-send] switched off (HOT_SHEET_SEND is not on); nothing sent")
+        return _HS_SEND["last"]
+    run = await asyncio.to_thread(_hs_send_all, now, False)
+    _HS_SEND["last"] = run
+    logger.info("[hot-sheet-send] sent=%s errors=%s", [(x["team"], x["count"]) for x in run["sent"]], run["errors"])
+    if run["errors"]:
+        await asyncio.to_thread(_hs_alert, run)
+    return run
+
+
+@app.on_event("startup")
+async def register_hot_sheet_send_job():
+    scheduler.add_job(job_hot_sheet_send, CronTrigger(day_of_week="mon-fri", hour=8, minute=0, timezone="America/New_York"),
+                      id="hot_sheet_send", replace_existing=True)
+    logger.info("[hot-sheet-send] registered (weekdays 8:00 ET); switch is %s", "ON" if _hs_switch_on() else "off")
+
+
+@app.get("/api/hot-sheet/send/status")
+async def hot_sheet_send_status():
+    """Switch and last send only: subjects and counts, never a sheet's content."""
+    return {"switch": "on" if _hs_switch_on() else "off", "schedule": "weekdays 8:00 ET",
+            "to": HOT_SHEET_TO, "last": _HS_SEND["last"]}
+
+
+@app.post("/api/hot-sheet/preview")
+async def hot_sheet_preview(request: Request):
+    """Both sheets to Marc only, marked PREVIEW (FORWARD OS pages only, once every 2 minutes)."""
+    _lp_guard(request)
+    now_t = _time.time()
+    if now_t - _HS_SEND["last_preview_at"] < HOT_SHEET_PREVIEW_GAP:
+        raise HTTPException(status_code=429, detail="A preview was sent less than 2 minutes ago.")
+    _HS_SEND["last_preview_at"] = now_t
+    run = await asyncio.to_thread(_hs_send_all, datetime.now(timezone.utc), True)
+    if run["errors"] and not run["sent"]:
+        raise HTTPException(status_code=502, detail="Preview not sent: " + "; ".join(e["error"] for e in run["errors"]))
+    return run
+
+
+# ── Showing tour plans (Oct 30, 2026) ─────────────────────────────────────────
+# The buyer's showing tour: each home looked up on the web (every figure with its page,
+# the agent confirms them in the app before a client sees anything), the drive order and
+# times (Google Routes API), the two map images, and the comparison sentences written only
+# from the confirmed figures. See tour_plan.py. Opens only from FORWARD OS. The Google key
+# is the server's own (GOOGLE_MAPS_SERVER_KEY, with Geocoding API, Routes API and Maps
+# Static API turned on); the browser key is never used for this.
+import tour_plan as _tour
+
+GOOGLE_MAPS_SERVER_KEY = os.environ.get("GOOGLE_MAPS_SERVER_KEY", "")
+_TOUR_SEARCHES = asyncio.Semaphore(4)   # at most four web searches at once for this tool
+
+
+class TourLookupRequest(BaseModel):
+    address: str
+
+
+class TourCompareRequest(BaseModel):
+    homes: list[dict]
+
+
+def _google_error(r) -> str:
+    try:
+        j = r.json()
+        msg = (j.get("error") or {}).get("message") or j.get("error_message") or ""
+    except ValueError:
+        msg = ""
+    return "Google answered {0}{1}".format(r.status_code, (": " + msg[:200]) if msg else "")
+
+
+async def _tour_get(url: str, params: dict):
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, params=params)
+    if r.status_code >= 400:
+        raise _tour.TourError(_google_error(r))
+    return r.json()
+
+
+async def _tour_post(url: str, body: dict, headers: dict):
+    h = {"X-Goog-Api-Key": GOOGLE_MAPS_SERVER_KEY, "Content-Type": "application/json"}
+    h.update(headers or {})
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, json=body, headers=h)
+    if r.status_code >= 400:
+        raise _tour.TourError(_google_error(r))
+    return r.json()
+
+
+async def _tour_get_bytes(url: str) -> bytes:
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url)
+    if r.status_code >= 400:
+        raise _tour.TourError(_google_error(r))
+    return r.content
+
+
+async def _tour_claude(body: dict, web: bool) -> dict:
+    headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01",
+               "content-type": "application/json"}
+    if web:
+        headers["anthropic-beta"] = "web-search-2025-03-05"
+    resp = await claude_post(headers, body, timeout=100, where="tour-lookup" if web else "tour-compare")
+    return resp.json()
+
+
+@app.post("/api/tour/lookup")
+async def tour_lookup(payload: TourLookupRequest, request: Request):
+    _lp_guard(request)
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="The backend has no AI key, so the listing search cannot run.")
+    async with _TOUR_SEARCHES:
+        try:
+            out = await _tour.lookup(payload.address, BMR_MODEL, lambda b: _tour_claude(b, True))
+        except _tour.TourError as e:
+            logger.warning("[tour] lookup %r: %s", payload.address, e)
+            raise HTTPException(status_code=502, detail=str(e))
+    out["looked_up_at"] = datetime.now(timezone.utc).isoformat()
+    return out
+
+
+@app.post("/api/tour/route")
+async def tour_route(payload: dict, request: Request):
+    _lp_guard(request)
+    if not GOOGLE_MAPS_SERVER_KEY:
+        raise HTTPException(status_code=503, detail="The backend has no Google Maps key (GOOGLE_MAPS_SERVER_KEY), so the route cannot be worked out.")
+    try:
+        return await _tour.route(payload, GOOGLE_MAPS_SERVER_KEY, _tour_get, _tour_post, _tour_get_bytes)
+    except _tour.AddressNotPlaced as e:
+        # detail stays the plain message every app version reads; the suggestion and which
+        # box it belongs to are extra keys for the app's one-press fix.
+        logger.warning("[tour] route: %s", e)
+        return JSONResponse(status_code=422, content={"detail": str(e), "suggestion": e.suggestion, "which": e.which})
+    except _tour.TourError as e:
+        logger.warning("[tour] route: %s", e)
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.post("/api/tour/compare")
+async def tour_compare(payload: TourCompareRequest, request: Request):
+    _lp_guard(request)
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="The backend has no AI key, so the comparisons cannot be written.")
+    try:
+        return await _tour.compare(payload.homes, BMR_MODEL, lambda b: _tour_claude(b, False))
+    except _tour.TourError as e:
+        raise HTTPException(status_code=502, detail=str(e))

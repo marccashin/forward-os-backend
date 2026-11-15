@@ -34,7 +34,7 @@ OSG_MODEL = "claude-sonnet-4-5"
 MAX_BYTES = 20 * 1024 * 1024
 MLS_MARKERS = ("bright mls", "mls #", "mls#", "listing agrmnt", "agent full")
 
-OSG_COMP_PARSE_PROMPT = 'You are reading a real estate MLS report (usually a Bright MLS "Agent Full" export).\n\nIMPORTANT: One PDF often contains SEVERAL properties, one after another. Each new property begins with a header line holding an address, a status word, and a price. Find EVERY property in the document and return one entry for each. Do not stop after the first.\n\nExtract ONLY facts printed on the sheet. Never estimate, infer, or calculate a value that is not stated. If a field is absent, use an empty string "".\n\nReturn ONLY a valid JSON object of the form {"listings": [ ... ]}, where every element has exactly these keys:\n\n{\n  "status": "one of: active, pending, closed, off_market",\n  "status_raw": "the status word exactly as printed (Active, Under Contract, Closed, Canceled, Expired, Withdrawn, etc.)",\n  "mlsNumber": "MLS #",\n  "address": "street address only, no city/state/zip",\n  "city": "city name only",\n  "state": "2-letter state",\n  "zip": "5-digit zip",\n  "county": "county name if shown",\n  "propType": "one of: Single Family, Condo, Townhouse, Multi-Family, Land, Other",\n  "beds": "number of bedrooms, digits only",\n  "fullBaths": "number of full baths, digits only",\n  "halfBaths": "number of half baths, digits only",\n  "gla": "Above Grade Finished SQFT, digits only, no commas. This is the appraiser\'s gross living area. NEVER use Total SQFT or Tax Total Fin SQFT, which include below-grade space.",\n  "glaSource": "the label printed after the Above Grade Fin SQFT figure, exactly as shown: Assessor, Estimated, or blank",\n  "assessorGla": "the separate \'Assessor AbvGrd Fin SQFT\' figure if the sheet prints one, digits only",\n  "below": "Below Grade FINISHED SQFT, digits only. If the sheet gives only unfinished sqft, or gives a percentage instead of a number, leave this EMPTY and set flag below_grade_unclear.",\n  "lotSize": "lot size in SQUARE FEET, digits only. If given in acres, convert (1 acre = 43560 sqft).",\n  "yearBuilt": "4-digit year",\n  "garageSpaces": "number of GARAGE spaces, digits only. If the sheet says Garage: No, use 0. If total parking is listed as Unknown, leave EMPTY and set flag parking_unknown.",\n  "hoaMonthly": "HOA fee converted to a MONTHLY dollar amount, digits only",\n  "condoFee": "condo fee converted to a MONTHLY dollar amount, digits only",\n  "listPrice": "current or original list price, digits only",\n  "salePrice": "CLOSE/SOLD price, digits only. Only for closed sales. Empty otherwise.",\n  "soldDate": "close date as YYYY-MM-DD. Only for closed sales.",\n  "listDate": "listing entry date as YYYY-MM-DD",\n  "dom": "days on market, digits only",\n  "concessions": "the dollar figure from \'Total Amount Paid by Seller Towards Closing Costs\', digits only, no commas or dollar sign. Use 0 if that line prints $0.00. Leave EMPTY only if the line is absent from the sheet. IGNORE the yes/no \'Seller Concessions\' field entirely - it is often wrong. A sheet can say Seller Concessions: No and still show a dollar amount here; the dollar amount wins.",\n  "concessionsRaw": "the \'Seller Concessions\' yes/no field exactly as printed, for reference only",\n  "annualTax": "annual property tax amount, digits only",\n  "flags": {\n    "gla_needs_check": true/false,\n    "lot_estimated": true/false,\n    "parking_unknown": true/false,\n    "below_grade_unclear": true/false,\n    "price_is_list_not_sold": true/false\n  }\n}\n\nRules:\n- status: Active -> "active". Pending / Under Contract / Active Under Contract -> "pending". Closed / Sold -> "closed". Canceled / Expired / Withdrawn / Temporarily Off Market -> "off_market".\n- Set gla_needs_check true ONLY when the square footage is genuinely uncertain: the label reads "Estimated", OR the Above Grade Fin SQFT differs from the Assessor AbvGrd Fin SQFT printed on the same sheet. A plain "Assessor" label that matches is normal and must NOT be flagged.\n- Set lot_estimated true when the lot size is labelled "Estimated".\n- Set parking_unknown true when total parking spaces reads "Unknown".\n- Set price_is_list_not_sold true whenever salePrice is empty but listPrice is present.\n- Never output a condition, quality, or proximity rating. Those are the agent\'s call.\n- A closed sale\'s price is its Close Price, not its list price, and its soldDate is the Close Date.\n- Return one entry per property. A report holding 7 properties returns 7 entries.\n\nReturn ONLY the JSON object {"listings": [...]}. No explanation, no markdown, no code fences.'
+OSG_COMP_PARSE_PROMPT = 'You are reading a real estate MLS report (usually a Bright MLS "Agent Full" export).\n\nIMPORTANT: One PDF often contains SEVERAL properties, one after another. Each new property begins with a header line holding an address, a status word, and a price. Find EVERY property in the document and return one entry for each. Do not stop after the first.\n\nExtract ONLY facts printed on the sheet. Never estimate, infer, or calculate a value that is not stated. If a field is absent, use an empty string "".\n\nReturn ONLY a valid JSON object of the form {"listings": [ ... ]}, where every element has exactly these keys:\n\n{\n  "status": "one of: active, pending, closed, off_market",\n  "status_raw": "the status word exactly as printed (Active, Under Contract, Closed, Canceled, Expired, Withdrawn, etc.)",\n  "mlsNumber": "MLS #",\n  "address": "street address only, no city/state/zip",\n  "city": "city name only",\n  "state": "2-letter state",\n  "zip": "5-digit zip",\n  "county": "county name if shown",\n  "propType": "one of: Single Family, Condo, Townhouse, Multi-Family, Land, Other",\n  "beds": "number of bedrooms, digits only",\n  "fullBaths": "number of full baths, digits only",\n  "halfBaths": "number of half baths, digits only",\n  "gla": "Above Grade Finished SQFT, digits only, no commas. This is the appraiser\'s gross living area. NEVER use Total SQFT or Tax Total Fin SQFT, which include below-grade space.",\n  "glaSource": "the label printed after the Above Grade Fin SQFT figure, exactly as shown: Assessor, Estimated, or blank",\n  "assessorGla": "the separate \'Assessor AbvGrd Fin SQFT\' figure if the sheet prints one, digits only",\n  "below": "Below Grade FINISHED SQFT, digits only. If the sheet gives only unfinished sqft, or gives a percentage instead of a number, leave this EMPTY and set flag below_grade_unclear.",\n  "basement": "Basement Type as printed, or the Basement Yes/No when no type is printed",\n  "totalFin": "Total Fin SQFT, digits only. NEVER Tax Total Fin SQFT.",\n  "lotSize": "lot size in SQUARE FEET, digits only. If given in acres, convert (1 acre = 43560 sqft).",\n  "yearBuilt": "4-digit year",\n  "renoYear": "Yr Major Reno/Remodel, 4-digit year, if printed",\n  "garageSpaces": "number of GARAGE spaces, digits only. If the sheet says Garage: No, use 0. If total parking is listed as Unknown, leave EMPTY and set flag parking_unknown.",\n  "waterfront": "Waterfront as printed: Yes or No. Empty if not printed.",\n  "waterFrontage": "Water Frontage in FT, digits only",\n  "views": "Views as printed",\n  "dockSlip": "Dock Slip Conveyance as printed",\n  "hoaMonthly": "HOA fee converted to a MONTHLY dollar amount, digits only",\n  "condoFee": "condo fee converted to a MONTHLY dollar amount, digits only",\n  "listPrice": "current or original list price, digits only",\n  "salePrice": "CLOSE/SOLD price, digits only. Only for closed sales. Empty otherwise.",\n  "soldDate": "close date as YYYY-MM-DD. Only for closed sales.",\n  "listDate": "listing entry date as YYYY-MM-DD",\n  "dom": "days on market, digits only",\n  "concessions": "the dollar figure from \'Total Amount Paid by Seller Towards Closing Costs\', digits only, no commas or dollar sign. Use 0 if that line prints $0.00. Leave EMPTY only if the line is absent from the sheet. IGNORE the yes/no \'Seller Concessions\' field entirely - it is often wrong. A sheet can say Seller Concessions: No and still show a dollar amount here; the dollar amount wins.",\n  "concessionsRaw": "the \'Seller Concessions\' yes/no field exactly as printed, for reference only",\n  "annualTax": "annual property tax amount, digits only",\n  "flags": {\n    "gla_needs_check": true/false,\n    "lot_estimated": true/false,\n    "parking_unknown": true/false,\n    "below_grade_unclear": true/false,\n    "price_is_list_not_sold": true/false\n  }\n}\n\nRules:\n- status: Active -> "active". Pending / Under Contract / Active Under Contract -> "pending". Closed / Sold -> "closed". Canceled / Expired / Withdrawn / Temporarily Off Market -> "off_market".\n- Set gla_needs_check true ONLY when the square footage is genuinely uncertain: the label reads "Estimated", OR the Above Grade Fin SQFT differs from the Assessor AbvGrd Fin SQFT printed on the same sheet. A plain "Assessor" label that matches is normal and must NOT be flagged.\n- Set lot_estimated true when the lot size is labelled "Estimated".\n- Set parking_unknown true when total parking spaces reads "Unknown".\n- Set price_is_list_not_sold true whenever salePrice is empty but listPrice is present.\n- Never output a condition, quality, or proximity rating. Those are the agent\'s call.\n- A closed sale\'s price is its Close Price, not its list price, and its soldDate is the Close Date.\n- Return one entry per property. A report holding 7 properties returns 7 entries.\n\nReturn ONLY the JSON object {"listings": [...]}. No explanation, no markdown, no code fences.'
 
 SUBJECT_PARSE_PROMPT = """You are reading the MLS listing sheet (usually a Bright MLS "Agent Full" export) for ONE property: the home a buyer is about to make an offer on.
 
@@ -62,8 +62,12 @@ Return ONLY a JSON object of this exact shape:
     "fullBaths": "the number before the slash in Baths",
     "halfBaths": "the number after the slash in Baths",
     "gla": "Above Grade Fin SQFT, digits only. NEVER Total SQFT or Total Fin SQFT.",
+    "assessorGla": "Assessor AbvGrd Fin SQFT, digits only, if the sheet prints it",
+    "belowGradeFin": "Below Grade Fin SQFT, digits only. NEVER Total Below Grade SQFT, which includes unfinished space.",
+    "totalFinSqft": "Total Fin SQFT, digits only. NEVER Tax Total Fin SQFT.",
     "glaSource": "the label printed after the Above Grade Fin SQFT figure (Assessor, Estimated...)",
     "yearBuilt": "",
+    "renoYear": "Yr Major Reno/Remodel, 4-digit year, if printed",
     "lotSizeText": "Lot Acres / SQFT exactly as printed",
     "listPrice": "the CURRENT list price in the header",
     "originalListPrice": "Original Price",
@@ -82,6 +86,16 @@ Return ONLY a JSON object of this exact shape:
     "taxAssessedValue": "Tax Assessed Value amount",
     "garage": "the Parking line as printed",
     "basement": "Basement Type as printed, or the Basement Yes/No if no type is printed",
+    "waterfront": "Waterfront as printed (Yes or No)",
+    "views": "Views as printed",
+    "waterfrontFeatures": "Waterfront Features as printed",
+    "waterAccess": "Water Access as printed",
+    "navigableWater": "Navigable Water as printed",
+    "tidalWater": "Tidal Water as printed",
+    "waterFrontage": "Water Frontage in FT, digits only",
+    "dockType": "Dock Type as printed",
+    "dockSlip": "Dock Slip Conveyance as printed",
+    "riparianRights": "Riparian Rights as printed",
     "waterSource": "Water Source as printed",
     "sewer": "Sewer as printed",
     "heating": "Heating as printed",
@@ -89,6 +103,7 @@ Return ONLY a JSON object of this exact shape:
     "floodZone": "Flood zone if printed",
     "inclusions": "Inclusions if printed",
     "exclusions": "Exclusions if printed",
+    "publicRemarks": "the WHOLE Public remarks, copied word for word from the first word after Public: to the last word before the listing office details. Never the Agent remarks. Empty if the sheet prints no public remarks.",
     "offerNotes": [
       {"quote": "one sentence copied WORD FOR WORD from the Agent or Public remarks", "topic": "one of: financing, seller_credit, offer_deadline, offer_instructions, possession, as_is, condition, hoa_condo, tenant, incentive, other"}
     ]
@@ -107,6 +122,7 @@ NUMERIC_FIELDS = (
     "beds", "fullBaths", "halfBaths", "gla", "yearBuilt", "listPrice",
     "originalListPrice", "previousListPrice", "dom", "cdom", "hoaFee",
     "condoFee", "annualTax", "taxYear", "taxAssessedValue",
+    "assessorGla", "belowGradeFin", "totalFinSqft", "renoYear", "waterFrontage",
 )
 TEXT_FIELDS = (
     "status_raw", "mlsNumber", "address", "city", "state", "zip", "county",
@@ -114,6 +130,8 @@ TEXT_FIELDS = (
     "saleType", "possession", "hoaFrequency", "condoFrequency", "garage",
     "basement", "waterSource", "sewer", "heating", "cooling", "floodZone",
     "inclusions", "exclusions",
+    "waterfront", "views", "waterfrontFeatures", "waterAccess", "navigableWater",
+    "tidalWater", "dockType", "dockSlip", "riparianRights",
 )
 # Categorical answers. Not printed verbatim, so they are checked against a
 # fixed list instead.
@@ -217,6 +235,28 @@ ANCHORS = {
     "floodZone":         [r"floodzone:"],
     "inclusions":        [r"inclusions:"],
     "exclusions":        [r"exclusions:"],
+    # Added Nov 4 2026 (3 Old Sound Rd: water and lower level never reached
+    # the strategy). "taxtotalfinsqft:" contains "totalfinsqft:", hence the
+    # lookbehind: the tax figure is not the finished area.
+    "assessorGla":       [r"assessorabvgrdfinsqft:"],
+    "belowGradeFin":     [r"belowgradefinsqft:"],
+    "totalFinSqft":      [r"(?<!tax)totalfinsqft:"],
+    "renoYear":          [r"yrmajorreno/remodel:"],
+    "waterFrontage":     [r"waterfrontageinft:"],
+    "waterfront":        [r"waterfront:"],
+    "views":             [r"views:"],
+    "waterfrontFeatures": [r"waterfrontfeatures:"],
+    "waterAccess":       [r"wateraccess:"],
+    "navigableWater":    [r"navigablewater:"],
+    "tidalWater":        [r"tidalwater:"],
+    "dockType":          [r"docktype:"],
+    "dockSlip":          [r"dockslipconveyance:"],
+    "riparianRights":    [r"riparianrights:"],
+    # Comp-only anchors (Nov 4 2026, second pass). A Bright lot prints as
+    # "0.25a / 10881sf"; garage spaces as "Attached Garage - # of Spaces 1"
+    # (no colon in pypdf's text), and no garage as "Garage: No".
+    "compLot":           [r"lotacres/sqft:(?:[\d.]+a/)?"],
+    "compGarage":        [r"garage-#ofspaces:?"],
 }
 
 
@@ -368,7 +408,42 @@ def verify_subject(sub: dict, text: str) -> dict:
             break
     clean["offerNotes"] = notes
 
-    return {"subject": clean, "unverified": unverified, "dropped_notes": dropped}
+    remarks, dropped_sentences = verify_public_remarks(sub.get("publicRemarks", ""), text)
+    clean["publicRemarks"] = remarks
+    if str(sub.get("publicRemarks", "") or "").strip() and not remarks:
+        unverified.append("publicRemarks")
+
+    return {"subject": clean, "unverified": unverified, "dropped_notes": dropped,
+            "dropped_remark_sentences": dropped_sentences}
+
+
+MAX_REMARKS = 5000
+_SENTENCE = re.compile(r"(?<=[.!?])\s+")
+
+
+def verify_public_remarks(raw, text: str):
+    """The public description, kept only where the sheet prints it.
+
+    Returns (remarks, dropped_sentence_count). The whole paragraph is kept
+    when it sits word for word inside the Public remarks. If Claude changed
+    anything (a fixed typo, a dropped word), each sentence is checked on its
+    own and only the ones printed in the Public remarks survive. Agent
+    remarks never qualify, and any sentence holding a phone, email, access
+    code, lockbox or compensation wording is dropped.
+    """
+    raw = str(raw or "").strip()
+    if not raw:
+        return "", 0
+    whole = len(raw) <= MAX_REMARKS and note_source(raw, text) == "public"
+    parts = [p.strip() for p in _SENTENCE.split(raw) if p.strip()]
+    kept, dropped = [], 0
+    for p in parts:
+        if (whole or note_source(p, text) == "public") and not is_sensitive(p):
+            kept.append(p)
+        else:
+            dropped += 1
+    out = " ".join(kept)
+    return out[:MAX_REMARKS], dropped
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +496,71 @@ async def ask_claude(api_key: str, content: str, max_tokens: int, temperature=No
 MAX_FILES = 12
 MAX_LISTINGS_PER_FILE = 30
 
+# Every comp field the strategy reads beyond price, dates, credit and above-
+# grade square footage (those are unchanged) is checked against the comp's OWN
+# part of the PDF: the text from its "MLS #:" line to the next property's. A comp packet prints
+# Waterfront: Yes on one property and No on the next, so matching anywhere
+# in the file would prove nothing. A value that cannot be matched is blanked.
+COMP_EXTRAS = {  # comp key -> (ANCHORS key, numeric)
+    # Fields the comp reader returned before Nov 4 2026 and the page never
+    # used. Since forward-os #265 sends them to the strategy they are checked
+    # too: on Marc's 2 Old Sound Rd sheet Claude returned the 576 sf printed
+    # as "Below Grade Unfin SQFT" as finished space.
+    "beds": ("beds", True),
+    "fullBaths": ("fullBaths", True),
+    "halfBaths": ("halfBaths", True),
+    "below": ("belowGradeFin", True),
+    "assessorGla": ("assessorGla", True),
+    "yearBuilt": ("yearBuilt", True),
+    "lotSize": ("compLot", True),
+    "garageSpaces": ("compGarage", True),
+    # Added Nov 4 2026 (first pass).
+    "waterfront": ("waterfront", False),
+    "waterFrontage": ("waterFrontage", True),
+    "views": ("views", False),
+    "dockSlip": ("dockSlip", False),
+    "basement": ("basement", False),
+    "totalFin": ("totalFinSqft", True),
+    "renoYear": ("renoYear", True),
+}
+_MLS_LABEL = re.compile(r"MLS\s*#\s*:\s*", re.IGNORECASE)
+
+
+def comp_block(text: str, mls: str) -> str:
+    """The comp's own text: its MLS # line up to the next property's."""
+    m = re.search(r"MLS\s*#\s*:\s*" + re.escape(str(mls or "").strip()) + r"(?!\d)",
+                  str(text or ""), re.IGNORECASE)
+    if not str(mls or "").strip() or not m:
+        return ""
+    nxt = _MLS_LABEL.search(text, m.end())
+    return text[m.start(): nxt.start() if nxt else len(text)]
+
+
+def verify_comp_extras(item: dict, text: str) -> list:
+    """Blank any added field the comp's own block does not print. Returns
+    the names blanked (also put on the item as "unverified")."""
+    block = comp_block(text, item.get("mlsNumber"))
+    blanked = []
+    for key, (anchor, numeric) in COMP_EXTRAS.items():
+        v = item.get(key)
+        raw = "" if v is None else str(v).strip()   # keep a real 0
+        if not raw:
+            item[key] = ""
+            continue
+        val = _digits(raw) if numeric else raw
+        if key == "garageSpaces" and val == "0":
+            ok = bool(block) and "garage:no" in _flat(block)
+        else:
+            ok = bool(block and val) and field_on_sheet(anchor, val, block, numeric=numeric)
+        if ok and not is_sensitive(raw):
+            item[key] = val
+        else:
+            item[key] = ""
+            blanked.append(key)
+    if blanked:
+        item["unverified"] = blanked
+    return blanked
+
 
 async def parse_comps(files, api_key: str) -> dict:
     results = []
@@ -433,7 +573,6 @@ async def parse_comps(files, api_key: str) -> dict:
                 continue
             data = await ask_claude(
                 api_key, f"MLS LISTING SHEET:\n\n{text}\n\n---\n\n{OSG_COMP_PARSE_PROMPT}", 16000)
-            del text
             if isinstance(data, dict) and isinstance(data.get("listings"), list):
                 listings = data["listings"]
             elif isinstance(data, dict):
@@ -449,6 +588,7 @@ async def parse_comps(files, api_key: str) -> dict:
             for item in listings[:MAX_LISTINGS_PER_FILE]:
                 if not isinstance(item, dict):
                     continue
+                verify_comp_extras(item, text)
                 item.setdefault("flags", {})
                 item["file"] = name
                 item["ok"] = True
@@ -475,7 +615,7 @@ async def parse_subject(upload, api_key: str) -> dict:
         if err:
             return fail(err)
         data = await ask_claude(
-            api_key, f"MLS LISTING SHEET:\n\n{text}\n\n---\n\n{SUBJECT_PARSE_PROMPT}", 4000, 0)
+            api_key, f"MLS LISTING SHEET:\n\n{text}\n\n---\n\n{SUBJECT_PARSE_PROMPT}", 8000, 0)
         if not isinstance(data, dict):
             raise ValueError("unexpected shape")
         found = count_properties(text, data.get("propertiesFound"))
