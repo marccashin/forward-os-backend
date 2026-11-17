@@ -5133,6 +5133,70 @@ async def fub_listing_stage(request: Request, property_id: str = ""):
         raise HTTPException(status_code=502, detail=f"Follow Up Boss could not be read: {e}")
 
 
+# Buyers (Nov 16, 2026): the buyer folder's Deal Progress tab, the listing one mirrored.
+# Same rules of privacy: the stage and when the deal entered it, the deal id (the
+# Command Center keys its buyer file by it), and the deal card's name only when it is a
+# street address. Which deal: fub_deal_stage.pick_buyer_deal. Read only: nothing is
+# stamped from here.
+_FDS_BUYER_CACHE: dict = {"at": 0.0, "deals": [], "pipeline_id": None}
+
+
+async def _fds_buyer_deals() -> list[dict]:
+    """Every Buyers deal, kept 10 minutes (one buyer page asks once; FUB pages 100)."""
+    now = _time.time()
+    if _FDS_BUYER_CACHE["deals"] and now - _FDS_BUYER_CACHE["at"] < 600:
+        return _FDS_BUYER_CACHE["deals"]
+    if _FDS_BUYER_CACHE["pipeline_id"] is None:
+        pipes = (await fub_get("/pipelines")).get("pipelines") or []
+        buyers = [p for p in pipes if str(p.get("name") or "").strip().lower() == "buyers"]
+        if len(buyers) != 1:
+            raise ValueError(f"expected one Buyers pipeline in Follow Up Boss, found {len(buyers)}")
+        _FDS_BUYER_CACHE["pipeline_id"] = buyers[0]["id"]
+    deals: list[dict] = []
+    nxt = None
+    for _ in range(20):
+        params = {"pipelineId": _FDS_BUYER_CACHE["pipeline_id"], "limit": 100}
+        if nxt:
+            params["next"] = nxt
+        page = await fub_get("/deals", params)
+        deals.extend(page.get("deals") or [])
+        nxt = (page.get("_metadata") or {}).get("next")
+        if not nxt:
+            break
+    _FDS_BUYER_CACHE.update(at=now, deals=deals)
+    return deals
+
+
+@app.get("/api/fub/buyer-stage")
+async def fub_buyer_stage(request: Request, buyer_id: str = ""):
+    _lp_guard(request)
+    bid = (buyer_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", bid):
+        raise HTTPException(status_code=400, detail="buyer_id must be a buyer id.")
+    rows = supabase.table("buyers").select("id,buyer_name,agent_name,subfolder_drive_ids").eq("id", bid).limit(1).execute().data or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="No FORWARD OS buyer with that id.")
+    buyer = rows[0]
+    try:
+        did = _fds.stamped_deal_id(buyer)
+        if did:
+            try:
+                deal = await fub_get(f"/deals/{did}")
+                return _fds.summarize_buyer(deal, "linked")
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code != 404:
+                    raise
+                logger.warning("[fub-stage] buyer %s names deal %s, which Follow Up Boss no longer has", bid, did)
+        agents = {a for a in _buyer_agents(buyer) if a}
+        hits, how = _fds.pick_buyer_deal(buyer.get("buyer_name") or "", agents, await _fds_buyer_deals(), AGENT_NAME_MAP)
+        return _fds.summarize_buyer(hits[0] if how == "name" else None, how, len(hits))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("[fub-stage] buyer %s: %s", bid, e)
+        raise HTTPException(status_code=502, detail=f"Follow Up Boss could not be read: {e}")
+
+
 @app.post("/api/otc/poll")
 async def otc_poll_now(request: Request):
     """Run one pass now (FORWARD OS pages only, once a minute)."""

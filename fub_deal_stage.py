@@ -146,3 +146,62 @@ def summarize(deal: dict | None, how: str, count: int = 0) -> dict:
         "entered_stage_at": deal.get("enteredStageAt") or None,
         "name_is_address": name_is_address(deal.get("name")),
     }
+
+
+# ---------------------------------------------------------------------------
+# Buyers (Nov 16, 2026): where a FORWARD OS buyer stands in Follow Up Boss, for the
+# buyer folder's Deal Progress tab (the listing one, mirrored).
+#
+# Which deal:
+#   1. the deal id the Buyer Engaged webhook stamped on the OS buyer card
+#      (subfolder_drive_ids._fub_deal_id). The top-level fub_deal_id column is not
+#      used, the same as for listings.
+#   2. else a Buyers deal whose name, or one of whose people, is the buyer's name
+#      exactly (same words, any case or punctuation), handled by the buyer's agent
+#      or a co-agent. The OS buyer card is named after the first person on the deal
+#      (the webhook copies it), so this is how an unstamped card is found.
+# Two or more hits are reported as ambiguous unless exactly one is still in progress.
+# ---------------------------------------------------------------------------
+def _name_tokens(name) -> list[str]:
+    toks = re.split(r"[^a-z]+", str(name or "").lower().replace("&", " "))
+    return [t for t in toks if t and t != "and"]
+
+
+def pick_buyer_deal(buyer_name: str, agents: set[str], deals: list[dict], agent_map: dict | None = None) -> tuple[list[dict], str]:
+    """Buyers deals that are this OS buyer. Returns (hits, how): how is "name",
+    "ambiguous" or "none". agents: the buyer's agent and co-agents (OS names);
+    agent_map turns a Follow Up Boss user name into the OS name."""
+    want = " ".join(_name_tokens(buyer_name))
+    if not want:
+        return [], "none"
+    agent_map = agent_map or {}
+
+    def deal_agents(d: dict) -> set[str]:
+        return {agent_map.get(u.get("name") or "", u.get("name") or "") for u in (d.get("users") or []) if isinstance(u, dict) and u.get("name")}
+
+    hits = []
+    for d in deals or []:
+        if not isinstance(d, dict):
+            continue
+        names = [d.get("name")] + [p.get("name") for p in (d.get("people") or []) if isinstance(p, dict)]
+        if not any(" ".join(_name_tokens(n)) == want for n in names):
+            continue
+        if agents and not (deal_agents(d) & agents):
+            continue
+        hits.append(d)
+    if len(hits) == 1:
+        return hits, "name"
+    if len(hits) > 1:
+        return (_one_open(hits), "name") if _one_open(hits) else (hits, "ambiguous")
+    return [], "none"
+
+
+def summarize_buyer(deal: dict | None, how: str, count: int = 0) -> dict:
+    """summarize(), plus the deal card's name ONLY when it is a street address: the
+    guide has the agent rename the card to the property address when the offer is
+    accepted, and that address is how Open To Close's file is found. A name that is a
+    person's never leaves the backend."""
+    out = summarize(deal, how, count)
+    if deal and out.get("name_is_address"):
+        out["address"] = str(deal.get("name") or "").strip()
+    return out
